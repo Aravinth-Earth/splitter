@@ -9,7 +9,10 @@
 language: "en"
 reviews:
   profile: "chill"
-  request_changes_workflow: false
+  # The merge gate: CodeRabbit requests changes while findings are open and approves once every
+  # thread is resolved. Branch protection requires that approval, so this is what makes "no merge
+  # without the review" mechanical instead of a promise.
+  request_changes_workflow: true
   high_level_summary: true
   changed_files_summary: true
   review_status: true
