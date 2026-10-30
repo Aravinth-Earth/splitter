@@ -1,0 +1,16 @@
+{
+  "name": "splitter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Splitter — end-to-end encrypted, live expense splitting at 332321.xyz/w/expense-splitter/",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "dev": "wrangler dev",
+    "check": "node scripts/check.mjs",
+    "deploy": "node scripts/check.mjs && wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.42.0"
+  }
+}

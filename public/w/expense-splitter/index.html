@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Splitter</title>
+  <meta name="description" content="Split expenses with a group over one code. Names, amounts and splits are encrypted in your browser, so the server cannot read them." />
+  <meta name="color-scheme" content="dark light" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <h1>Splitter</h1>
+    <p class="lede">One code, one group, a shared expense list the server cannot read.</p>
+
+    <h2>How it will work</h2>
+    <ol>
+      <li><strong>Create a group.</strong> Name it, and you are inside it with a 16-character code.</li>
+      <li><strong>Share the code.</strong> Anyone with it asks to join; you let them in.</li>
+      <li><strong>Add what you paid.</strong> Every expense lands on everyone's screen live; split it equally, by share, by percentage or by exact amount.</li>
+      <li><strong>Settle up.</strong> Balances update as you go, and the end of the trip is one short list of transfers.</li>
+    </ol>
+
+    <h2>What the server sees</h2>
+    <p>
+      The code is the key. It never leaves the page: the browser turns it into an AES-256-GCM key and
+      seals every name, amount and split before anything is sent. The server holds ciphertext plus the
+      ids and timestamps needed to route it — and cannot read any of the content.
+    </p>
+    <p class="muted">
+      Honest limits: a code that leaks cannot be revoked, a device's own cache is plaintext, and the
+      server cannot check that a split adds up because it cannot read either number.
+    </p>
+
+    <p class="status">
+      In development — this page is a placeholder while the app is built.
+      <a href="/">The rest of the site is here.</a>
+    </p>
+  </main>
+</body>
+</html>
