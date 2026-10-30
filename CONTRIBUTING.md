@@ -1,28 +1,30 @@
 # Contributing
 
-This repository ships from `main` on merge: Workers Builds builds and deploys, so **a merged commit is a
-release**. There is no manual deploy step, and no manual merge.
+A merged commit is a release: Workers Builds deploys `main` on merge. There is no manual `wrangler deploy`,
+and a branch build only uploads a preview version — it never takes production traffic.
 
-## The loop every change goes through
+## The loop every cycle runs
 
-1. Branch, commit, open a PR against `main`. Keep it under ~100 changed files — the review bot's per-review
-   limit is 100–300 files (it varies with the repository's stars), and past the limit the PR gets no review at
-   all.
-2. Let the mechanical checks finish (Workers Builds, and any Actions added later). Fix anything red **before**
-   asking for a review — a review spent on a broken build is a review wasted.
-3. Ask for the review: comment `@coderabbitai review` (incremental) or `@coderabbitai full review` (from
-   scratch). A public repository under 10 stars never gets an automatic review, so this step is mandatory.
-4. Work the review. Every comment gets a fix, or a reply on its own thread explaining why the finding does not
-   hold — with the evidence. Then trigger the review again. Repeat until CodeRabbit approves.
-5. Merge. `main` is protected: one approving review and a green Workers Builds check are required, and the
-   deployment happens from the merge, never from a terminal.
+1. **Pick a set of work items** small enough to land in one PR. Keep it under ~100 changed files.
+2. **Test first.** Write the failing test, watch it fail, implement until it passes, then re-run the whole
+   local suite. Each item brings three tests: the positive case, the negative case and the error case.
+   Patch tests and code together until the local suite is green — a fix that weakens a test is not a fix.
+3. **Commit in technical language only**: what changed, where, and how it was verified. No reasoning, no
+   story, no conversation, no personal detail.
+4. **Push and open the PR.**
+5. **Deep review** by a focused reviewer against `docs/review-brief.md`: every finding is classified by
+   severity, fixed, or filed as a backlog item when it cannot land in this PR. The review is re-run until
+   nothing actionable is left.
+6. **Merge.**
+7. **Verify the deployment**: exercise the live URL and run the whole regression suite against it, not just
+   the new tests.
+8. **Any failure is a bug**: a patch branch, its own review, merge, retest. Then the cycle restarts at step 1
+   until the work items are done.
 
-## What a change has to bring
+## Non-negotiables
 
-- **A failing test first, then the change**, and the test proves three things: the positive case, the negative
-  case and the error case. A story with only a happy-path test is not done.
-- `npm run check` green.
 - No third-party anything under `public/` — no CDN, no web font, no analytics, no inline handler.
-- Nothing readable in a frame: names, amounts, descriptions and splits are sealed in the browser before they
-  are sent, and the group code never leaves it.
-- Copy that a reader can check: no claim the behaviour does not keep.
+- Nothing readable in a frame: names, amounts, descriptions and splits are sealed in the browser, and the
+  group code never leaves it.
+- Copy a reader can check: no claim the behaviour does not keep.
+- `npm run check` green before a review is asked for.
