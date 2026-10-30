@@ -1,0 +1,34 @@
+# Splitter — one code, one group, a shared ledger the server cannot read.
+#
+# Served on the public site's own origin through a Worker route, the same pattern as the
+# Estimation app: the page and the API live at /w/expense-splitter/, and the Worker answers
+# both so the security headers cannot be bypassed by reading a static file directly.
+#
+# M0 has no Durable Objects yet: groups arrive with M2, and the bindings land in the same PR
+# as the classes plus a v1 migration.
+name = "splitter"
+main = "src/index.js"
+compatibility_date = "2026-10-30"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+html_handling = "auto-trailing-slash"
+not_found_handling = "404-page"
+# Assets would otherwise be served before the Worker, and the page would lose the CSP/HSTS
+# headers the rest of the site sets.
+run_worker_first = true
+
+# The preview route is where the app is built. It serves the SAME asset tree as the canonical
+# path (the Worker rewrites the prefix), so the cutover is a route change and nothing else.
+[[routes]]
+pattern = "www.332321.xyz/w/expense-splitter-preview/*"
+zone_name = "332321.xyz"
+
+# A wildcard route does not match the slash-less path, so the bare preview path needs its own.
+[[routes]]
+pattern = "www.332321.xyz/w/expense-splitter-preview"
+zone_name = "332321.xyz"
+
+[observability]
+enabled = true
