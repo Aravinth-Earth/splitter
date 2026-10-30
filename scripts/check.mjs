@@ -5,6 +5,9 @@
  * analytics snippet or tracking pixel has to fail the build rather than ship. Also syntax-checks
  * every module, refuses copy that overclaims, and keeps personal details out of a page strangers
  * load.
+ *
+ * Every absence check is paired with a presence check: a scan that inspects nothing passes
+ * vacuously, which is the failure mode this file exists to prevent.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -29,6 +32,12 @@ function walk(directory) {
 
 const assets = walk(publicDir);
 
+/* 0. A scan over nothing proves nothing. */
+if (assets.length === 0) {
+  console.error(`check failed: no assets found under ${publicDir}`);
+  process.exit(1);
+}
+
 /* 1. Every browser module must parse. */
 for (const file of assets.filter((path) => path.endsWith('.js'))) {
   try {
@@ -38,9 +47,12 @@ for (const file of assets.filter((path) => path.endsWith('.js'))) {
   }
 }
 
-/* 2. No outbound requests to anyone but this origin. */
-const allowedHosts = /^(?:[a-z]+:\/\/)?(?:www\.)?332321\.xyz|localhost|127\.0\.0\.1/i;
+/* 2. No outbound requests to anyone but this origin. The host is compared whole, so
+   `332321.xyz.attacker.example` and a `localhost` that only appears in a path cannot pass. */
+const allowedHosts = new Set(['332321.xyz', 'www.332321.xyz', 'localhost', '127.0.0.1']);
 const urlPattern = /\bhttps?:\/\/[^\s"'<>)]+/gi;
+/* `src="//host/x"` loads a third party without ever spelling a scheme. */
+const protocolRelativePattern = /\b(?:src|href)\s*=\s*["']\/\/[^"']+/gi;
 const bannedHosts = [
   'google-analytics',
   'googletagmanager',
@@ -56,25 +68,41 @@ const bannedHosts = [
   'fonts.gstatic.com'
 ];
 /* Copy that would be a lie: ciphertext does go to our own Worker. */
-const bannedCopy = ['no data sent anywhere', 'no data ever leaves'];
+const bannedCopy = ['no data sent anywhere', 'no data ever leaves', 'only ever holds ciphertext'];
 /* Nothing personal belongs in a page strangers load. */
-const personal = ['Aravinth', '@332321.xyz', 'simplelogin'];
+const personal = ['aravinth', '@332321.xyz', 'simplelogin'];
 
 for (const file of assets) {
   const text = readFileSync(file, 'utf8');
+  /* Rendered whitespace collapses, so a phrase split across a line break still reads as itself. */
+  const flat = text.toLowerCase().replace(/\s+/g, ' ');
+
   for (const match of text.matchAll(urlPattern)) {
-    if (allowedHosts.test(match[0])) continue;
+    let host;
+    try {
+      host = new URL(match[0]).hostname.toLowerCase();
+    } catch {
+      problems.push(`${relative(root, file)}: unparseable URL ${match[0]}`);
+      continue;
+    }
+    if (allowedHosts.has(host)) continue;
     problems.push(`${relative(root, file)}: external URL ${match[0]}`);
     break;
   }
+
+  for (const match of text.matchAll(protocolRelativePattern)) {
+    problems.push(`${relative(root, file)}: protocol-relative URL ${match[0].trim()}`);
+    break;
+  }
+
   for (const banned of bannedHosts) {
-    if (text.includes(banned)) problems.push(`${relative(root, file)}: contains "${banned}"`);
+    if (flat.includes(banned)) problems.push(`${relative(root, file)}: contains "${banned}"`);
   }
   for (const phrase of bannedCopy) {
-    if (text.toLowerCase().includes(phrase)) problems.push(`${relative(root, file)}: overclaiming copy "${phrase}"`);
+    if (flat.includes(phrase)) problems.push(`${relative(root, file)}: overclaiming copy "${phrase}"`);
   }
   for (const who of personal) {
-    if (text.includes(who)) problems.push(`${relative(root, file)}: personal detail "${who}" in a public asset`);
+    if (flat.includes(who)) problems.push(`${relative(root, file)}: personal detail "${who}" in a public asset`);
   }
   /* The CSP has no 'unsafe-inline' for scripts, so an inline handler would simply not run. */
   if (file.endsWith('.html')) {

@@ -53,6 +53,39 @@ function redirect(url, pathname) {
   });
 }
 
+/* A missing page has to link back to the prefix that served it, and one static file cannot know
+   which prefix that was — so the 404 is generated here, where the prefix is known. */
+function notFound(prefix) {
+  return new Response(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Not found</title>
+<style>
+  :root { color-scheme: dark light; }
+  body { margin: 0; background: #0d1117; color: #e6edf3;
+         font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 42rem; margin: 0 auto; padding: 3rem 1.25rem; }
+  h1 { margin: 0 0 0.5rem; font-size: 2rem; }
+  p { color: #9198a1; }
+  a { color: #4c8dff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Not found</h1>
+  <p>That page does not exist.</p>
+  <p><a href="${prefix}/">Back to Splitter</a></p>
+</main>
+</body>
+</html>
+`, {
+    status: 404,
+    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }
+  });
+}
+
 async function handleApi(request, env, url) {
   const path = url.pathname.slice(API_PREFIX.length);
   if (path === '/health') return json({ ok: true, version: VERSION });
@@ -62,6 +95,8 @@ async function handleApi(request, env, url) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const prefix =
+      url.pathname === PREVIEW || url.pathname.startsWith(`${PREVIEW}/`) ? PREVIEW : CANONICAL;
 
     /* The preview route serves the canonical asset tree, so a file is never moved at cutover:
        /w/expense-splitter-preview/style.css reads /w/expense-splitter/style.css. */
@@ -83,6 +118,14 @@ export default {
     const assetUrl = new URL(url.pathname + url.search, url.origin);
     const response = await env.ASSETS.fetch(new Request(assetUrl, request));
     const headers = new Headers(response.headers);
+
+    if (response.status === 404) {
+      const page = notFound(prefix);
+      for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
+      for (const [name, value] of page.headers) headers.set(name, value);
+      return new Response(page.body, { status: 404, headers });
+    }
+
     for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
     if (!headers.has('cache-control')) {
       headers.set('cache-control', 'public, max-age=0, must-revalidate');

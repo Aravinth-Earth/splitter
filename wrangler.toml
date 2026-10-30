@@ -14,7 +14,9 @@ compatibility_date = "2026-10-30"
 directory = "./public"
 binding = "ASSETS"
 html_handling = "auto-trailing-slash"
-not_found_handling = "404-page"
+# Missing paths are answered by the Worker, not by a static page: the 404 has to link back to
+# whichever prefix served it (preview or canonical), and a file cannot know that.
+not_found_handling = "none"
 # Assets would otherwise be served before the Worker, and the page would lose the CSP/HSTS
 # headers the rest of the site sets.
 run_worker_first = true

@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Splitter</title>
-  <meta name="description" content="Split expenses with a group over one code. Everything is encrypted in your browser; the server only ever holds ciphertext." />
+  <meta name="description" content="Split expenses with a group over one code. Names, amounts and splits are encrypted in your browser, so the server cannot read them." />
   <meta name="color-scheme" content="dark light" />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -24,15 +24,18 @@
     <h2>What the server sees</h2>
     <p>
       The code is the key. It never leaves the page: the browser turns it into an AES-256-GCM key and
-      seals every name, amount and split before anything is sent. The server holds ciphertext, ids and
-      timestamps — and cannot decrypt any of it.
+      seals every name, amount and split before anything is sent. The server holds ciphertext plus the
+      ids and timestamps needed to route it — and cannot read any of the content.
     </p>
     <p class="muted">
       Honest limits: a code that leaks cannot be revoked, a device's own cache is plaintext, and the
       server cannot check that a split adds up because it cannot read either number.
     </p>
 
-    <p class="status">In development. This page is a placeholder while the app is built.</p>
+    <p class="status">
+      In development — this page is a placeholder while the app is built.
+      <a href="/">The rest of the site is here.</a>
+    </p>
   </main>
 </body>
 </html>

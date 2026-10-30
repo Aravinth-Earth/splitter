@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "check": "node scripts/check.mjs",
-    "deploy": "wrangler deploy"
+    "deploy": "node scripts/check.mjs && wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4.42.0"
