@@ -4,11 +4,27 @@
 # Estimation app: the page and the API live at /w/expense-splitter/, and the Worker answers
 # both so the security headers cannot be bypassed by reading a static file directly.
 #
-# M0 has no Durable Objects yet: groups arrive with M2, and the bindings land in the same PR
-# as the classes plus a v1 migration.
+# Two Durable Object classes: the Registry singleton holds the slot ledger, and one Group holds
+# one group's records. Both are SQLite-backed: a new namespace can only be created with the
+# SQLite backend now, and it is the only one the SQL API (the ledger table) is available on. The
+# Group keeps its records in the key-value API, which a SQLite-backed namespace serves as well.
 name = "splitter"
 main = "src/index.js"
 compatibility_date = "2026-10-30"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
+[[durable_objects.bindings]]
+name = "GROUPS"
+class_name = "Group"
+
+# v1 creates both namespaces. The bindings and the classes land together: a binding without a
+# migration fails the deploy, and a migration without a class fails it too.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Registry", "Group"]
 
 [assets]
 directory = "./public"
@@ -47,6 +63,17 @@ zone_name = "332321.xyz"
 # run without this block -- an empty one is enough. Without it every branch build fails in a few
 # seconds and every PR carries a red check that says nothing about the code.
 [previews]
+
+# The Worker reaches both classes through `env`, so a Preview needs the bindings too: without them
+# /api/create answers 1101 in a Preview instead of reserving anything. Each Preview still gets its
+# own namespace and storage.
+[[previews.durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
+[[previews.durable_objects.bindings]]
+name = "GROUPS"
+class_name = "Group"
 
 [observability]
 enabled = true
