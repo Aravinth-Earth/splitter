@@ -157,8 +157,8 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
     for (const result of limited) assert.deepEqual(result.body, { error: 'limit' });
     for (const result of results) assert.ok([200, 429].includes(result.status), `unexpected ${result.status}`);
 
-    /* A refusal is not a slot: the group that was turned away can be created again once a slot
-       frees, and the ones that were accepted are stable. */
+    /* A refusal is not a slot: re-sending the refused id while the ledger is still full is
+       refused again, so the refusal neither held a slot nor freed one. */
     const refusedId = ids[results.findIndex((result) => result.status === 429)];
     assert.equal((await createGroup(worker.baseUrl, createBody(refusedId))).status, 429);
 
@@ -280,4 +280,36 @@ test('create: a body over the cap is refused without a content-length to check',
   const created = await createGroup(worker.baseUrl, createBody(id22()));
   assert.equal(created.status, 200, 'an oversized body must not have taken the only slot');
   assert.deepEqual(created.body, { ok: true });
+});
+
+test('create: the body cap is a threshold, not a wall', async (t) => {
+  /* Both sides of the same number, with one slot at stake so a refusal that quietly took a slot
+     and an acceptance that quietly took none are both visible. The chunked case above pins the
+     rule that the cap counts bytes received; this one pins the number it counts to. */
+  const worker = await startWorker({ vars: { MAX_GROUPS: '1' } });
+  t.after(async () => {
+    await worker.stop();
+  });
+
+  /* About 120 KB: over the 64 KiB cap. */
+  const oversized = { ...createBody(id22()), nameBlob: sealed(90_000) };
+  const oversizedBytes = JSON.stringify(oversized).length;
+  assert.ok(oversizedBytes > 64 * 1024, `the fixture must exceed the cap, got ${oversizedBytes} bytes`);
+  const refused = await createGroup(worker.baseUrl, oversized);
+  assert.equal(refused.status, 400, 'a body over 64 KiB must be refused');
+  assert.deepEqual(refused.body, { error: 'body' });
+
+  /* About 53 KB: a large but legal create, comfortably inside the cap. It must still get the
+     slot, so the cap cannot be satisfied by refusing everything. */
+  const large = { ...createBody(id22()), nameBlob: sealed(40_000) };
+  const size = JSON.stringify(large).length;
+  assert.ok(size > 32 * 1024 && size < 64 * 1024, `the fixture must sit under the cap, got ${size} bytes`);
+  const accepted = await createGroup(worker.baseUrl, large);
+  assert.equal(accepted.status, 200, `a ${size}-byte body is under 64 KiB and must be accepted`);
+  assert.deepEqual(accepted.body, { ok: true });
+
+  /* The oversized body spent nothing and the legal one spent the one slot: hence the refusal. */
+  const next = await createGroup(worker.baseUrl, createBody(id22()));
+  assert.equal(next.status, 429, 'the refusal must not have taken a slot, and the acceptance must have');
+  assert.deepEqual(next.body, { error: 'limit' });
 });
