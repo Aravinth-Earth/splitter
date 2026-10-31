@@ -86,9 +86,116 @@ function notFound(prefix) {
   });
 }
 
+/* An id the client can send: a group id from crypto.js (64 lowercase hex, a hash of the code) or
+   the 22-character base64url shape a member id has. Both are opaque here — the ledger and the
+   Durable Object name only need to be unforgeable and stable, and neither is a secret we can read
+   anything out of. */
+const ID = /^(?:[A-Za-z0-9_-]{22}|[0-9a-f]{64})$/;
+/* A sealed value as crypto.js writes it: {iv, ct}, unpadded base64url, the iv 12 bytes. */
+const BASE64URL = /^[A-Za-z0-9_-]+$/;
+const IV_LENGTH = 16;
+/* A sealed name is a few hundred bytes; a body larger than this is not a create. */
+const MAX_BODY_BYTES = 64 * 1024;
+
+function isId(value) {
+  return typeof value === 'string' && ID.test(value);
+}
+
+/* The Worker never opens a blob — it cannot, and must not be able to. It checks the envelope and
+   stores the bytes as they arrived. */
+function isSealed(value) {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof value.iv === 'string' &&
+    value.iv.length === IV_LENGTH &&
+    BASE64URL.test(value.iv) &&
+    typeof value.ct === 'string' &&
+    value.ct.length > 0 &&
+    BASE64URL.test(value.ct)
+  );
+}
+
+/**
+ * One internal POST to a Durable Object.
+ *
+ * Both classes take their work over `fetch`, so a call is a request and there is no second calling
+ * convention to keep in step. A failed call answers `ok: false` rather than throwing, so the caller
+ * decides what a broken ledger means.
+ */
+async function callDurable(stub, url, body) {
+  const response = await stub.fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return { ok: response.ok, body: await response.json().catch(() => ({})) };
+}
+
+/**
+ * Reserve a slot and initialise the group.
+ *
+ * The body carries no plaintext: `groupId` and `hostId` are hashes, and the name and meta are
+ * sealed under a key derived from the code in the browser. Everything is refused before a Durable
+ * Object is touched, so a malformed request costs no slot.
+ */
+async function createGroup(request, env) {
+  if (request.method !== 'POST') return json({ error: 'method' }, 405);
+
+  const declared = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return json({ error: 'body' }, 400);
+
+  let input;
+  try {
+    input = await request.json();
+  } catch {
+    return json({ error: 'body' }, 400);
+  }
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    return json({ error: 'body' }, 400);
+  }
+
+  const { groupId, hostId, nameBlob, metaBlob } = input;
+  if (!isId(groupId)) return json({ error: 'groupId' }, 400);
+  if (!isId(hostId)) return json({ error: 'hostId' }, 400);
+  if (!isSealed(nameBlob)) return json({ error: 'blob' }, 400);
+  if (metaBlob !== undefined && metaBlob !== null && !isSealed(metaBlob)) {
+    return json({ error: 'blob' }, 400);
+  }
+
+  const registry = env.REGISTRY.get(env.REGISTRY.idFromName('registry'));
+  const slot = await callDurable(registry, 'https://registry/reserve', { groupId });
+  if (!slot.ok) return json({ error: 'internal' }, 500);
+  if (!slot.body.ok) return json({ error: 'limit' }, 429);
+
+  const group = env.GROUPS.get(env.GROUPS.idFromName(groupId));
+  let initialised;
+  try {
+    initialised = await callDurable(group, 'https://group/init', {
+      hostId,
+      nameBlob,
+      metaBlob: metaBlob ?? null
+    });
+  } catch {
+    initialised = { ok: false };
+  }
+
+  if (!initialised.ok) {
+    /* Only a call that took the slot gives it back: a retry found the group already there, and it
+       must not free the slot the first create is holding. */
+    if (slot.body.reserved) {
+      await callDurable(registry, 'https://registry/release', { groupId }).catch(() => {});
+    }
+    return json({ error: 'internal' }, 500);
+  }
+
+  return json({ ok: true });
+}
+
 async function handleApi(request, env, url) {
   const path = url.pathname.slice(API_PREFIX.length);
   if (path === '/health') return json({ ok: true, version: VERSION });
+  if (path === '/create') return createGroup(request, env);
   return json({ error: 'not_found' }, 404);
 }
 
@@ -137,3 +244,7 @@ export default {
     });
   }
 };
+
+/* The classes the bindings in wrangler.toml name. */
+export { Group } from './group.js';
+export { Registry } from './registry.js';
