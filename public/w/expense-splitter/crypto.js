@@ -156,11 +156,27 @@ export async function idFromSecret(secret) {
   return toBase64Url(digest.slice(0, ID_BYTES));
 }
 
+/**
+ * The GCM parameters for one frame. The associated data is authenticated and never encrypted: it
+ * is what the record *is* — its kind, its group id, its record id — so a blob lifted into another
+ * record, or into another group that happens to share a key, fails to open even under the right key.
+ */
+function gcmParams(iv, associated) {
+  const params = { name: 'AES-GCM', iv, tagLength: 128 };
+  if (associated === undefined || associated === '') return params;
+  if (typeof associated !== 'string') {
+    throw new Error('splitter: associated data must be a string');
+  }
+  params.additionalData = encoder.encode(associated);
+  return params;
+}
+
 /** Seal a JSON value under a group key, with a fresh 12-byte IV every time. */
-export async function seal(key, value) {
+export async function seal(key, value, associated) {
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+  const params = gcmParams(iv, associated);
   const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
+    params,
     key,
     encoder.encode(JSON.stringify(value))
   );
@@ -169,9 +185,9 @@ export async function seal(key, value) {
 
 /**
  * Open a sealed value, or throw. The GCM tag is what decides: a flipped bit anywhere in the
- * ciphertext, the IV or the tag is a refusal, never a partial read.
+ * ciphertext, the IV, the tag or the associated data is a refusal, never a partial read.
  */
-export async function open(key, sealed) {
+export async function open(key, sealed, associated) {
   if (!sealed || typeof sealed.iv !== 'string' || typeof sealed.ct !== 'string') {
     throw new Error('splitter: a sealed value carries an iv and a ct');
   }
@@ -181,10 +197,11 @@ export async function open(key, sealed) {
     throw new Error(`splitter: a sealed value carries a ${IV_BYTES}-byte iv`);
   }
   const ciphertext = fromBase64Url(sealed.ct, 'the ciphertext');
+  const params = gcmParams(iv, associated);
 
   let plaintext;
   try {
-    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, ciphertext);
+    plaintext = await crypto.subtle.decrypt(params, key, ciphertext);
   } catch {
     throw new Error('splitter: this value was not sealed under this key');
   }

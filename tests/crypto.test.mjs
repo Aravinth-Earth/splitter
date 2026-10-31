@@ -306,3 +306,64 @@ test('prints the derived group id shape', async (t) => {
   assert.match(id, HEX_64);
   assert.equal(key.algorithm.length, KEY_BITS);
 });
+
+/*
+ * A known-answer vector. The three labels, the salt recipe and the iteration count are already in
+ * browsers: move one and every group id and every key in the wild moves with it, so a group opens
+ * to nothing and its records are unreadable. Consistency checks cannot see that — each derivation
+ * still agrees with itself — so the bytes themselves are pinned here.
+ */
+const KAT_CODE = 'ABCDEFGHJKMNPQRS';
+const KAT_GROUP_ID = '0fdd7a502a8bb14cf22851cd4a0c60fca5c514fb7c8ecb391dc47e3f9be7f786';
+const KAT_SECRET = 'AAECAwQFBgcICQoLDA0ODw';
+const KAT_MEMBER_ID = 'EPOcSRlhtThBdbTwu7zU9Q';
+/* Sealed by deriveGroupKey(KAT_CODE) as `{ k: 'v' }`. The key is non-extractable, so a stored frame
+ * is the only way to pin the key bytes: only the same derivation opens it. */
+const KAT_SEALED = { iv: 'fFRYFfYESFER6uba', ct: 'fdsVHoSPWVNEb_XO7thHzCEDtVTtvR4KKA' };
+
+test('the derivation is pinned to known bytes', async () => {
+  assert.deepEqual(
+    { ...LABELS },
+    { group: 'sp1:group:', key: 'sp1:key:', member: 'sp1:member:' },
+    'a label is wire format: moving one moves every group id and every key'
+  );
+
+  assert.equal(await groupIdFromCode(KAT_CODE), KAT_GROUP_ID);
+  assert.equal(
+    await groupIdFromCode(formatCode(KAT_CODE).toLowerCase()),
+    KAT_GROUP_ID,
+    'the vector names the same group through the formatted reading'
+  );
+  assert.equal(await idFromSecret(KAT_SECRET), KAT_MEMBER_ID);
+  assert.deepEqual(
+    await open(await deriveGroupKey(KAT_CODE), KAT_SEALED),
+    { k: 'v' },
+    'a key derived differently must not open a frame sealed before the change'
+  );
+});
+
+test('a seal can bind the record it belongs to', async () => {
+  const key = await deriveGroupKey(generateCode());
+  const bound = 'sp1:rec:g:73e7f14/kind:expense/id:7';
+  const sealed = await seal(key, { amount: 100 }, bound);
+
+  assert.deepEqual(await open(key, sealed, bound), { amount: 100 });
+  assert.deepEqual(
+    Object.keys(sealed).sort(),
+    ['ct', 'iv'],
+    'the binding is authenticated, not carried in the frame'
+  );
+
+  await assert.rejects(
+    open(key, sealed, 'sp1:rec:g:73e7f14/kind:expense/id:8'),
+    /sealed under this key/,
+    'another record id must not open it'
+  );
+  await assert.rejects(
+    open(key, sealed),
+    /sealed under this key/,
+    'an unbound open must not accept a bound frame'
+  );
+  await assert.rejects(open(key, sealed, 7), /associated data must be a string/);
+  await assert.rejects(seal(key, { amount: 100 }, null), /associated data must be a string/);
+});
