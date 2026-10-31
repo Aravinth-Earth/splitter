@@ -54,6 +54,22 @@ async function createGroup(baseUrl, payload) {
   return post(baseUrl, '/create', payload);
 }
 
+/**
+ * A body sent chunk by chunk, so the request carries no `content-length` at all.
+ *
+ * This is the shape a declared-length check cannot see, and the one that decides whether the cap
+ * is a limit on the bytes received or only on a header the client wrote.
+ */
+function streamedJson(payload, chunk = 8192) {
+  const bytes = new TextEncoder().encode(payload);
+  return new ReadableStream({
+    start(controller) {
+      for (let at = 0; at < bytes.length; at += chunk) controller.enqueue(bytes.slice(at, at + chunk));
+      controller.close();
+    }
+  });
+}
+
 /* ------------------------------------------------------------------ the gate */
 
 test('create: twenty-six creates against a cap of twenty-five leave twenty-five groups', async (t) => {
@@ -235,4 +251,33 @@ test('group: the group stores its host, an approval join mode and revision zero'
   assert.equal(second.created, false);
   assert.deepEqual(stored.get('meta'), meta);
   assert.equal(stored.get('meta').rev, 0);
+});
+
+/* ------------------------------------------------------- the cap on received bytes */
+
+test('create: a body over the cap is refused without a content-length to check', async (t) => {
+  /* One slot, so whether the refusal cost one is visible in the next create. */
+  const worker = await startWorker({ vars: { MAX_GROUPS: '1' } });
+  t.after(async () => {
+    await worker.stop();
+  });
+
+  /* Just over the 64 KiB cap, and sent chunked: no content-length header exists to read. */
+  const payload = JSON.stringify({ groupId: id22(), hostId: id22(), nameBlob: sealed(50_000) });
+  assert.ok(payload.length > 64 * 1024, 'the fixture must exceed the cap');
+
+  const response = await fetch(`${worker.baseUrl}${API}/create`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: streamedJson(payload),
+    duplex: 'half',
+    signal: AbortSignal.timeout(15_000)
+  });
+  assert.equal(response.status, 400, 'the cap is on the bytes received, not on a header');
+  assert.deepEqual(await response.json(), { error: 'body' });
+
+  /* A refused body is not a create: the only slot is still free. */
+  const created = await createGroup(worker.baseUrl, createBody(id22()));
+  assert.equal(created.status, 200, 'an oversized body must not have taken the only slot');
+  assert.deepEqual(created.body, { ok: true });
 });

@@ -94,11 +94,55 @@ const ID = /^(?:[A-Za-z0-9_-]{22}|[0-9a-f]{64})$/;
 /* A sealed value as crypto.js writes it: {iv, ct}, unpadded base64url, the iv 12 bytes. */
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const IV_LENGTH = 16;
-/* A sealed name is a few hundred bytes; a body larger than this is not a create. */
+/* A sealed name is a few hundred bytes; a body larger than this is not a create. The cap is a
+   limit on the bytes received, not on `content-length`: a chunked body carries no length header,
+   and a declared one is only a claim. */
 const MAX_BODY_BYTES = 64 * 1024;
 
 function isId(value) {
   return typeof value === 'string' && ID.test(value);
+}
+
+/**
+ * The request body, refused the moment it exceeds the cap.
+ *
+ * `content-length` is read first because a refusal that costs no read is the cheap one, but it is
+ * never trusted on its own: the body is counted as it arrives and reading stops at the cap, so an
+ * unbounded body cannot be buffered and an oversized one never reaches the parser or a Durable
+ * Object. The result is text, because the cap has to be decided on bytes and only then parsed.
+ *
+ * @returns {Promise<{text: string} | {tooLarge: true} | {failed: true}>}
+ */
+async function readCappedBody(request) {
+  const declared = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return { tooLarge: true };
+  if (!request.body) return { text: '' };
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let total = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_BODY_BYTES) {
+        await reader.cancel().catch(() => {});
+        return { tooLarge: true };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch {
+    /* The client went away mid-body: that is a bad request, not a server fault. */
+    return { failed: true };
+  } finally {
+    reader.releaseLock?.();
+  }
+
+  return { text };
 }
 
 /* The Worker never opens a blob — it cannot, and must not be able to. It checks the envelope and
@@ -142,12 +186,12 @@ async function callDurable(stub, url, body) {
 async function createGroup(request, env) {
   if (request.method !== 'POST') return json({ error: 'method' }, 405);
 
-  const declared = Number(request.headers.get('content-length'));
-  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return json({ error: 'body' }, 400);
+  const body = await readCappedBody(request);
+  if (body.tooLarge || body.failed) return json({ error: 'body' }, 400);
 
   let input;
   try {
-    input = await request.json();
+    input = JSON.parse(body.text);
   } catch {
     return json({ error: 'body' }, 400);
   }
