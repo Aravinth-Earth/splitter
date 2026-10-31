@@ -15,7 +15,8 @@ and a branch build only uploads a preview version — it never takes production 
 5. **Deep review** by a focused reviewer against `docs/review-brief.md`: every finding is classified by
    severity, fixed, or filed as a backlog item when it cannot land in this PR. The review is re-run until
    nothing actionable is left.
-6. **Merge.**
+6. **The owner merges.** A green run or a reviewer's verdict is not permission: the repository owner reads
+   the pull request and merges it. No auto-merge, no admin bypass, no merge by a contributor's tooling.
 7. **Verify the deployment**: exercise the live URL and run the whole regression suite against it, not just
    the new tests.
 8. **Any failure is a bug**: a patch branch, its own review, merge, retest. Then the cycle restarts at step 1
