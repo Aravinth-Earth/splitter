@@ -32,5 +32,8 @@ jobs:
       - name: guards — no third-party, no inline handlers, no overclaiming copy
         run: npm run check
 
+      - name: tests — node:test
+        run: npm test
+
       - name: wrangler configuration resolves and bundles
         run: npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/dry-run"
