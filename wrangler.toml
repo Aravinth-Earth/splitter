@@ -43,5 +43,10 @@ zone_name = "332321.xyz"
 pattern = "www.332321.xyz/w/expense-splitter-preview"
 zone_name = "332321.xyz"
 
+# Workers Builds runs `npx wrangler preview` for every branch push, and that command refuses to
+# run without this block -- an empty one is enough. Without it every branch build fails in a few
+# seconds and every PR carries a red check that says nothing about the code.
+[previews]
+
 [observability]
 enabled = true
