@@ -21,8 +21,19 @@ not_found_handling = "none"
 # headers the rest of the site sets.
 run_worker_first = true
 
-# The preview route is where the app is built. It serves the SAME asset tree as the canonical
-# path (the Worker rewrites the prefix), so the cutover is a route change and nothing else.
+# The canonical site. The Worker answers it, so the page and its security headers cannot be
+# obtained from a static file, and the old localStorage build is retired from this path.
+[[routes]]
+pattern = "www.332321.xyz/w/expense-splitter/*"
+zone_name = "332321.xyz"
+
+# A wildcard route does not match the slash-less path, so the bare canonical path needs its own.
+[[routes]]
+pattern = "www.332321.xyz/w/expense-splitter"
+zone_name = "332321.xyz"
+
+# The preview route serves the SAME asset tree as the canonical path (the Worker rewrites the
+# prefix), so a branch build can be exercised without touching what visitors see.
 [[routes]]
 pattern = "www.332321.xyz/w/expense-splitter-preview/*"
 zone_name = "332321.xyz"
@@ -31,6 +42,11 @@ zone_name = "332321.xyz"
 [[routes]]
 pattern = "www.332321.xyz/w/expense-splitter-preview"
 zone_name = "332321.xyz"
+
+# Workers Builds runs `npx wrangler preview` for every branch push, and that command refuses to
+# run without this block -- an empty one is enough. Without it every branch build fails in a few
+# seconds and every PR carries a red check that says nothing about the code.
+[previews]
 
 [observability]
 enabled = true
