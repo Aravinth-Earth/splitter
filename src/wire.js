@@ -31,6 +31,14 @@ export function isId(value) {
   return typeof value === 'string' && ID.test(value);
 }
 
+/* A group id is the 64 hex characters in a hash of the code: the one id shape that names a
+   Durable Object. The room in a socket URL must be this, never a member id. */
+const GROUP_ID = /^[0-9a-f]{64}$/;
+
+export function isGroupId(value) {
+  return typeof value === 'string' && GROUP_ID.test(value);
+}
+
 /* The Worker never opens a blob — it cannot, and must not be able to. It checks the envelope and
    stores the bytes as they arrived. */
 export function isSealed(value) {

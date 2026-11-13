@@ -1,0 +1,301 @@
+/**
+ * A socket has no identity until its first frame.
+ *
+ * Two guarantees live here. The room id in the URL is a hash of the code — it says whether a group
+ * exists, never whether the person asking is a member — so an accepted socket is a socket with no
+ * content on it. And a join request writes a pending roster entry and answers with exactly
+ * `{t:"waiting", memberId}`: no blob, no roster, no state. The organizer's own frame is the one
+ * place the pending name is visible, because the organizer has to decide.
+ *
+ * These tests run against the real `wrangler dev`, with the real Durable Object and its storage.
+ */
+
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { startWorker } from './wrangler.mjs';
+import {
+  deriveGroupKey,
+  generateCode,
+  groupIdFromCode,
+  idFromSecret,
+  randomSecret,
+  seal
+} from '../public/crypto.js';
+import { memberIdFromSecret } from '../src/identity.js';
+
+/* The same vector tests/crypto.test.mjs pins for the browser. Two copies of the label must produce
+   one member id, or a socket would verify against an id no client can present. */
+const KAT_SECRET = 'AAECAwQFBgcICQoLDA0ODw';
+const KAT_MEMBER_ID = 'EPOcSRlhtThBdbTwu7zU9Q';
+
+/**
+ * A socket that hands the test one frame at a time.
+ *
+ * Frames that arrive before the test asks are queued, so a fast server cannot race a slow
+ * assertion. `next` rejects on close, which turns "the server said nothing" into a named failure
+ * rather than a timeout with no context.
+ */
+function connect(url) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url);
+    const frames = [];
+    const waiters = [];
+    let closed = null;
+
+    ws.addEventListener('message', (event) => {
+      const frame = JSON.parse(event.data);
+      const waiter = waiters.shift();
+      if (waiter) waiter.resolve(frame);
+      else frames.push(frame);
+    });
+
+    ws.addEventListener('close', (event) => {
+      closed = { code: event.code, reason: event.reason };
+      for (const waiter of waiters.splice(0)) {
+        waiter.reject(new Error(`socket closed ${event.code} before a frame arrived`));
+      }
+    });
+
+    ws.addEventListener('error', () => {
+      /* The close event carries the code; an error event is not extra information here. */
+    });
+
+    ws.addEventListener(
+      'open',
+      () => {
+        resolve({
+          frames,
+          send(frame) {
+            ws.send(JSON.stringify(frame));
+          },
+          close() {
+            ws.close();
+          },
+          closed() {
+            return closed;
+          },
+          next(timeoutMs = 5_000) {
+            if (frames.length) return Promise.resolve(frames.shift());
+            return new Promise((done, fail) => {
+              const timer = setTimeout(() => fail(new Error(`no frame within ${timeoutMs} ms`)), timeoutMs);
+              waiters.push({
+                resolve(value) {
+                  clearTimeout(timer);
+                  done(value);
+                },
+                reject(error) {
+                  clearTimeout(timer);
+                  fail(error);
+                }
+              });
+            });
+          },
+          async silence(ms = 400) {
+            if (frames.length) throw new Error(`unexpected frame: ${JSON.stringify(frames[0])}`);
+            await new Promise((done) => setTimeout(done, ms));
+            if (frames.length) throw new Error(`unexpected frame: ${JSON.stringify(frames[0])}`);
+          },
+          async waitClosed(timeoutMs = 5_000) {
+            if (closed) return closed;
+            return new Promise((done, fail) => {
+              const deadline = Date.now() + timeoutMs;
+              const poll = setInterval(() => {
+                if (closed) {
+                  clearInterval(poll);
+                  done(closed);
+                } else if (Date.now() > deadline) {
+                  clearInterval(poll);
+                  fail(new Error('socket did not close'));
+                }
+              }, 20);
+            });
+          }
+        });
+      },
+      { once: true }
+    );
+
+    ws.addEventListener('error', () => reject(new Error(`could not connect to ${url}`)), { once: true });
+  });
+}
+
+function socketUrl(baseUrl, groupId) {
+  return `${baseUrl.replace(/^http/, 'ws')}/api/ws?room=${groupId}`;
+}
+
+async function createGroup(baseUrl) {
+  const code = generateCode();
+  const groupId = await groupIdFromCode(code);
+  const key = await deriveGroupKey(code);
+  const hostSecret = randomSecret();
+  const hostId = await idFromSecret(hostSecret);
+  const nameBlob = await seal(key, { name: 'Host' });
+
+  const response = await fetch(`${baseUrl}/api/create`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      groupId,
+      hostId,
+      nameBlob,
+      metaBlob: await seal(key, { currency: 'INR' })
+    })
+  });
+  assert.equal(response.status, 200, 'the group must exist before a socket can reach it');
+
+  return { code, groupId, key, hostSecret, hostId };
+}
+
+test('the member id the server derives is the id the browser derives', async () => {
+  assert.equal(await memberIdFromSecret(KAT_SECRET), KAT_MEMBER_ID);
+  assert.equal(await idFromSecret(KAT_SECRET), KAT_MEMBER_ID);
+});
+
+test('a join writes a pending seat: waiting to the joiner, the name to the host', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+
+  const hostState = await host.next();
+  assert.equal(hostState.t, 'state');
+  assert.equal(hostState.role, 'host');
+  assert.equal(hostState.roster.length, 0, 'the host is the viewer, not an entry in its own roster');
+
+  const joinerSecret = randomSecret();
+  const joinerId = await idFromSecret(joinerSecret);
+  const joinerName = await seal(group.key, { name: 'Joiner' });
+
+  const joiner = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => joiner.close());
+  joiner.send({
+    t: 'auth',
+    id: joinerId,
+    secret: joinerSecret,
+    mode: 'join',
+    nameBlob: joinerName
+  });
+
+  const waiting = await joiner.next();
+  assert.deepEqual(Object.keys(waiting).sort(), ['memberId', 't'], 'a pending frame has no other key');
+  assert.equal(waiting.t, 'waiting');
+  assert.equal(waiting.memberId, joinerId);
+  assert.ok(!JSON.stringify(waiting).includes('blob'), 'no sealed value reaches a pending socket');
+
+  await joiner.silence(600);
+
+  const update = await host.next();
+  assert.equal(update.t, 'state');
+  const pending = update.roster.find((member) => member.id === joinerId);
+  assert.ok(pending, 'the organizer must see the person asking');
+  assert.equal(pending.status, 'pending');
+  assert.deepEqual(pending.nameBlob, joinerName, 'the host receives the sealed name, not the name');
+
+  const approved = update.roster.filter((member) => member.status === 'approved');
+  assert.equal(approved.length, 0, 'a pending person is not an approved member');
+});
+
+test('a wrong secret closes the socket with no frames', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const socket = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => socket.close());
+
+  socket.send({ t: 'auth', id: group.hostId, secret: randomSecret(), mode: 'resume' });
+
+  const closed = await socket.waitClosed();
+  assert.equal(closed.code, 1008);
+  assert.equal(socket.frames.length, 0, 'a refused identity receives nothing, not even an error frame');
+});
+
+test('a socket that never authenticates is closed', async (t) => {
+  const worker = await startWorker({ vars: { AUTH_TIMEOUT_MS: '400' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const socket = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => socket.close());
+
+  const closed = await socket.waitClosed();
+  assert.equal(closed.code, 1008);
+  assert.equal(socket.frames.length, 0);
+});
+
+test('an unknown room, a bad origin and a non-upgrade request are refused before a socket exists', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  /* No upgrade header: these are the checks that run before a socket could exist, so a plain GET
+     is the whole request. */
+  await assert.rejects(
+    connect(`${worker.baseUrl.replace(/^http/, 'ws')}/api/ws?room=${'a'.repeat(64)}`),
+    'an unknown room must not complete a handshake'
+  );
+
+  const origin = await fetch(`${worker.baseUrl}/api/ws?room=${group.groupId}`, {
+    headers: { origin: 'https://evil.example' }
+  });
+  assert.equal(origin.status, 403);
+
+  const upgrade = await fetch(`${worker.baseUrl}/api/ws?room=${group.groupId}`, {
+    headers: { origin: worker.baseUrl }
+  });
+  assert.equal(upgrade.status, 426);
+
+  const room = await fetch(`${worker.baseUrl}/api/ws?room=not-a-group`, {
+    headers: { origin: worker.baseUrl }
+  });
+  assert.equal(room.status, 400);
+});
+
+test('a full group refuses the next join with a code and no seat', async (t) => {
+  const worker = await startWorker({ vars: { MAX_MEMBERS: '2' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const firstSecret = randomSecret();
+  const firstId = await idFromSecret(firstSecret);
+  const first = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => first.close());
+  first.send({
+    t: 'auth',
+    id: firstId,
+    secret: firstSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'First' })
+  });
+  assert.equal((await first.next()).t, 'waiting');
+  await host.next();
+
+  const secondSecret = randomSecret();
+  const secondId = await idFromSecret(secondSecret);
+  const second = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => second.close());
+  second.send({
+    t: 'auth',
+    id: secondId,
+    secret: secondSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Second' })
+  });
+
+  const refused = await second.next();
+  assert.deepEqual(refused, { t: 'refused', code: 'group_full' });
+  const closed = await second.waitClosed();
+  assert.equal(closed.code, 1008);
+});
