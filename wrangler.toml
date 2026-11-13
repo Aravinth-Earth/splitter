@@ -41,13 +41,13 @@ run_worker_first = true
 # The app's own origin. The name is the mount: the Worker answers / and /api/* on this host, and
 # no path on the main site reaches it.
 #
-# One pattern, with the wildcard directly after the host rather than after a slash. A route is
-# matched against the whole request URL, so a bare host — a link a chat client stripped the path
-# from — matches neither `expense-splitter.332321.xyz` nor `expense-splitter.332321.xyz/*` and
-# would fall through to whatever the DNS record points at. `expense-splitter.332321.xyz*` covers
-# the bare host, a query-carrying shape and every path beneath it.
+# One pattern, with the wildcard at the end of the path. Cloudflare accepts wildcards only at the
+# beginning of the hostname and the end of the path, so a host-only pattern is refused outright
+# (API code 10022) — after the merge, in the deploy, where no local dry run can see it. A request
+# to the bare host arrives with the path `/` and matches `/*`, and the wildcard covers every path
+# beneath it, including a query-carrying link.
 [[routes]]
-pattern = "expense-splitter.332321.xyz*"
+pattern = "expense-splitter.332321.xyz/*"
 zone_name = "332321.xyz"
 
 # Workers Builds runs `npx wrangler preview` for every branch push, and that command refuses to

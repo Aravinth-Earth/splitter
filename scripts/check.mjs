@@ -111,10 +111,37 @@ for (const file of assets) {
   }
 }
 
+/* 4. Every Worker route is one Cloudflare accepts. Wildcards are allowed only at the beginning of
+   the hostname and at the end of the path; a host-only pattern such as `app.example.com*` is
+   refused by the API (code 10022) at deploy time, after the merge and outside every local dry
+   run. Catch it here instead. */
+const wrangler = readFileSync(join(root, 'wrangler.toml'), 'utf8');
+const routePatterns = [...wrangler.matchAll(/^\s*pattern\s*=\s*"([^"]+)"/gm)].map((match) => match[1]);
+if (routePatterns.length === 0) {
+  problems.push('wrangler.toml: no Worker route pattern found, so the route guard proves nothing');
+}
+for (const pattern of routePatterns) {
+  const slash = pattern.indexOf('/');
+  if (slash === -1) {
+    problems.push(`wrangler.toml: route "${pattern}" has no path; Cloudflare allows a wildcard only at the end of the path`);
+    continue;
+  }
+  const host = pattern.slice(0, slash);
+  const path = pattern.slice(slash);
+  const hostStars = (host.match(/\*/g) || []).length;
+  const pathStars = (path.match(/\*/g) || []).length;
+  if (hostStars && !(hostStars === 1 && host.startsWith('*.'))) {
+    problems.push(`wrangler.toml: route "${pattern}" may use a wildcard only at the start of the hostname`);
+  }
+  if (pathStars && !(pathStars === 1 && path.endsWith('*'))) {
+    problems.push(`wrangler.toml: route "${pattern}" may use a wildcard only at the end of the path`);
+  }
+}
+
 if (problems.length) {
   console.error('check failed:');
   for (const problem of problems) console.error(`  - ${problem}`);
   process.exit(1);
 }
 
-console.log(`check passed: ${assets.length} assets, no third-party references, no overclaiming copy`);
+console.log(`check passed: ${assets.length} assets, no third-party references, no overclaiming copy, route patterns valid`);
