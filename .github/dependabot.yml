@@ -1,0 +1,42 @@
+# Dependency updates. Security fixes are a repository setting, not a file: Dependabot alerts and
+# automated security updates are switched on for this repo, so a published advisory opens a PR on
+# its own. What this file adds is the other half — the ordinary version drift that nobody notices
+# until a build breaks or a stale action runs with a permission it should no longer have.
+#
+# Three PRs at a time per ecosystem, grouped: an ungrouped weekly bump on a repo that merges by hand
+# turns into a wall of single-line PRs, and the ones that matter then go unread.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 3
+    versioning-strategy: "increase"
+    groups:
+      npm-minor-and-patch:
+        applies-to: "version-updates"
+        update-types: ["minor", "patch"]
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # The workflows are as much of the supply chain here as npm is: an action tag floats until it is
+  # pinned, and `@v4` moving is exactly the change this ecosystem is for.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns: ["*"]
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "chore(ci)"

@@ -29,6 +29,12 @@ jobs:
       - name: install
         run: npm ci
 
+      # The lockfile is the whole supply chain here, and the project ships one runtime dependency
+      # plus a dev tool. A high-severity advisory in either fails the build rather than waiting for
+      # someone to read a Dependabot email: Dependabot opens the fix, this refuses the vulnerable tree.
+      - name: no known-vulnerable dependency is installed
+        run: npm audit --audit-level=high
+
       - name: guards — no third-party, no inline handlers, no overclaiming copy
         run: npm run check
 
