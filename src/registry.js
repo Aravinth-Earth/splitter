@@ -83,3 +83,5 @@ export class Registry {
     return json({ error: 'not_found' }, 404);
   }
 }
+
+/* probe: does default setup analyse a pull request head? */
