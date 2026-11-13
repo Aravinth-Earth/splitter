@@ -109,6 +109,11 @@ test('a wrong length or an impossible character throws instead of passing', () =
     assert.throws(() => normalizeCode(bad), Error, `"${bad}" must be refused`);
   }
 
+  /* A 15-character input whose last character upper-cases to two must not arrive as 16 and derive
+     a key for a group the person did not type. */
+  assert.throws(() => normalizeCode('ABCDEFGHJKMNPQ' + 'ß'), /changes length/i);
+  assert.throws(() => normalizeCode('ABCDEFGHJKMNPQ' + 'ﬁ'), /changes length/i);
+
   const impossible = ['ABCDEFGHJKMNPQR$', 'ABCDEFGHJKMNPQRé', 'ABCDEFGHJKMNPQR\u0000'];
   for (const bad of impossible) {
     assert.throws(() => normalizeCode(bad), /not a group-code character/);

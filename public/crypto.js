@@ -84,9 +84,19 @@ export function generateCode() {
 export function normalizeCode(input) {
   if (typeof input !== 'string') throw new Error('splitter: a group code must be a string');
 
-  const folded = input
-    .toUpperCase()
-    .replace(/[\s-]+/g, '')
+  const stripped = input.replace(/[\s-]+/g, '');
+  const upper = stripped.toUpperCase();
+
+  /* Uppercasing can change length ("ß" becomes "SS"), so a 15-character input could otherwise
+     arrive as 16 characters and derive a key for a group the person never typed. The length is
+     checked on the typed characters, before any fold can add one. */
+  if (upper.length !== stripped.length) {
+    throw new Error(
+      `splitter: a group code is ${CODE_LENGTH} characters; a character in the input changes length when upper-cased`
+    );
+  }
+
+  const folded = upper
     .replace(/[IL]/g, '1')
     .replace(/O/g, '0')
     .replace(/U/g, 'V');

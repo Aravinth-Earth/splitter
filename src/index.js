@@ -240,8 +240,17 @@ async function handleApi(request, env, url) {
   const path = url.pathname.slice(API_PREFIX.length);
   if (path === '/health') return json({ ok: true, version: VERSION });
   if (path === '/create') return createGroup(request, env);
+  if (path === '/room') return roomInfo(request, env, url);
   if (path === '/ws') return openSocket(request, env, url);
   return json({ error: 'not_found' }, 404);
+}
+
+/** Answer whether a room exists, without opening a socket or revealing anything it holds. */
+function roomInfo(request, env, url) {
+  if (request.method !== 'GET') return json({ error: 'method' }, 405, { allow: 'GET' });
+  const room = url.searchParams.get('room');
+  if (!isGroupId(room)) return json({ error: 'room' }, 400);
+  return env.GROUPS.get(env.GROUPS.idFromName(room)).fetch(request);
 }
 
 /**

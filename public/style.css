@@ -180,6 +180,11 @@ button {
   font-size: 0.95rem;
 }
 
+.switch {
+  margin: 1rem 0 0;
+  font-size: 0.95rem;
+}
+
 /* ------------------------------------------------------------------ group */
 
 .group-head h2 {

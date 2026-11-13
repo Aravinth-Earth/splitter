@@ -16,6 +16,7 @@ import test from 'node:test';
 import {
   CURRENCIES,
   DEFAULT_CURRENCY,
+  codeFromInput,
   countCodePoints,
   createErrorMessage,
   createPayload,
@@ -341,4 +342,35 @@ test('a denied clipboard returns false so the caller can show the fallback field
 test('a browser with no clipboard API returns false', async () => {
   assert.equal(await writeClipboardText({ navigator: {} }, 'V4ZS-XSXY-QJ0X-YJC1'), false);
   assert.equal(await writeClipboardText(undefined, 'V4ZS-XSXY-QJ0X-YJC1'), false);
+});
+
+/* -------------------------------------------------------------------- joining */
+
+test('a code is read from a typed string or a pasted invite link', () => {
+  const canonical = 'ABCDEFGHJKMNPQRS';
+
+  for (const input of [
+    'abcdefghjkmnpqrs',
+    'ABCD EFGH-JKMN PQRS',
+    'https://expense-splitter.332321.xyz/#code=abcd-efgh-jkmn-pqrs',
+    'https://expense-splitter.332321.xyz/?c=ABCD-EFGH-JKMN-PQRS&from=chat',
+    '#code=ABCD-EFGH-JKMN-PQRS'
+  ]) {
+    assert.deepEqual(codeFromInput(input), { ok: true, code: canonical }, input);
+  }
+});
+
+test('a wrong code is refused before any request', () => {
+  for (const input of ['', '   ', 'ABC', 'ABCDEFGHJKMNPQ', 'ABCDEFGHJKMNPQRSX']) {
+    const result = codeFromInput(input);
+    assert.equal(result.ok, false, input);
+    assert.match(result.message, /16 characters|Enter a group code/, input);
+  }
+
+  /* A 15-character input whose last character upper-cases to two must not become 16. */
+  assert.equal(codeFromInput('ABCDEFGHJKMNPQß').ok, false);
+
+  const link = codeFromInput('https://expense-splitter.332321.xyz/#code=%E0%A4');
+  assert.equal(link.ok, false);
+  assert.match(link.message, /readable/);
 });

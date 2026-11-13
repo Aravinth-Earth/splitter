@@ -255,6 +255,21 @@ test('an unknown room, a bad origin and a non-upgrade request are refused before
     headers: { origin: worker.baseUrl }
   });
   assert.equal(room.status, 400);
+
+  const known = await fetch(`${worker.baseUrl}/api/room?room=${group.groupId}`);
+  assert.equal(known.status, 200);
+  assert.deepEqual(await known.json(), { ok: true });
+
+  const missing = await fetch(`${worker.baseUrl}/api/room?room=${'a'.repeat(64)}`);
+  assert.equal(missing.status, 404);
+  assert.deepEqual(await missing.json(), { error: 'unknown_group' });
+
+  const malformed = await fetch(`${worker.baseUrl}/api/room?room=not-a-group`);
+  assert.equal(malformed.status, 400);
+
+  const method = await fetch(`${worker.baseUrl}/api/room?room=${group.groupId}`, { method: 'POST' });
+  assert.equal(method.status, 405);
+  assert.equal(method.headers.get('allow'), 'GET');
 });
 
 test('a full group refuses the next join with a code and no seat', async (t) => {
