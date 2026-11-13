@@ -43,12 +43,18 @@ export async function freePort() {
  */
 export async function startWorker({ vars = {}, timeoutMs = 120_000 } = {}) {
   const port = await freePort();
+  /* Two suites that each boot a Worker would otherwise fight over the inspector socket: `wrangler
+     dev` picks one by default, and the second holds it. `npm test` also runs files one at a time
+     (`--test-concurrency=1`), because a suite owns a port, a store and a process group. */
+  const inspectorPort = await freePort();
   const persistTo = join(ROOT, '.wrangler', `do-${process.pid}-${Date.now().toString(36)}`);
   const args = [
     'wrangler',
     'dev',
     '--port',
     String(port),
+    '--inspector-port',
+    String(inspectorPort),
     '--ip',
     '127.0.0.1',
     '--persist-to',
