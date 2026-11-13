@@ -412,3 +412,66 @@ test('a member cannot approve anyone', async (t) => {
   assert.equal(hostState.roster.some((member) => member.id === joinerId), true);
   await host.silence(500);
 });
+
+test('an approved member can be removed, and cannot return with the same secret', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+  const member = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => member.close());
+  member.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Removable' })
+  });
+  assert.equal((await member.next()).t, 'waiting');
+  await host.next();
+
+  host.send({ t: 'approve', memberId });
+  assert.equal((await member.next()).t, 'state');
+  await host.next();
+
+  host.send({ t: 'remove', memberId });
+
+  assert.deepEqual(await member.next(), { t: 'removed' });
+  assert.equal((await member.waitClosed()).code, 1008);
+
+  const after = await host.next();
+  assert.ok(
+    !after.roster.some((entry) => entry.id === memberId),
+    'a removed member is not on the roster'
+  );
+
+  const again = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => again.close());
+  again.send({ t: 'auth', id: memberId, secret: memberSecret, mode: 'join' });
+  assert.equal((await again.waitClosed()).code, 1008);
+  assert.equal(again.frames.length, 0, 'a removed member gets no content on reconnection');
+});
+
+test('the organizer cannot remove themselves, and only the host can remove', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  host.send({ t: 'remove', memberId: group.hostId });
+  assert.deepEqual(await host.next(), { t: 'refused', code: 'not_member' });
+  await host.silence(400);
+});

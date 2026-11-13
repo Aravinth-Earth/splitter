@@ -304,6 +304,15 @@ button {
   font-size: 0.85rem;
 }
 
+.chip.is-self {
+  background: transparent;
+}
+
+.chip button.is-armed {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
 .steps li { margin: 0.5rem 0; }
 
 /* --------------------------------------------------------------- page ends */
