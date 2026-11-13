@@ -200,6 +200,10 @@ button {
 
 .group-head #role-line { margin: 0; }
 
+#join-mode { margin: 0.15rem 0 0; }
+
+.mode-row { margin: 0.25rem 0 0; }
+
 .code-line { margin: 1rem 0 0.5rem; }
 
 .code-line code {
