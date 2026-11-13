@@ -8,8 +8,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "check": "node scripts/check.mjs",
-    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
-    "deploy": "node scripts/check.mjs && wrangler deploy"
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.159.0"

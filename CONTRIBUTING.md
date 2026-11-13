@@ -1,7 +1,9 @@
 # Contributing
 
-A merged commit is a release: Workers Builds deploys `main` on merge. There is no manual `wrangler deploy`,
-and a branch build only uploads a preview version — it never takes production traffic.
+A merged commit is a release: the Cloudflare GitHub app is installed on this repository, and Workers
+Builds deploys `main` on merge. There is no manual `wrangler deploy`, and a branch build only uploads a
+preview version — it never takes production traffic. A failed build is retried in Workers Builds, never
+from a laptop with a personal OAuth login.
 
 ## The loop every cycle runs
 
