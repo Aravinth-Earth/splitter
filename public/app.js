@@ -284,6 +284,8 @@ export function init(doc = document, win = window) {
   const copyFallbackField = doc.getElementById('copy-fallback-field');
   const whoLine = doc.getElementById('who-line');
   const roleLine = doc.getElementById('role-line');
+  const joinModeLine = doc.getElementById('join-mode');
+  const toggleModeButton = doc.getElementById('toggle-mode');
   const roster = doc.getElementById('roster');
   const rosterPending = doc.getElementById('roster-pending');
   const rosterApproved = doc.getElementById('roster-approved');
@@ -321,6 +323,7 @@ export function init(doc = document, win = window) {
   let joinPending = false;
   let joinSocket = null;
   let hostSocket = null;
+  let currentMode = 'approval';
 
   form.addEventListener('submit', (event) => {
     /* A form with no action would still navigate, and a navigation is a lost create. */
@@ -350,6 +353,12 @@ export function init(doc = document, win = window) {
   joinForm.addEventListener('submit', (event) => {
     event.preventDefault();
     void submitJoin();
+  });
+  toggleModeButton.addEventListener('click', () => {
+    if (!hostSocket || hostSocket.readyState !== 1) return;
+    const next = currentMode === 'open' ? 'approval' : 'open';
+    toggleModeButton.disabled = true;
+    hostSocket.send(JSON.stringify({ t: 'mode', mode: next }));
   });
 
   /**
@@ -435,6 +444,27 @@ export function init(doc = document, win = window) {
     };
   }
 
+  /** The join mode, and the one control only the organizer may use. */
+  function applyMode(mode, role) {
+    currentMode = mode === 'open' ? 'open' : 'approval';
+    joinModeLine.textContent =
+      currentMode === 'open'
+        ? 'Anyone with the code can join.'
+        : 'People need approval to join.';
+
+    const host = role === 'organizer' || role === 'host';
+    if (host) {
+      toggleModeButton.hidden = false;
+      toggleModeButton.disabled = false;
+      toggleModeButton.textContent =
+        currentMode === 'open'
+          ? 'Require approval again'
+          : 'Open joining to anyone with the code';
+    } else {
+      toggleModeButton.hidden = true;
+    }
+  }
+
   /** Replace the form with the group, in place: no modal, no confirmation, no second screen. */
   function showGroup({ code, name, displayName, role = 'organizer' }) {
     group = { code };
@@ -444,6 +474,7 @@ export function init(doc = document, win = window) {
     whoLine.textContent = displayName;
     whoLine.hidden = false;
     roleLine.textContent = role === 'organizer' ? 'you are the organizer' : 'you are a member';
+    applyMode('approval', role);
     roster.hidden = role !== 'organizer';
     rosterPending.textContent = '';
     rosterApproved.textContent = '';
@@ -510,6 +541,7 @@ export function init(doc = document, win = window) {
   /** The join sheet, with an optional code already in the field. */
   function showJoin({ code = '', error = '' } = {}) {
     closeJoinSocket();
+    group = null;
     createPanel.hidden = true;
     groupHeader.hidden = true;
     emptyLedger.hidden = true;
@@ -528,6 +560,8 @@ export function init(doc = document, win = window) {
 
   function showCreate() {
     closeJoinSocket();
+    closeHostSocket();
+    group = null;
     joinPanel.hidden = true;
     waitingPanel.hidden = true;
     groupHeader.hidden = true;
@@ -659,6 +693,14 @@ export function init(doc = document, win = window) {
 
       if (frame.t === 'state' && frame.role === 'member') {
         settled = true;
+
+        /* A member already in the group only needs the mode when it changes; the first state after
+           a join is what replaces the waiting screen. */
+        if (group) {
+          applyMode(frame.joinMode, 'member');
+          return;
+        }
+
         let name = 'Your group';
         try {
           const key = await deriveGroupKey(code);
@@ -668,6 +710,10 @@ export function init(doc = document, win = window) {
           /* the name stays a neutral label rather than an unreadable blob */
         }
         showGroup({ code, name, displayName: joinNameInput.value.trim(), role: 'member' });
+        applyMode(frame.joinMode, 'member');
+        if (frame.openAdmit) {
+          setStatus("You're in — this group lets anyone with the code join.");
+        }
         return;
       }
 
@@ -727,6 +773,7 @@ export function init(doc = document, win = window) {
 
     let socket;
     try {
+      toggleModeButton.disabled = true;
       socket = new win.WebSocket(url.toString());
     } catch {
       rosterEmpty.textContent = 'Could not open a connection. Reload to continue.';
@@ -738,6 +785,7 @@ export function init(doc = document, win = window) {
     const key = deriveGroupKey(code);
 
     socket.addEventListener('open', () => {
+      toggleModeButton.disabled = false;
       socket.send(JSON.stringify({ t: 'auth', id: memberId, secret, mode: 'resume' }));
     });
 
@@ -756,6 +804,7 @@ export function init(doc = document, win = window) {
       if (frame.t === 'refused') {
         rosterEmpty.textContent = 'That request could not be completed.';
         rosterEmpty.hidden = false;
+        toggleModeButton.disabled = false;
       }
     });
 
@@ -815,6 +864,7 @@ export function init(doc = document, win = window) {
     const pending = frame.roster.filter((member) => member.status === 'pending');
     const approved = frame.roster.filter((member) => member.status === 'approved');
 
+    applyMode(frame.joinMode, 'host');
     disarm();
     rosterPending.textContent = '';
     rosterApproved.textContent = '';
@@ -967,6 +1017,10 @@ export function init(doc = document, win = window) {
       showJoinError(invited.message);
     }
   }
+
+  /* A single marker for a page-level check: the form exists in the HTML before this module runs,
+     so a test that waits for the form can still click before the handlers are attached. */
+  doc.documentElement.dataset.splitter = 'ready';
 }
 
 /* Under `node --test` there is no document, so importing this module for its pure functions wires

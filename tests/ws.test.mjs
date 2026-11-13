@@ -475,3 +475,92 @@ test('the organizer cannot remove themselves, and only the host can remove', asy
   assert.deepEqual(await host.next(), { t: 'refused', code: 'not_member' });
   await host.silence(400);
 });
+
+test('open join admits a new device without a decision, and approval restores the wait', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  assert.equal((await host.next()).joinMode, 'approval');
+
+  host.send({ t: 'mode', mode: 'open' });
+  assert.equal((await host.next()).joinMode, 'open');
+
+  const openSecret = randomSecret();
+  const openId = await idFromSecret(openSecret);
+  const open = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => open.close());
+  open.send({
+    t: 'auth',
+    id: openId,
+    secret: openSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Walk In' })
+  });
+
+  const admitted = await open.next();
+  assert.equal(admitted.t, 'state');
+  assert.equal(admitted.role, 'member');
+  assert.equal(admitted.joinMode, 'open');
+  assert.equal(admitted.openAdmit, true, 'the client is told this was an open admission');
+  assert.ok(admitted.roster.some((member) => member.id === openId && member.status === 'approved'));
+
+  const hostUpdate = await host.next();
+  assert.equal(hostUpdate.joinMode, 'open');
+  assert.ok(
+    hostUpdate.roster.some((member) => member.id === openId && member.status === 'approved'),
+    'the host sees the open admission'
+  );
+
+  host.send({ t: 'mode', mode: 'approval' });
+  assert.equal((await host.next()).joinMode, 'approval');
+  assert.equal((await open.next()).joinMode, 'approval', 'every member sees the mode change');
+
+  const laterSecret = randomSecret();
+  const laterId = await idFromSecret(laterSecret);
+  const later = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => later.close());
+  later.send({
+    t: 'auth',
+    id: laterId,
+    secret: laterSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Needs Approval' })
+  });
+  assert.equal((await later.next()).t, 'waiting', 'the next joiner needs a decision again');
+});
+
+test('a member cannot change the join mode', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  assert.equal((await host.next()).joinMode, 'approval');
+
+  const secret = randomSecret();
+  const id = await idFromSecret(secret);
+  const joiner = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => joiner.close());
+  joiner.send({
+    t: 'auth',
+    id,
+    secret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Want Open' })
+  });
+  assert.equal((await joiner.next()).t, 'waiting');
+  await host.next();
+
+  joiner.send({ t: 'mode', mode: 'open' });
+  assert.deepEqual(await joiner.next(), { t: 'refused', code: 'not_host' });
+  assert.equal((await joiner.waitClosed()).code, 1008);
+  await host.silence(400);
+});

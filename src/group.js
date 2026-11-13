@@ -222,13 +222,26 @@ export class Group {
    * client sent: a member that forges `approve` changes nothing and is closed with `not_host`.
    */
   async handleAction(socket, frame) {
-    if (frame.t !== 'approve' && frame.t !== 'reject' && frame.t !== 'remove') return;
+    if (frame.t !== 'approve' && frame.t !== 'reject' && frame.t !== 'remove' && frame.t !== 'mode') {
+      return;
+    }
 
     const meta = await this.ctx.storage.get(GROUP_KEY);
     if (!meta) return this.refuse(socket, 'unknown_group');
 
     const identity = this.identities.get(socket);
     if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
+
+    if (frame.t === 'mode') {
+      if (frame.mode !== 'open' && frame.mode !== 'approval') {
+        this.sendRefusal(socket, 'bad_mode');
+        return;
+      }
+      meta.joinMode = frame.mode;
+      await this.ctx.storage.put(GROUP_KEY, meta);
+      await this.notifyState(meta);
+      return;
+    }
 
     if (!isId(frame.memberId)) {
       this.sendRefusal(socket, 'bad_request');
@@ -244,8 +257,8 @@ export class Group {
         return;
       }
       await this.ctx.storage.put(key, { ...entry, status: 'removed' });
-      await this.notifyHosts(meta);
-      await this.notifyMember(meta, frame.memberId, 'removed');
+      const handled = await this.notifyMember(meta, frame.memberId, 'removed');
+      await this.notifyState(meta, handled);
       return;
     }
 
@@ -261,14 +274,20 @@ export class Group {
       await this.ctx.storage.put(key, { ...entry, status: 'removed' });
     }
 
-    await this.notifyHosts(meta);
-    await this.notifyMember(meta, frame.memberId, frame.t === 'approve' ? 'approved' : 'declined');
+    const handled = await this.notifyMember(
+      meta,
+      frame.memberId,
+      frame.t === 'approve' ? 'approved' : 'declined'
+    );
+    await this.notifyState(meta, handled);
   }
 
   /** A decision reaches the person waiting, if they still have a socket. */
   async notifyMember(meta, memberId, outcome) {
+    const handled = new Set();
     for (const socket of this.sockets) {
       if (this.identities.get(socket)?.memberId !== memberId) continue;
+      handled.add(socket);
       if (outcome === 'approved') {
         this.identities.set(socket, { memberId, role: 'member' });
         socket.send(JSON.stringify(await this.rosterFrame(meta, memberId, 'member')));
@@ -286,6 +305,7 @@ export class Group {
         /* already gone */
       }
     }
+    return handled;
   }
 
   /** Verify the secret, then attach a role and answer with only what that role may see. */
@@ -346,6 +366,29 @@ export class Group {
       joinedAt: Date.now()
     });
 
+    if (meta.joinMode === 'open') {
+      await this.ctx.storage.put(memberKey(frame.id), {
+        status: 'approved',
+        nameBlob: frame.nameBlob,
+        joinedAt: Date.now()
+      });
+      this.identities.set(socket, { memberId: frame.id, role: 'member' });
+      socket.send(
+        JSON.stringify({
+          ...(await this.rosterFrame(meta, frame.id, 'member')),
+          openAdmit: true
+        })
+      );
+      await this.notifyState(meta, new Set([socket]));
+      return;
+    }
+
+    await this.ctx.storage.put(memberKey(frame.id), {
+      status: 'pending',
+      nameBlob: frame.nameBlob,
+      joinedAt: Date.now()
+    });
+
     this.identities.set(socket, { memberId: frame.id, role: 'pending' });
     socket.send(JSON.stringify({ t: 'waiting', memberId: frame.id }));
     await this.notifyHosts(meta);
@@ -373,7 +416,32 @@ export class Group {
         roster.push({ id, status: entry.status, nameBlob: entry.nameBlob });
       }
     }
-    return { t: 'state', rev: meta.rev, memberId, role, nameBlob: meta.nameBlob, roster };
+    return {
+      t: 'state',
+      rev: meta.rev,
+      memberId,
+      role,
+      joinMode: meta.joinMode === 'open' ? 'open' : 'approval',
+      nameBlob: meta.nameBlob,
+      roster
+    };
+  }
+
+  /**
+   * Send the state each socket is allowed to see: the host its full roster, an approved member the
+   * approved one. Pending sockets receive nothing here — waiting is the only frame they may get.
+   */
+  async notifyState(meta, skip = new Set()) {
+    for (const socket of this.sockets) {
+      if (skip.has(socket)) continue;
+      const identity = this.identities.get(socket);
+      if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
+      try {
+        socket.send(JSON.stringify(await this.rosterFrame(meta, identity.memberId, identity.role)));
+      } catch {
+        /* a socket that is already gone is not a reason to stop telling the others */
+      }
+    }
   }
 
   async notifyHosts(meta) {
