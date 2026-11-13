@@ -30,8 +30,8 @@ new_sqlite_classes = ["Registry", "Group"]
 directory = "./public"
 binding = "ASSETS"
 html_handling = "auto-trailing-slash"
-# Missing paths are answered by the Worker, not by a static page: the 404 has to link back to
-# whichever prefix served it (preview or canonical), and a file cannot know that.
+# Missing paths are answered by the Worker, not by a static page: the 404 is generated there so it
+# can carry the site's security headers, which a static file cannot.
 not_found_handling = "none"
 # Assets would otherwise be served before the Worker, and the page would lose the CSP/HSTS
 # headers the rest of the site sets.
@@ -39,24 +39,15 @@ run_worker_first = true
 
 # The canonical site. The Worker answers it, so the page and its security headers cannot be
 # obtained from a static file, and the old localStorage build is retired from this path.
+#
+# One pattern, with the wildcard directly after the path rather than after a slash. A route is
+# matched against the whole request URL, so a slash-less path that carries a query string — a link
+# a chat client tagged on the way past — matches neither `…/expense-splitter` nor `…/expense-splitter/*`
+# and would fall through to the origin behind the zone, which serves the root site's 404 with no
+# CSP and a third-party script. `…/expense-splitter*` covers the bare path, the query-carrying
+# shape and every path beneath it, so no request on this prefix reaches anything but this Worker.
 [[routes]]
-pattern = "www.332321.xyz/w/expense-splitter/*"
-zone_name = "332321.xyz"
-
-# A wildcard route does not match the slash-less path, so the bare canonical path needs its own.
-[[routes]]
-pattern = "www.332321.xyz/w/expense-splitter"
-zone_name = "332321.xyz"
-
-# The preview route serves the SAME asset tree as the canonical path (the Worker rewrites the
-# prefix), so a branch build can be exercised without touching what visitors see.
-[[routes]]
-pattern = "www.332321.xyz/w/expense-splitter-preview/*"
-zone_name = "332321.xyz"
-
-# A wildcard route does not match the slash-less path, so the bare preview path needs its own.
-[[routes]]
-pattern = "www.332321.xyz/w/expense-splitter-preview"
+pattern = "www.332321.xyz/w/expense-splitter*"
 zone_name = "332321.xyz"
 
 # Workers Builds runs `npx wrangler preview` for every branch push, and that command refuses to
