@@ -12,6 +12,6 @@
     "deploy": "node scripts/check.mjs && wrangler deploy"
   },
   "devDependencies": {
-    "wrangler": "^4.42.0"
+    "wrangler": "^4.159.0"
   }
 }
