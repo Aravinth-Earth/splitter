@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Splitter — end-to-end encrypted, live expense splitting at 332321.xyz/w/expense-splitter/",
+  "description": "Splitter — end-to-end encrypted, live expense splitting at expense-splitter.332321.xyz",
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "dev": "wrangler dev",

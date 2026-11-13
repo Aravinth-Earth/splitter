@@ -1,8 +1,9 @@
 # Splitter — one code, one group, a shared ledger the server cannot read.
 #
-# Served on the public site's own origin through a Worker route, the same pattern as the
-# Estimation app: the page and the API live at /w/expense-splitter/, and the Worker answers
-# both so the security headers cannot be bypassed by reading a static file directly.
+# The app owns the root of its own origin, the same pattern as the Estimation app and the
+# bookmarks: a hostname per app, with the page and the API on that origin so the security headers
+# cannot be bypassed by reading a static file directly. The main site carries the introduction at
+# www.332321.xyz/w/expense-splitter/ and no longer routes that path here.
 #
 # Two Durable Object classes: the Registry singleton holds the slot ledger, and one Group holds
 # one group's records. Both are SQLite-backed: a new namespace can only be created with the
@@ -37,17 +38,16 @@ not_found_handling = "none"
 # headers the rest of the site sets.
 run_worker_first = true
 
-# The canonical site. The Worker answers it, so the page and its security headers cannot be
-# obtained from a static file, and the old localStorage build is retired from this path.
+# The app's own origin. The name is the mount: the Worker answers / and /api/* on this host, and
+# no path on the main site reaches it.
 #
-# One pattern, with the wildcard directly after the path rather than after a slash. A route is
-# matched against the whole request URL, so a slash-less path that carries a query string — a link
-# a chat client tagged on the way past — matches neither `…/expense-splitter` nor `…/expense-splitter/*`
-# and would fall through to the origin behind the zone, which serves the root site's 404 with no
-# CSP and a third-party script. `…/expense-splitter*` covers the bare path, the query-carrying
-# shape and every path beneath it, so no request on this prefix reaches anything but this Worker.
+# One pattern, with the wildcard directly after the host rather than after a slash. A route is
+# matched against the whole request URL, so a bare host — a link a chat client stripped the path
+# from — matches neither `expense-splitter.332321.xyz` nor `expense-splitter.332321.xyz/*` and
+# would fall through to whatever the DNS record points at. `expense-splitter.332321.xyz*` covers
+# the bare host, a query-carrying shape and every path beneath it.
 [[routes]]
-pattern = "www.332321.xyz/w/expense-splitter*"
+pattern = "expense-splitter.332321.xyz*"
 zone_name = "332321.xyz"
 
 # Workers Builds runs `npx wrangler preview` for every branch push, and that command refuses to

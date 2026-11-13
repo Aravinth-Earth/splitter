@@ -24,7 +24,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import test from 'node:test';
 
-import { generateCode, groupIdFromCode, randomSecret } from '../public/w/expense-splitter/crypto.js';
+import { generateCode, groupIdFromCode, randomSecret } from '../public/crypto.js';
 import { API, startWorker } from './wrangler.mjs';
 
 /** 22 characters: 16 bytes, base64url, unpadded — the id shape the client sends. */

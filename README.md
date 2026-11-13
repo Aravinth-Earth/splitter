@@ -7,8 +7,9 @@ The code **is** the key. The browser stretches it into an AES-256-GCM key, seals
 before anything leaves the page, and the Worker only ever sees ciphertext plus the ids, revisions and timestamps
 it needs to route and order it. No accounts, no email, no analytics, no third-party script.
 
-**Live:** <https://www.332321.xyz/w/expense-splitter/> · **Status:** in development — the page above still serves
-the older local-only version until the cutover.
+**Live:** <https://expense-splitter.332321.xyz/> · **Status:** in development — the app creates a group;
+joining, the expense sheet and live sync are still being built. The introduction to the product lives at
+<https://www.332321.xyz/w/expense-splitter/>.
 
 ## What the server knows, and what it cannot do
 
@@ -55,7 +56,7 @@ npm test        # node:test — crypto, and the Worker's routes against a throwa
 deploys. A manual `wrangler deploy` is break-glass only; prove what is live with
 
 ```bash
-curl -s https://www.332321.xyz/w/expense-splitter/api/health   # {"ok":true,"version":"…"}
+curl -s https://expense-splitter.332321.xyz/api/health   # {"ok":true,"version":"…"}
 ```
 
 ## Licence

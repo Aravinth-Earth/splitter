@@ -42,8 +42,8 @@ export const SLOT_LIMIT_MESSAGE = 'All 25 group slots are in use.';
 export const OFFLINE_MESSAGE = 'Creating needs a connection.';
 export const RETRY_MESSAGE = 'The group was not created. Try again.';
 
-/* The page is served at a trailing-slash mount, so a relative path is the API on this origin and
-   nothing else. */
+/* The app is the whole of its origin, so a relative path is the API on this origin and nothing
+   else. */
 const CREATE_PATH = 'api/create';
 
 /**
