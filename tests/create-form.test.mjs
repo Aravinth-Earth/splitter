@@ -21,8 +21,10 @@ import {
   createPayload,
   inviteLink,
   normalizeCurrency,
+  shareInvite,
   validateDisplayName,
-  validateGroupName
+  validateGroupName,
+  writeClipboardText
 } from '../public/app.js';
 import {
   deriveGroupKey,
@@ -260,4 +262,83 @@ test('the invite link carries the code in the fragment', () => {
     '#code=ABCD-EFGH-JKMN-PQRS',
     'a fragment is the one part of a URL a browser does not send to the server'
   );
+});
+
+/* ------------------------------------------------------------------- sharing */
+
+test('a browser with a share sheet gets the link once', async () => {
+  const calls = [];
+  const win = { navigator: { share: async (data) => { calls.push(data); } } };
+  const link = 'https://expense-splitter.332321.xyz/#code=ABCD-EFGH-JKMN-PQRS';
+
+  assert.equal(await shareInvite(win, link), 'shared');
+  assert.deepEqual(
+    calls,
+    [{ title: 'Splitter invite', text: 'Join my Splitter group', url: link }],
+    'the share sheet receives the link and nothing that names the group'
+  );
+});
+
+test('a dismissed share sheet is not a failure', async () => {
+  const win = {
+    navigator: {
+      share: async () => {
+        throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+      }
+    }
+  };
+
+  assert.equal(await shareInvite(win, 'https://expense-splitter.332321.xyz/#code=X'), 'cancelled');
+});
+
+test('a refused share sheet reports a failure so the caller can copy', async () => {
+  const win = {
+    navigator: {
+      share: async () => {
+        throw new Error('not allowed');
+      }
+    }
+  };
+
+  assert.equal(await shareInvite(win, 'https://expense-splitter.332321.xyz/#code=X'), 'failed');
+});
+
+test('a browser without a share sheet says so', async () => {
+  assert.equal(await shareInvite({ navigator: {} }, 'https://expense-splitter.332321.xyz/#code=X'), 'unsupported');
+  assert.equal(await shareInvite(undefined, 'https://expense-splitter.332321.xyz/#code=X'), 'unsupported');
+});
+
+test('the clipboard is written through the async API', async () => {
+  const written = [];
+  const win = {
+    navigator: {
+      clipboard: {
+        writeText: async (text) => {
+          written.push(text);
+        }
+      }
+    }
+  };
+
+  assert.equal(await writeClipboardText(win, 'V4ZS-XSXY-QJ0X-YJC1'), true);
+  assert.deepEqual(written, ['V4ZS-XSXY-QJ0X-YJC1']);
+});
+
+test('a denied clipboard returns false so the caller can show the fallback field', async () => {
+  const win = {
+    navigator: {
+      clipboard: {
+        writeText: async () => {
+          throw new Error('denied');
+        }
+      }
+    }
+  };
+
+  assert.equal(await writeClipboardText(win, 'V4ZS-XSXY-QJ0X-YJC1'), false);
+});
+
+test('a browser with no clipboard API returns false', async () => {
+  assert.equal(await writeClipboardText({ navigator: {} }, 'V4ZS-XSXY-QJ0X-YJC1'), false);
+  assert.equal(await writeClipboardText(undefined, 'V4ZS-XSXY-QJ0X-YJC1'), false);
 });

@@ -222,6 +222,37 @@ button {
   margin: 0.5rem 0 0;
 }
 
+.copy-status.toast {
+  display: inline-block;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: var(--bg);
+  color: var(--text-primary);
+}
+
+.copy-fallback {
+  margin-top: 0.5rem;
+}
+
+.copy-fallback label {
+  display: block;
+  margin-bottom: 0.25rem;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.copy-fallback input {
+  width: 100%;
+  padding: 0.5rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
 .hint-card {
   margin-top: 1rem;
   padding: 0.75rem 0.85rem;
