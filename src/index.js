@@ -12,7 +12,7 @@
 
 /* The id and the sealed-blob shapes the Durable Objects check too, so the two checks cannot drift
    apart: an id the edge accepts must be one the Group stores, and vice versa. */
-import { isId, isSealed } from './wire.js';
+import { isGroupId, isId, isSealed } from './wire.js';
 
 const API_PREFIX = '/api';
 const VERSION = '0.1.0';
@@ -240,7 +240,45 @@ async function handleApi(request, env, url) {
   const path = url.pathname.slice(API_PREFIX.length);
   if (path === '/health') return json({ ok: true, version: VERSION });
   if (path === '/create') return createGroup(request, env);
+  if (path === '/ws') return openSocket(request, env, url);
   return json({ error: 'not_found' }, 404);
+}
+
+/**
+ * Hand a socket to the group it names.
+ *
+ * The room is the group id, a hash of the code: it selects the Durable Object, and it is not a
+ * credential. Authentication is the first frame, inside the group, so a URL never carries a
+ * secret and a socket with no frame receives nothing.
+ *
+ * A browser always sends `Origin`, and a page on another site cannot forge it; when one arrives and
+ * does not name this host, the upgrade is refused before it reaches the group. A non-browser client
+ * may send no Origin at all — it still needs the secret in the first frame, so the missing header
+ * is not a bypass.
+ */
+function openSocket(request, env, url) {
+  if (request.method !== 'GET') return json({ error: 'method' }, 405, { allow: 'GET' });
+
+  const origin = request.headers.get('origin');
+  if (origin !== null) {
+    let sameHost = false;
+    try {
+      sameHost = new URL(origin).host === url.host;
+    } catch {
+      sameHost = false;
+    }
+    if (!sameHost) return json({ error: 'origin' }, 403);
+  }
+
+  const room = url.searchParams.get('room');
+  if (!isGroupId(room)) return json({ error: 'room' }, 400);
+
+  const upgrade = request.headers.get('upgrade');
+  if ((upgrade ?? '').toLowerCase() !== 'websocket') {
+    return json({ error: 'upgrade' }, 426, { upgrade: 'websocket' });
+  }
+
+  return env.GROUPS.get(env.GROUPS.idFromName(room)).fetch(request);
 }
 
 export default {

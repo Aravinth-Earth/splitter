@@ -13,6 +13,12 @@ name = "splitter"
 main = "src/index.js"
 compatibility_date = "2026-10-30"
 
+[vars]
+# The roster cap: the host plus every pending or approved member. A join is refused with
+# `group_full` at this number; the host's seat is one of them. The store holds no default that can
+# drift from the code: unset or malformed falls back to 20 in src/group.js.
+MAX_MEMBERS = "20"
+
 [[durable_objects.bindings]]
 name = "REGISTRY"
 class_name = "Registry"
