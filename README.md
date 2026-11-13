@@ -52,8 +52,17 @@ npm test        # node:test — crypto, and the Worker's routes against a throwa
 
 `npm run e2e` — two real Chromium profiles against a live Worker — is planned, not written yet.
 
-**Deploys come from `main`.** Workers Builds is connected to this repository, so a merge to `main` builds and
-deploys. A manual `wrangler deploy` is break-glass only; prove what is live with
+### Deploy
+
+**Workers Builds is the only deploy path.** The Cloudflare GitHub app is installed on this repository, and the
+Workers Builds connection builds `main` on every merge. A branch push only uploads a preview version; it never
+takes production traffic, and no Cloudflare credential is stored in the repository or used from a laptop.
+
+If a merged build does not appear live, open the failed **Workers Builds: splitter** check on the commit (or the
+build in the Cloudflare dashboard) and retry it there. Do not run `wrangler deploy` locally: it deploys under a
+personal OAuth login, bypasses the version the merge produced, and leaves production with no commit to point at.
+
+Prove what is live with
 
 ```bash
 curl -s https://expense-splitter.332321.xyz/api/health   # {"ok":true,"version":"…"}
