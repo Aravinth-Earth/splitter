@@ -174,6 +174,50 @@ export function inviteLink(base, code) {
   return `${base}#code=${formatCode(code)}`;
 }
 
+/**
+ * Ask the browser's share sheet for an invite link, when it has one.
+ *
+ * Returns `shared` when the sheet completed, `cancelled` when the person dismissed it, `failed`
+ * when the platform refused, and `unsupported` when `navigator.share` is absent. Only `failed` and
+ * `unsupported` fall back to copying: a cancellation is a decision, not an error, and re-copying
+ * behind the person's back would be a second action they did not ask for.
+ *
+ * @returns {Promise<'shared' | 'cancelled' | 'failed' | 'unsupported'>}
+ */
+export async function shareInvite(win, link) {
+  const share = win?.navigator?.share;
+  if (typeof share !== 'function') return 'unsupported';
+
+  try {
+    await share.call(win.navigator, {
+      title: 'Splitter invite',
+      text: 'Join my Splitter group',
+      url: link
+    });
+    return 'shared';
+  } catch (error) {
+    return error?.name === 'AbortError' ? 'cancelled' : 'failed';
+  }
+}
+
+/**
+ * Put text on the clipboard, or report that it did not happen.
+ *
+ * A boolean rather than an exception, because the caller has a visible field waiting: a denied
+ * permission is answered by showing the text and selecting it, not by a hidden retry. There is
+ * deliberately no `execCommand('copy')` fallback -- a hidden textarea that reports success leaves
+ * the person with no way to see what was copied, and no way to copy it again by hand.
+ */
+export async function writeClipboardText(win, text) {
+  try {
+    if (typeof win?.navigator?.clipboard?.writeText !== 'function') return false;
+    await win.navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /* ------------------------------------------------------------------ the page */
 
 /**
@@ -198,8 +242,10 @@ export function init(doc = document, win = window) {
   const groupCode = doc.getElementById('group-code');
   const copyCodeButton = doc.getElementById('copy-code');
   const copyLinkButton = doc.getElementById('copy-link');
-  const whoLine = doc.getElementById('who-line');
   const copyStatus = doc.getElementById('copy-status');
+  const copyFallback = doc.getElementById('copy-fallback');
+  const copyFallbackField = doc.getElementById('copy-fallback-field');
+  const whoLine = doc.getElementById('who-line');
   const codeHint = doc.getElementById('code-hint');
   const dismissHintButton = doc.getElementById('dismiss-hint');
   const emptyLedger = doc.getElementById('empty-ledger');
@@ -230,8 +276,14 @@ export function init(doc = document, win = window) {
   });
   copyLinkButton.addEventListener('click', () => {
     if (!group) return;
-    void copy(inviteLink(pageBase(), group.code), 'Invite link copied — it carries the code.');
+    void shareOrCopy(inviteLink(pageBase(), group.code));
   });
+
+  /* The button names the action the browser will actually take. `navigator.share` is the phone's
+     own share sheet; without it the same control copies. */
+  if (typeof win.navigator?.share === 'function') {
+    copyLinkButton.textContent = 'Share invite link';
+  }
 
   /**
    * Submit once, or explain why not.
@@ -324,6 +376,7 @@ export function init(doc = document, win = window) {
     whoLine.textContent = displayName;
     whoLine.hidden = false;
     copyStatus.textContent = '';
+    hideFallback();
     codeHint.hidden = false;
 
     createPanel.hidden = true;
@@ -361,40 +414,63 @@ export function init(doc = document, win = window) {
     formError.hidden = true;
   }
 
-  /** Copy text, and say what happened. A refused clipboard falls back, then reports the failure. */
-  async function copy(text, done) {
-    const copied = await writeClipboard(text);
-    copyStatus.textContent = copied
-      ? done
-      : 'Copy failed — select the code and copy it by hand.';
-    if (copied) hideHint();
+  /* A short message in the live region, cleared after a few seconds. */
+  let statusTimer = null;
+
+  function setStatus(message) {
+    copyStatus.textContent = message;
+    copyStatus.classList.toggle('toast', message !== '');
+    if (statusTimer !== null) win.clearTimeout(statusTimer);
+    statusTimer = null;
+    if (!message) return;
+    statusTimer = win.setTimeout(() => {
+      copyStatus.textContent = '';
+      copyStatus.classList.remove('toast');
+      statusTimer = null;
+    }, 4000);
   }
 
-  async function writeClipboard(text) {
-    try {
-      if (win.navigator?.clipboard?.writeText) {
-        await win.navigator.clipboard.writeText(text);
-        return true;
-      }
-    } catch {
-      /* A refused permission is not a copy; the old path below is the only fallback left. */
+  function hideFallback() {
+    copyFallback.hidden = true;
+    copyFallbackField.value = '';
+  }
+
+  /** Show the string in a visible field, selected, so a denied clipboard still has a way out. */
+  function showFallback(text) {
+    copyFallbackField.value = text;
+    copyFallback.hidden = false;
+    copyFallbackField.focus();
+    copyFallbackField.select();
+    setStatus('Copy it from here.');
+  }
+
+  async function copy(text, done) {
+    hideFallback();
+    const copied = await writeClipboardText(win, text);
+    if (!copied) {
+      showFallback(text);
+      return;
+    }
+    setStatus(done);
+    hideHint();
+  }
+
+  /** Use the phone's share sheet for the link when there is one, otherwise copy it. */
+  async function shareOrCopy(link) {
+    if (typeof win.navigator?.share !== 'function') {
+      await copy(link, 'Invite link copied — it carries the code.');
+      return;
     }
 
-    try {
-      const area = doc.createElement('textarea');
-      area.value = text;
-      area.setAttribute('readonly', '');
-      area.style.position = 'fixed';
-      area.style.top = '0';
-      area.style.left = '-9999px';
-      doc.body.append(area);
-      area.select();
-      const copied = doc.execCommand('copy');
-      area.remove();
-      return copied;
-    } catch {
-      return false;
+    hideFallback();
+    const outcome = await shareInvite(win, link);
+    if (outcome === 'shared') {
+      setStatus('Invite link shared.');
+      hideHint();
+      return;
     }
+    if (outcome === 'cancelled') return;
+    await copy(link, 'Invite link copied — it carries the code.');
   }
 }
 
