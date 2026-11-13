@@ -1,14 +1,17 @@
 /**
- * Splitter — the create-group page.
+ * Splitter — the page in front of a group.
  *
- * One job: take a group name, a currency and a display name, turn them into a code and a key in
- * this browser, and ask the Worker to reserve a slot. The name and the currency never travel as
- * text — they are sealed under a key derived from the code — so the request carries a hash of the
- * code, a hash of this member's secret, and two blobs the server cannot open.
+ * Two jobs. Create: take a group name, a currency and a display name, turn them into a code and a
+ * key in this browser, and ask the Worker to reserve a slot. Join: take a code and a display name,
+ * prove the code to the group's socket, and wait for the organizer. The name and the currency
+ * never travel as text — they are sealed under a key derived from the code — so the request carries
+ * a hash of the code, a hash of this member's secret, and sealed blobs the server cannot open.
  *
  * The code is kept in memory only. Nothing in this module writes to browser storage on purpose: a
  * reload losing the group is expected until a group can be re-opened from a code, and a code
- * written to a store is a key written to a store.
+ * written to a store is a key written to a store. A join keeps its member secret in memory for the
+ * same reason, so a refresh while waiting asks again with a new member id; #506 is the task that
+ * gives a member a stored seat.
  *
  * No presence chip and no "Add expense" action is rendered. Live presence and the expense sheet do
  * not exist yet, and a control that cannot do its job is a claim the code cannot keep.
@@ -23,6 +26,7 @@ import {
   generateCode,
   groupIdFromCode,
   idFromSecret,
+  normalizeCode,
   randomSecret,
   seal
 } from './crypto.js';
@@ -175,6 +179,38 @@ export function inviteLink(base, code) {
 }
 
 /**
+ * The code a person typed or pasted, or the reason it is not one.
+ *
+ * A whole invite link is accepted: the code may arrive as `#code=…` (the shape this app builds)
+ * or `?c=…` (an older link), and a pasted string that contains neither is treated as a code. The
+ * value is normalised by the same rules the request uses, so a lowercase, dashed or spaced code
+ * resolves to the group the person meant; a wrong length is refused before a socket exists.
+ *
+ * @returns {{ok: true, code: string} | {ok: false, message: string}}
+ */
+export function codeFromInput(input) {
+  if (typeof input !== 'string' || input.trim() === '') {
+    return { ok: false, message: 'Enter a group code.' };
+  }
+
+  let value = input.trim();
+  const embedded = value.match(/[#?](?:code|c)=([^&\s]+)/i);
+  if (embedded) {
+    try {
+      value = decodeURIComponent(embedded[1]);
+    } catch {
+      return { ok: false, message: 'That link does not carry a readable group code.' };
+    }
+  }
+
+  try {
+    return { ok: true, code: normalizeCode(value) };
+  } catch {
+    return { ok: false, message: 'A group code is 16 characters. Check it and try again.' };
+  }
+}
+
+/**
  * Ask the browser's share sheet for an invite link, when it has one.
  *
  * Returns `shared` when the sheet completed, `cancelled` when the person dismissed it, `failed`
@@ -250,6 +286,20 @@ export function init(doc = document, win = window) {
   const dismissHintButton = doc.getElementById('dismiss-hint');
   const emptyLedger = doc.getElementById('empty-ledger');
 
+  const joinPanel = doc.getElementById('join-panel');
+  const joinForm = doc.getElementById('join-form');
+  const joinCodeInput = doc.getElementById('join-code');
+  const joinNameInput = doc.getElementById('join-name');
+  const joinButton = doc.getElementById('join-btn');
+  const joinError = doc.getElementById('join-error');
+  const showJoinButton = doc.getElementById('show-join');
+  const showCreateButton = doc.getElementById('show-create');
+  const waitingPanel = doc.getElementById('waiting-panel');
+  const waitingTitle = doc.getElementById('waiting-title');
+  const waitingCopy = doc.getElementById('waiting-copy');
+  const waitingCode = doc.getElementById('waiting-code');
+  const waitingBack = doc.getElementById('waiting-back');
+
   const createUrl = new URL(CREATE_PATH, win.location.href).toString();
   const pageBase = () => {
     const here = new URL(win.location.href);
@@ -262,6 +312,8 @@ export function init(doc = document, win = window) {
      no group at all, and nothing here is written to a store. */
   let group = null;
   let pending = false;
+  let joinPending = false;
+  let joinSocket = null;
 
   form.addEventListener('submit', (event) => {
     /* A form with no action would still navigate, and a navigation is a lost create. */
@@ -284,6 +336,14 @@ export function init(doc = document, win = window) {
   if (typeof win.navigator?.share === 'function') {
     copyLinkButton.textContent = 'Share invite link';
   }
+
+  showJoinButton.addEventListener('click', () => showJoin());
+  showCreateButton.addEventListener('click', () => showCreate());
+  waitingBack.addEventListener('click', () => showJoin());
+  joinForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    void submitJoin();
+  });
 
   /**
    * Submit once, or explain why not.
@@ -414,6 +474,210 @@ export function init(doc = document, win = window) {
     formError.hidden = true;
   }
 
+  /* --------------------------------------------------------------- joining */
+
+  function showJoinError(message) {
+    joinError.textContent = message;
+    joinError.hidden = false;
+  }
+
+  function hideJoinError() {
+    joinError.textContent = '';
+    joinError.hidden = true;
+  }
+
+  function setJoinBusy(busy) {
+    joinButton.disabled = busy;
+    joinButton.textContent = busy ? 'Asking…' : 'Ask to join';
+  }
+
+  /** The join sheet, with an optional code already in the field. */
+  function showJoin({ code = '', error = '' } = {}) {
+    closeJoinSocket();
+    createPanel.hidden = true;
+    groupHeader.hidden = true;
+    emptyLedger.hidden = true;
+    waitingPanel.hidden = true;
+    joinPanel.hidden = false;
+
+    joinCodeInput.removeAttribute('aria-invalid');
+    joinNameInput.removeAttribute('aria-invalid');
+    hideJoinError();
+    if (code) joinCodeInput.value = formatCode(code);
+    if (error) showJoinError(error);
+
+    if (code) joinNameInput.focus();
+    else joinCodeInput.focus();
+  }
+
+  function showCreate() {
+    closeJoinSocket();
+    joinPanel.hidden = true;
+    waitingPanel.hidden = true;
+    groupHeader.hidden = true;
+    emptyLedger.hidden = true;
+    createPanel.hidden = false;
+    hideJoinError();
+    nameInput.focus();
+  }
+
+  function showWaiting(code) {
+    createPanel.hidden = true;
+    joinPanel.hidden = true;
+    groupHeader.hidden = true;
+    emptyLedger.hidden = true;
+    waitingPanel.hidden = false;
+    waitingCode.textContent = formatCode(code);
+    waitingCopy.textContent =
+      'The organizer has to let you in. Nothing from the group is shown until they do.';
+    waitingTitle.focus();
+  }
+
+  async function submitJoin() {
+    if (joinPending) return;
+
+    joinCodeInput.removeAttribute('aria-invalid');
+    joinNameInput.removeAttribute('aria-invalid');
+    hideJoinError();
+
+    const code = codeFromInput(joinCodeInput.value);
+    if (!code.ok) {
+      joinCodeInput.setAttribute('aria-invalid', 'true');
+      showJoinError(code.message);
+      joinCodeInput.focus();
+      return;
+    }
+
+    const name = validateDisplayName(joinNameInput.value);
+    if (!name.ok) {
+      joinNameInput.setAttribute('aria-invalid', 'true');
+      showJoinError(name.message);
+      joinNameInput.focus();
+      return;
+    }
+
+    if (win.navigator && win.navigator.onLine === false) {
+      showJoinError(OFFLINE_MESSAGE);
+      return;
+    }
+
+    joinPending = true;
+    setJoinBusy(true);
+
+    try {
+      const groupId = await groupIdFromCode(code.code);
+      const reachable = await probeRoom(groupId);
+      if (reachable === 'missing') {
+        showJoinError('No live group with that code.');
+        return;
+      }
+      if (reachable === 'offline') {
+        showJoinError(OFFLINE_MESSAGE);
+        return;
+      }
+
+      const key = await deriveGroupKey(code.code);
+      const secret = randomSecret();
+      const memberId = await idFromSecret(secret);
+      const nameBlob = await seal(key, { name: name.value });
+
+      showWaiting(code.code);
+      openJoinSocket({ groupId, memberId, secret, nameBlob, code: code.code });
+    } catch {
+      showJoinError(RETRY_MESSAGE);
+    } finally {
+      joinPending = false;
+      setJoinBusy(false);
+    }
+  }
+
+  /** Whether the group exists, asked before a socket so an unknown code has an answer. */
+  async function probeRoom(groupId) {
+    try {
+      const url = new URL('api/room', win.location.href);
+      url.searchParams.set('room', groupId);
+      const response = await win.fetch(url.toString(), { cache: 'no-store' });
+      if (response.status === 404) return 'missing';
+      return response.ok ? 'ok' : 'offline';
+    } catch {
+      return 'offline';
+    }
+  }
+
+  function openJoinSocket({ groupId, memberId, secret, nameBlob, code }) {
+    closeJoinSocket();
+
+    const url = new URL('api/ws', win.location.href);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.searchParams.set('room', groupId);
+
+    let socket;
+    try {
+      socket = new win.WebSocket(url.toString());
+    } catch {
+      waitingCopy.textContent = 'Could not open a connection. Try again.';
+      return;
+    }
+
+    joinSocket = socket;
+    let settled = false;
+
+    socket.addEventListener('open', () => {
+      socket.send(JSON.stringify({ t: 'auth', id: memberId, secret, mode: 'join', nameBlob }));
+    });
+
+    socket.addEventListener('message', (event) => {
+      let frame;
+      try {
+        frame = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (frame.t === 'waiting') {
+        settled = true;
+        waitingCopy.textContent =
+          'The organizer has to let you in. Nothing from the group is shown until they do.';
+        return;
+      }
+
+      if (frame.t === 'refused') {
+        settled = true;
+        closeJoinSocket();
+        showJoin({ code, error: refusalMessage(frame.code) });
+      }
+    });
+
+    socket.addEventListener('close', () => {
+      if (joinSocket !== socket) return;
+      joinSocket = null;
+      if (settled) return;
+      waitingCopy.textContent = 'The connection closed before the group answered. Try again.';
+    });
+
+    socket.addEventListener('error', () => {
+      /* A close event follows, and that is where the message is set. */
+    });
+  }
+
+  function closeJoinSocket() {
+    if (!joinSocket) return;
+    const socket = joinSocket;
+    joinSocket = null;
+    try {
+      socket.close();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  function refusalMessage(code) {
+    if (code === 'group_full') return 'That group already has 20 people in it.';
+    if (code === 'rate_limited') return 'Too many attempts from here.';
+    if (code === 'unknown_group') return 'No live group with that code.';
+    return 'The group could not take the request. Try again.';
+  }
+
   /* A short message in the live region, cleared after a few seconds. */
   let statusTimer = null;
 
@@ -471,6 +735,20 @@ export function init(doc = document, win = window) {
     }
     if (outcome === 'cancelled') return;
     await copy(link, 'Invite link copied — it carries the code.');
+  }
+
+  /* An invite link opens the join sheet with the code already there; the fragment never reaches
+     the server. A malformed one shows the sheet and the reason rather than doing nothing. */
+  const invitation = win.location.hash || win.location.search || '';
+  if (invitation) {
+    const invited = codeFromInput(invitation);
+    if (invited.ok) {
+      showJoin({ code: invited.code });
+    } else if (/[#?](?:code|c)=/i.test(invitation)) {
+      showJoin();
+      joinCodeInput.value = invitation;
+      showJoinError(invited.message);
+    }
   }
 }
 

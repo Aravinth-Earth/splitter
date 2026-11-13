@@ -107,6 +107,7 @@ export class Group {
     const { pathname } = new URL(request.url);
 
     if (pathname === '/api/ws') return this.openSocket(request);
+    if (pathname === '/api/room') return this.roomInfo(request);
 
     if (request.method !== 'POST') {
       /* RFC 9110: a 405 has to name the methods it does allow. */
@@ -125,6 +126,20 @@ export class Group {
 
     const result = await this.init(body);
     return json(result, result.ok ? 200 : 400);
+  }
+
+  /**
+   * Whether this room exists, for a client about to ask to join.
+   *
+   * The question is answered before a socket so an unknown code can say so instead of opening a
+   * handshake that fails with no reason a browser can read. The room is a hash of the code: the
+   * only people who can ask are the ones who already hold the code.
+   */
+  async roomInfo(request) {
+    if (request.method !== 'GET') return json({ error: 'method' }, 405, { allow: 'GET' });
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta) return json({ error: 'unknown_group' }, 404);
+    return json({ ok: true });
   }
 
   /**

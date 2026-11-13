@@ -57,6 +57,56 @@
 
         <button id="create-btn" class="primary" type="submit">Create group</button>
       </form>
+      <p class="switch">
+        <button id="show-join" class="link-button" type="button">Have a code? Join a group</button>
+      </p>
+    </section>
+
+    <section id="join-panel" class="panel" aria-labelledby="join-title" hidden>
+      <h2 id="join-title">Join a group</h2>
+      <form id="join-form" novalidate>
+        <div class="field">
+          <label for="join-code">Group code</label>
+          <input
+            id="join-code"
+            name="code"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="XXXX-XXXX-XXXX-XXXX"
+            aria-describedby="join-code-help" />
+          <p id="join-code-help" class="hint">Paste the code, or the link you were sent.</p>
+        </div>
+
+        <div class="field">
+          <label for="join-name">Your name</label>
+          <input
+            id="join-name"
+            name="displayName"
+            type="text"
+            autocomplete="off"
+            placeholder="Ana"
+            aria-describedby="join-name-help" />
+          <p id="join-name-help" class="hint">2 to 30 characters. It is not sent to the server as text.</p>
+        </div>
+
+        <p id="join-error" class="form-error" role="alert" hidden></p>
+
+        <button id="join-btn" class="primary" type="submit">Ask to join</button>
+      </form>
+      <p class="switch">
+        <button id="show-create" class="link-button" type="button">Start a new group instead</button>
+      </p>
+    </section>
+
+    <section id="waiting-panel" class="panel group-head" aria-labelledby="waiting-title" hidden>
+      <p class="eyebrow">Waiting</p>
+      <h2 id="waiting-title" tabindex="-1">Waiting for the organizer</h2>
+      <p id="waiting-copy" class="muted">
+        The organizer has to let you in. Nothing from the group is shown until they do.
+      </p>
+      <p class="code-line"><code id="waiting-code"></code></p>
+      <button id="waiting-back" class="secondary" type="button">Try another code</button>
     </section>
 
     <section id="group-header" class="panel group-head" aria-labelledby="group-name-display" hidden>
