@@ -18,9 +18,9 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/dependency-review-action@v4
+      - uses: actions/dependency-review-action@v5
         with:
           # A moderate advisory in a dev dependency is noted in the summary; only high and above
           # stop the merge, so the gate keeps its authority for what actually ships.
