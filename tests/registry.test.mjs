@@ -82,3 +82,59 @@ test('registry: an unusable cap falls back to the default, never to zero', () =>
   }
   assert.equal(DEFAULT_MAX_GROUPS, 25);
 });
+
+/* --------------------------------------------------------- the paths the ledger serves */
+
+/** A request the Worker itself makes to the ledger: JSON, POST, to `path`. */
+function post(registry, payload, { path, method = 'POST' } = {}) {
+  return registry.fetch(
+    new Request(`https://registry${path}`, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: method === 'GET' ? undefined : JSON.stringify(payload)
+    })
+  );
+}
+
+test('registry: /reserve and /release are routed whole, so a suffix is not a route', async () => {
+  const { ctx, rows } = fakeContext();
+  const registry = new Registry(ctx, { MAX_GROUPS: '2' });
+
+  const reserved = await post(registry, { groupId: id(1) }, { path: '/reserve' });
+  assert.equal(reserved.status, 200);
+  assert.deepEqual(await reserved.json(), { ok: true, reserved: true });
+  assert.equal(rows.has(id(1)), true);
+
+  /* `POST /nope/release` ends in `/release`. A suffix match dropped the slot for a caller whose
+     intent was some other route; the whole-pathname comparison answers 404 and touches nothing. */
+  const unrouted = await post(registry, { groupId: id(1) }, { path: '/nope/release' });
+  assert.equal(unrouted.status, 404, 'POST /nope/release must not release a slot');
+  assert.deepEqual(await unrouted.json(), { error: 'not_found' });
+  assert.equal(rows.has(id(1)), true, 'an unrouted path must leave the ledger untouched');
+
+  const released = await post(registry, { groupId: id(1) }, { path: '/release' });
+  assert.equal(released.status, 200);
+  assert.deepEqual(await released.json(), { ok: true });
+  assert.equal(rows.has(id(1)), false, '/release must drop the slot');
+});
+
+test('registry: a method other than POST is refused and names the method it allows', async () => {
+  const { ctx } = fakeContext();
+  const registry = new Registry(ctx, { MAX_GROUPS: '2' });
+
+  const response = await post(registry, null, { path: '/reserve', method: 'GET' });
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get('allow'), 'POST', 'a 405 must carry Allow: POST');
+  assert.deepEqual(await response.json(), { error: 'method' });
+});
+
+test('registry: a release without a group id is a bad request, not a no-op success', async () => {
+  const { ctx, rows } = fakeContext();
+  const registry = new Registry(ctx, { MAX_GROUPS: '2' });
+  registry.reserve(id(1));
+
+  const response = await post(registry, {}, { path: '/release' });
+  assert.equal(response.status, 400, 'a release that names nothing must not answer ok');
+  assert.deepEqual(await response.json(), { error: 'bad_request' });
+  assert.equal(rows.size, 1, 'the held slot must survive a malformed release');
+});

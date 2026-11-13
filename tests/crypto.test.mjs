@@ -27,6 +27,9 @@ import {
   seal,
   open
 } from '../public/w/expense-splitter/crypto.js';
+/* The server's half of the same envelope. The iv was counted as 16 characters in one file and 12
+   bytes in the other, so the cross-check below is the point of the import, not a detail. */
+import { IV_BASE64_CHARS } from '../src/wire.js';
 
 /* Crockford base32: 0-9, then A-H (no I), J, K, M, N, P-T (no U), V-Z. */
 const CODE_PATTERN = /^[0-9A-HJKMNP-TV-Z]{16}$/;
@@ -233,6 +236,19 @@ test('every seal carries a fresh 12-byte iv', async () => {
   assert.equal(Buffer.from(two.iv, 'base64url').length, IV_BYTES);
   assert.notEqual(one.iv, two.iv, 'the same value must not seal to the same bytes');
   assert.notEqual(one.ct, two.ct);
+});
+
+test('the server counts the iv in the same twelve bytes the client writes', async () => {
+  /* The Worker used to check 16 under the name IV_LENGTH, which reads as a byte count and disagreed
+     with the IV_BYTES crypto.js exports. IV_BASE64_CHARS is the same number in the unit that arrives
+     on the wire; this case is what stops the two files drifting apart again, because it takes the
+     server's constant and measures a real frame against it. */
+  assert.equal(IV_BASE64_CHARS, 16, 'an unpadded base64url encoding of 12 bytes is 16 characters');
+
+  const key = await deriveGroupKey(generateCode());
+  const frame = await seal(key, { amount: 1 });
+  assert.equal(frame.iv.length, IV_BASE64_CHARS, 'a sealed iv is exactly what the server expects');
+  assert.equal(Buffer.from(frame.iv, 'base64url').length, IV_BYTES, 'and those characters are 12 bytes');
 });
 
 test('the sealed bytes carry no plaintext', async () => {

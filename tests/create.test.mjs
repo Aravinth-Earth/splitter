@@ -11,6 +11,12 @@
  * from the same derivation crypto.js uses, and one case asserts that derivation's own output shape
  * is accepted rather than refused as malformed.
  *
+ * Two things are proved without a socket. The media-type gate is a refusal that must cost no slot,
+ * so it is driven over HTTP with the slot count visible. The compensation path — release the slot
+ * when the group cannot be initialised — cannot be reached by any HTTP request (the edge refuses
+ * every body the Group refuses), so the Worker is called directly with bindings that refuse, and
+ * the release is read from a call log.
+ *
  * Every assertion names the guarantee, so a failure reports the promise rather than a line number.
  */
 
@@ -38,16 +44,19 @@ function createBody(groupId) {
   return { groupId, hostId: id22(), nameBlob: sealed(), metaBlob: sealed() };
 }
 
-async function post(baseUrl, path, payload, { method = 'POST', raw } = {}) {
+async function post(baseUrl, path, payload, { method = 'POST', raw, type = 'application/json' } = {}) {
   const hasBody = method !== 'GET' && method !== 'HEAD';
+  const headers = {};
+  /* `type: null` sends no content-type header of its own, which is one of the refusals under test. */
+  if (type !== null) headers['content-type'] = type;
   const response = await fetch(`${baseUrl}${API}${path}`, {
     method,
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: hasBody ? (raw ?? JSON.stringify(payload)) : undefined,
     signal: AbortSignal.timeout(15_000)
   });
   const body = await response.json().catch(() => ({}));
-  return { status: response.status, body };
+  return { status: response.status, headers: response.headers, body };
 }
 
 async function createGroup(baseUrl, payload) {
@@ -78,6 +87,54 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
     await worker.stop();
   });
 
+  /* The cap is spent first, on purpose. Every malformed case below then runs against a full
+     ledger, where any request that reached the ledger would be answered 429 — so a 400 is proof
+     the validation refused it before a slot was asked for, and a 429 afterwards is proof the
+     ledger is exactly as full as it was. */
+  await t.test('26 distinct creates leave 25 ok answers and one limit', async () => {
+    const ids = Array.from({ length: 26 }, () => id22());
+    assert.equal(new Set(ids).size, 26, 'the 26 ids must be distinct');
+
+    const results = [];
+    for (const groupId of ids) {
+      results.push(await createGroup(worker.baseUrl, createBody(groupId)));
+    }
+
+    const ok = results.filter((result) => result.status === 200);
+    const limited = results.filter((result) => result.status === 429);
+
+    assert.equal(results.length, 26);
+    assert.equal(ok.length, 25, `25 creates must be accepted, got ${ok.length}`);
+    assert.equal(limited.length, 1, `exactly one create must be refused for the cap, got ${limited.length}`);
+    for (const result of ok) assert.deepEqual(result.body, { ok: true });
+    for (const result of limited) assert.deepEqual(result.body, { error: 'limit' });
+    /* The two buckets partition the answers, so a third status — a 500 from a broken binding, say —
+       cannot hide behind two filters that each quietly found nothing to check. */
+    assert.equal(
+      ok.length + limited.length,
+      results.length,
+      'every create must be either an acceptance or a cap refusal'
+    );
+
+    /* A refusal is not a slot: re-sending the refused id while the ledger is still full is
+       refused again, so the refusal neither held a slot nor freed one. */
+    const refusedId = ids[results.findIndex((result) => result.status === 429)];
+    assert.equal((await createGroup(worker.baseUrl, createBody(refusedId))).status, 429);
+
+    /* Idempotency: a retry of an accepted id is ok, and it does not make a slot appear. */
+    const retried = await createGroup(worker.baseUrl, createBody(ids[0]));
+    assert.equal(retried.status, 200);
+    assert.deepEqual(retried.body, { ok: true });
+
+    const again = await createGroup(worker.baseUrl, createBody(ids[1]));
+    assert.equal(again.status, 200);
+    assert.deepEqual(again.body, { ok: true });
+
+    const fresh = await createGroup(worker.baseUrl, createBody(id22()));
+    assert.equal(fresh.status, 429, 'a retry must not free or add a slot');
+    assert.deepEqual(fresh.body, { error: 'limit' });
+  });
+
   await t.test('a body that is not JSON is refused', async () => {
     const result = await post(worker.baseUrl, '/create', null, { raw: '{"groupId":' });
     assert.equal(result.status, 400, 'unparseable body must not reach a Durable Object');
@@ -98,6 +155,8 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
 
     for (const groupId of bad) {
       const result = await createGroup(worker.baseUrl, { ...createBody(id22()), groupId });
+      /* With the ledger full, a request that reached it would answer 429 — so a 400 is the
+         validation firing before a slot is asked for, which is what the message claims. */
       assert.equal(result.status, 400, `"${groupId}" must be refused before any slot is taken`);
       assert.deepEqual(result.body, { error: 'groupId' });
     }
@@ -108,6 +167,12 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
       assert.equal(result.status, 400);
       assert.deepEqual(result.body, { error: 'groupId' });
     }
+
+    /* And the ledger is exactly as full as it was: a refused create neither took a slot nor freed
+       one, which is the "before any slot is taken" half of the claim above. */
+    const stillFull = await createGroup(worker.baseUrl, createBody(id22()));
+    assert.equal(stillFull.status, 429, 'refusing a bad groupId must not take, free or bypass a slot');
+    assert.deepEqual(stillFull.body, { error: 'limit' });
   });
 
   await t.test('a missing or unusable sealed name is refused', async () => {
@@ -132,48 +197,176 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
     assert.deepEqual(result.body, { error: 'hostId' });
   });
 
-  await t.test('a method other than POST is refused', async () => {
+  await t.test('a method other than POST is refused, and the answer names POST', async () => {
     const result = await post(worker.baseUrl, '/create', null, { method: 'GET' });
     assert.equal(result.status, 405);
+    assert.equal(result.headers.get('allow'), 'POST', 'a 405 must carry Allow: POST (RFC 9110)');
     assert.deepEqual(result.body, { error: 'method' });
   });
+});
 
-  await t.test('26 distinct creates leave 25 ok answers and one limit', async () => {
-    const ids = Array.from({ length: 26 }, () => id22());
-    assert.equal(new Set(ids).size, 26, 'the 26 ids must be distinct');
+/* --------------------------------------------------------------- the media type */
 
-    const results = [];
-    for (const groupId of ids) {
-      results.push(await createGroup(worker.baseUrl, createBody(groupId)));
+test('create: only application/json may reach a slot, and a refused type spends none', async (t) => {
+  /* One slot, and the refusal comes first while it is free: the create that follows succeeding is
+     what proves the text/plain request took nothing. A cross-site page can send `text/plain` with
+     no preflight, so this is the shape a drive-by create would use. */
+  const worker = await startWorker({ vars: { MAX_GROUPS: '1' } });
+  t.after(async () => {
+    await worker.stop();
+  });
+
+  const simple = await post(worker.baseUrl, '/create', createBody(id22()), { type: 'text/plain' });
+  assert.equal(simple.status, 400, 'a CORS-simple media type must be refused before a slot is asked for');
+  assert.deepEqual(simple.body, { error: 'body' });
+
+  /* The same body in the type the page will send: the exact type, with a charset. It takes the one
+     slot — which is only possible because the request above spent nothing. */
+  const accepted = await post(worker.baseUrl, '/create', createBody(id22()), {
+    type: 'application/json; charset=utf-8'
+  });
+  assert.equal(accepted.status, 200, 'application/json with a charset is accepted, and the slot was free');
+  assert.deepEqual(accepted.body, { ok: true });
+
+  /* The ledger is now full, so a request that reached it answers 429 and one refused before it
+     answers 400. Each of these is a type this API does not speak. */
+  for (const type of [
+    'text/plain',
+    'application/json-patch+json',
+    'application/x-www-form-urlencoded',
+    'Text/Plain'
+  ]) {
+    const refused = await post(worker.baseUrl, '/create', createBody(id22()), { type });
+    assert.equal(refused.status, 400, `content-type ${type} must be refused before the ledger is asked`);
+    assert.deepEqual(refused.body, { error: 'body' });
+  }
+
+  /* A create with no content-type at all. Sent as a stream, because fetch would otherwise add a
+     `text/plain` of its own and hide the case. */
+  const untyped = await fetch(`${worker.baseUrl}${API}/create`, {
+    method: 'POST',
+    body: streamedJson(JSON.stringify(createBody(id22()))),
+    duplex: 'half',
+    signal: AbortSignal.timeout(15_000)
+  });
+  assert.equal(untyped.status, 400, 'a create with no media type is not JSON');
+  assert.deepEqual(await untyped.json(), { error: 'body' });
+
+  /* Media types are case-insensitive, so a mixed-case one is accepted by the gate and refused only
+     by the cap — a 400 here would mean the gate compares strings case-sensitively. */
+  const mixedCase = await post(worker.baseUrl, '/create', createBody(id22()), { type: 'Application/JSON' });
+  assert.equal(mixedCase.status, 429, 'a mixed-case media type is accepted and only the full ledger refuses');
+  assert.deepEqual(mixedCase.body, { error: 'limit' });
+
+  /* Nothing above freed or added a slot. */
+  const next = await createGroup(worker.baseUrl, createBody(id22()));
+  assert.equal(next.status, 429, 'a refused content-type must neither take nor free a slot');
+  assert.deepEqual(next.body, { error: 'limit' });
+});
+
+/* ------------------------------------------- the compensation path, without the network */
+
+/**
+ * The real Worker over two fake Durable Object namespaces.
+ *
+ * `calls` records every internal request in order, so "the slot was released" is an observed call
+ * rather than an inference from a status code. `initRefuses` makes the Group answer the way a
+ * refusing Group does; `reserved` is what the ledger says about the slot this create took.
+ */
+function fakeBindings({ initRefuses = false, reserved = true } = {}) {
+  const calls = [];
+  const reply = (body, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+  const registry = {
+    fetch: async (url, init) => {
+      const { pathname } = new URL(url);
+      calls.push({ pathname, body: JSON.parse(init.body) });
+      if (pathname === '/reserve') return reply({ ok: true, reserved });
+      if (pathname === '/release') return reply({ ok: true });
+      return reply({ error: 'not_found' }, 404);
     }
+  };
+  const group = {
+    fetch: async (url, init) => {
+      const { pathname } = new URL(url);
+      calls.push({ pathname, body: JSON.parse(init.body) });
+      return initRefuses ? reply({ ok: false, error: 'hostId' }, 400) : reply({ ok: true, created: true });
+    }
+  };
 
-    const ok = results.filter((result) => result.status === 200);
-    const limited = results.filter((result) => result.status === 429);
+  return {
+    calls,
+    env: {
+      REGISTRY: { idFromName: (name) => ({ name }), get: () => registry },
+      GROUPS: { idFromName: (name) => ({ name }), get: () => group }
+    }
+  };
+}
 
-    assert.equal(results.length, 26);
-    assert.equal(ok.length, 25, `25 creates must be accepted, got ${ok.length}`);
-    assert.equal(limited.length, 1, `exactly one create must be refused for the cap, got ${limited.length}`);
-    for (const result of ok) assert.deepEqual(result.body, { ok: true });
-    for (const result of limited) assert.deepEqual(result.body, { error: 'limit' });
-    for (const result of results) assert.ok([200, 429].includes(result.status), `unexpected ${result.status}`);
+/** The request the page makes, built without a socket. */
+function createRequest(payload) {
+  return new Request(`https://splitter.test${API}/create`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
 
-    /* A refusal is not a slot: re-sending the refused id while the ledger is still full is
-       refused again, so the refusal neither held a slot nor freed one. */
-    const refusedId = ids[results.findIndex((result) => result.status === 429)];
-    assert.equal((await createGroup(worker.baseUrl, createBody(refusedId))).status, 429);
+test('create: a refused init gives its slot back', async () => {
+  /* This branch cannot be reached over HTTP: the edge refuses every body the Group would refuse,
+     both reading the same shapes from wire.js, so no request to /api/create can make a real Group
+     answer with a refusal. The Worker is therefore driven with bindings that answer the way a
+     refusing Group does, and the release is what the call log shows. */
+  const { default: worker } = await import('../src/index.js');
+  const groupId = id22();
+  const { calls, env } = fakeBindings({ initRefuses: true });
 
-    /* Idempotency: a retry of an accepted id is ok, and it does not make a slot appear. */
-    const retried = await createGroup(worker.baseUrl, createBody(ids[0]));
-    assert.equal(retried.status, 200);
-    assert.deepEqual(retried.body, { ok: true });
+  const response = await worker.fetch(createRequest(createBody(groupId)), env);
+  assert.equal(response.status, 500, 'an init that was refused must not answer ok');
+  assert.deepEqual(await response.json(), { error: 'internal' });
 
-    const again = await createGroup(worker.baseUrl, createBody(ids[1]));
-    assert.equal(again.status, 200);
-    assert.deepEqual(again.body, { ok: true });
+  assert.deepEqual(
+    calls.map((call) => call.pathname),
+    ['/reserve', '/init', '/release'],
+    'a slot this create took must be handed back when the group cannot be initialised'
+  );
+  assert.deepEqual(calls[2].body, { groupId }, 'the release must name the id that was reserved');
+});
 
-    const fresh = await createGroup(worker.baseUrl, createBody(id22()));
-    assert.equal(fresh.status, 429, 'a retry must not free or add a slot');
-    assert.deepEqual(fresh.body, { error: 'limit' });
+test('create: an init failure after a retry frees nothing, because the retry took nothing', async () => {
+  /* The same failure on a create whose id already held a slot: the ledger answered `reserved:
+     false`, so this call must not free a slot the first create is still using. */
+  const { default: worker } = await import('../src/index.js');
+  const { calls, env } = fakeBindings({ initRefuses: true, reserved: false });
+
+  const response = await worker.fetch(createRequest(createBody(id22())), env);
+  assert.equal(response.status, 500);
+  assert.deepEqual(
+    calls.map((call) => call.pathname),
+    ['/reserve', '/init'],
+    'a create that reserved nothing must not release'
+  );
+});
+
+test('create: a successful create reserves, initialises, and releases nothing', async () => {
+  const { default: worker } = await import('../src/index.js');
+  const groupId = id22();
+  const body = createBody(groupId);
+  const { calls, env } = fakeBindings();
+
+  const response = await worker.fetch(createRequest(body), env);
+  assert.equal(response.status, 200, 'the success body is unchanged: {ok:true} on 200');
+  assert.deepEqual(await response.json(), { ok: true });
+  assert.deepEqual(
+    calls.map((call) => call.pathname),
+    ['/reserve', '/init'],
+    'a create that succeeded must not release its slot'
+  );
+  assert.deepEqual(calls[1].body, {
+    hostId: body.hostId,
+    nameBlob: body.nameBlob,
+    metaBlob: body.metaBlob
   });
 });
 
