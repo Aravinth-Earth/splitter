@@ -285,7 +285,8 @@ export function init(doc = document, win = window) {
   const whoLine = doc.getElementById('who-line');
   const roleLine = doc.getElementById('role-line');
   const roster = doc.getElementById('roster');
-  const rosterList = doc.getElementById('roster-list');
+  const rosterPending = doc.getElementById('roster-pending');
+  const rosterApproved = doc.getElementById('roster-approved');
   const rosterEmpty = doc.getElementById('roster-empty');
   const codeHint = doc.getElementById('code-hint');
   const dismissHintButton = doc.getElementById('dismiss-hint');
@@ -444,7 +445,8 @@ export function init(doc = document, win = window) {
     whoLine.hidden = false;
     roleLine.textContent = role === 'organizer' ? 'you are the organizer' : 'you are a member';
     roster.hidden = role !== 'organizer';
-    rosterList.textContent = '';
+    rosterPending.textContent = '';
+    rosterApproved.textContent = '';
     rosterEmpty.hidden = role !== 'organizer';
     rosterEmpty.textContent = 'No one is waiting.';
     copyStatus.textContent = '';
@@ -669,6 +671,13 @@ export function init(doc = document, win = window) {
         return;
       }
 
+      if (frame.t === 'removed') {
+        settled = true;
+        closeJoinSocket();
+        showJoin({ code, error: 'Removed from this group.' });
+        return;
+      }
+
       if (frame.t === 'refused') {
         settled = true;
         closeJoinSocket();
@@ -773,32 +782,64 @@ export function init(doc = document, win = window) {
     }
   }
 
+  /* One armed removal at a time; the second click within four seconds is the one that acts. */
+  let armedMemberId = null;
+  let armedButton = null;
+  let armedTimer = null;
+
+  function disarm() {
+    if (armedTimer !== null) win.clearTimeout(armedTimer);
+    armedTimer = null;
+    armedMemberId = null;
+    if (armedButton) {
+      armedButton.textContent = 'Remove';
+      armedButton.classList.remove('is-armed');
+    }
+    armedButton = null;
+  }
+
+  async function nameOf(key, blob) {
+    try {
+      const opened = await open(key, blob);
+      return typeof opened?.name === 'string' ? opened.name : 'Someone';
+    } catch {
+      return 'Name could not be opened';
+    }
+  }
+
   /** The names are sealed; the host has the code, so it can open them and nobody else can. */
   async function renderRoster(frame, keyPromise) {
     if (frame.role !== 'host') return;
 
     const key = await keyPromise;
     const pending = frame.roster.filter((member) => member.status === 'pending');
+    const approved = frame.roster.filter((member) => member.status === 'approved');
 
-    rosterList.textContent = '';
+    disarm();
+    rosterPending.textContent = '';
+    rosterApproved.textContent = '';
     roster.hidden = false;
     rosterEmpty.hidden = pending.length > 0;
     rosterEmpty.textContent = 'No one is waiting.';
 
-    for (const member of pending) {
-      let name = 'Someone';
-      try {
-        const opened = await open(key, member.nameBlob);
-        if (typeof opened?.name === 'string') name = opened.name;
-      } catch {
-        name = 'Name could not be opened';
-      }
+    /* The organizer's own chip is a label, never a control: there is no member entry for the host,
+       so there is nothing to remove and no button to press. */
+    const self = doc.createElement('li');
+    self.className = 'chip is-self';
+    const selfName = doc.createElement('span');
+    selfName.textContent = whoLine.textContent || 'You';
+    const selfRole = doc.createElement('span');
+    selfRole.className = 'muted';
+    selfRole.textContent = 'organizer';
+    self.append(selfName, selfRole);
+    rosterApproved.append(self);
 
+    for (const member of pending) {
       const chip = doc.createElement('li');
       chip.className = 'chip';
 
       const label = doc.createElement('span');
-      label.textContent = name;
+      label.textContent = await nameOf(key, member.nameBlob);
 
       const allow = doc.createElement('button');
       allow.type = 'button';
@@ -819,7 +860,38 @@ export function init(doc = document, win = window) {
       decline.addEventListener('click', () => act('reject'));
 
       chip.append(label, allow, decline);
-      rosterList.append(chip);
+      rosterPending.append(chip);
+    }
+
+    for (const member of approved) {
+      const chip = doc.createElement('li');
+      chip.className = 'chip';
+
+      const label = doc.createElement('span');
+      label.textContent = await nameOf(key, member.nameBlob);
+
+      const remove = doc.createElement('button');
+      remove.type = 'button';
+      remove.className = 'secondary';
+      remove.textContent = 'Remove';
+      remove.addEventListener('click', () => {
+        if (armedMemberId !== member.id) {
+          disarm();
+          armedMemberId = member.id;
+          armedButton = remove;
+          remove.textContent = 'Remove? Their entries stay';
+          remove.classList.add('is-armed');
+          armedTimer = win.setTimeout(disarm, 4000);
+          return;
+        }
+
+        disarm();
+        remove.disabled = true;
+        if (hostSocket) hostSocket.send(JSON.stringify({ t: 'remove', memberId: member.id }));
+      });
+
+      chip.append(label, remove);
+      rosterApproved.append(chip);
     }
   }
 

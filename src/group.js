@@ -222,7 +222,7 @@ export class Group {
    * client sent: a member that forges `approve` changes nothing and is closed with `not_host`.
    */
   async handleAction(socket, frame) {
-    if (frame.t !== 'approve' && frame.t !== 'reject') return;
+    if (frame.t !== 'approve' && frame.t !== 'reject' && frame.t !== 'remove') return;
 
     const meta = await this.ctx.storage.get(GROUP_KEY);
     if (!meta) return this.refuse(socket, 'unknown_group');
@@ -237,6 +237,18 @@ export class Group {
 
     const key = memberKey(frame.memberId);
     const entry = await this.ctx.storage.get(key);
+
+    if (frame.t === 'remove') {
+      if (!entry || entry.status !== 'approved') {
+        this.sendRefusal(socket, 'not_member');
+        return;
+      }
+      await this.ctx.storage.put(key, { ...entry, status: 'removed' });
+      await this.notifyHosts(meta);
+      await this.notifyMember(meta, frame.memberId, 'removed');
+      return;
+    }
+
     if (!entry || entry.status !== 'pending') {
       this.sendRefusal(socket, 'not_pending');
       await this.notifyHosts(meta);
@@ -263,8 +275,13 @@ export class Group {
         continue;
       }
       try {
-        socket.send(JSON.stringify({ t: 'refused', code: 'declined' }));
-        socket.close(1008, 'declined');
+        if (outcome === 'removed') {
+          socket.send(JSON.stringify({ t: 'removed' }));
+          socket.close(1008, 'removed');
+        } else {
+          socket.send(JSON.stringify({ t: 'refused', code: 'declined' }));
+          socket.close(1008, 'declined');
+        }
       } catch {
         /* already gone */
       }
