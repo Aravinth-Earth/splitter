@@ -12,10 +12,14 @@
 
 export const DEFAULT_MAX_GROUPS = 25;
 
-function json(body, status = 200) {
+function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      ...headers
+    }
   });
 }
 
@@ -69,17 +73,25 @@ export class Registry {
   }
 
   async fetch(request) {
-    const path = new URL(request.url).pathname;
-    if (request.method !== 'POST') return json({ error: 'method' }, 405);
+    if (request.method !== 'POST') {
+      /* RFC 9110: a 405 has to name the methods it does allow. */
+      return json({ error: 'method' }, 405, { allow: 'POST' });
+    }
+
+    /* Compared whole, never by suffix: `/nope/release` ends in `/release`, and a suffix match would
+       drop a slot for a caller that never asked to release one. Every internal call is written in
+       this repo, so the set of paths is closed. */
+    const { pathname } = new URL(request.url);
+    if (pathname !== '/reserve' && pathname !== '/release') return json({ error: 'not_found' }, 404);
 
     const body = await request.json().catch(() => null);
-    if (!body || typeof body.groupId !== 'string') return json({ error: 'bad_request' }, 400);
-
-    if (path.endsWith('/reserve')) return json(this.reserve(body.groupId));
-    if (path.endsWith('/release')) {
-      this.release(body.groupId);
-      return json({ ok: true });
+    if (typeof body !== 'object' || body === null || typeof body.groupId !== 'string') {
+      return json({ error: 'bad_request' }, 400);
     }
-    return json({ error: 'not_found' }, 404);
+
+    if (pathname === '/reserve') return json(this.reserve(body.groupId));
+
+    this.release(body.groupId);
+    return json({ ok: true });
   }
 }

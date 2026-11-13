@@ -3,39 +3,122 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Splitter</title>
-  <meta name="description" content="Split expenses with a group over one code. Names, amounts and splits are encrypted in your browser, so the server cannot read them." />
+  <title>Splitter — start a group</title>
+  <meta name="description" content="Split expenses with a group over one code. The group name and its currency are sealed in your browser before anything is sent, so the server cannot read them." />
   <meta name="color-scheme" content="dark light" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <main>
-    <h1>Splitter</h1>
-    <p class="lede">One code, one group, a shared expense list the server cannot read.</p>
+    <header class="page-head">
+      <h1>Splitter</h1>
+      <p class="lede">One code, one group, a shared expense list the server cannot read.</p>
+    </header>
 
-    <h2>How it will work</h2>
-    <ol>
-      <li><strong>Create a group.</strong> Name it, and you are inside it with a 16-character code.</li>
-      <li><strong>Share the code.</strong> Anyone with it asks to join; you let them in.</li>
-      <li><strong>Add what you paid.</strong> Every expense lands on everyone's screen live; split it equally, by share, by percentage or by exact amount.</li>
-      <li><strong>Settle up.</strong> Balances update as you go, and the end of the trip is one short list of transfers.</li>
-    </ol>
+    <section id="create-panel" class="panel" aria-labelledby="create-title">
+      <h2 id="create-title">Start a group</h2>
+      <form id="create-form" novalidate>
+        <div class="field">
+          <label for="group-name">Group name</label>
+          <input
+            id="group-name"
+            name="groupName"
+            type="text"
+            autocomplete="off"
+            placeholder="Goa, flat 3B, Friday dinner"
+            aria-describedby="group-name-help" />
+          <p id="group-name-help" class="hint">1 to 60 characters, counted one by one, whatever the script.</p>
+        </div>
 
-    <h2>What the server sees</h2>
-    <p>
-      The code is the key. It never leaves the page: the browser turns it into an AES-256-GCM key and
-      seals every name, amount and split before anything is sent. The server holds ciphertext plus the
-      ids and timestamps needed to route it — and cannot read any of the content.
-    </p>
-    <p class="muted">
-      Honest limits: a code that leaks cannot be revoked, a device's own cache is plaintext, and the
-      server cannot check that a split adds up because it cannot read either number.
-    </p>
+        <div class="field">
+          <label for="currency">Currency</label>
+          <select id="currency" name="currency">
+            <option value="INR" selected>INR — Indian rupee</option>
+            <option value="EUR">EUR — Euro</option>
+            <option value="USD">USD — US dollar</option>
+            <option value="GBP">GBP — Pound sterling</option>
+          </select>
+          <p id="currency-help" class="hint">Sealed with the group name; the server never learns it.</p>
+        </div>
+
+        <div class="field">
+          <label for="display-name">Your name</label>
+          <input
+            id="display-name"
+            name="displayName"
+            type="text"
+            autocomplete="off"
+            placeholder="Your name"
+            aria-describedby="display-name-help" />
+          <p id="display-name-help" class="hint">2 to 30 characters. It is not sent to the server.</p>
+        </div>
+
+        <p id="form-error" class="form-error" role="alert" hidden></p>
+
+        <button id="create-btn" class="primary" type="submit">Create group</button>
+      </form>
+    </section>
+
+    <section id="group-header" class="panel group-head" aria-labelledby="group-name-display" hidden>
+      <p class="eyebrow">Your group</p>
+      <h2 id="group-name-display" tabindex="-1"></h2>
+      <p id="who-line" class="who" hidden></p>
+      <p id="role-line" class="muted">you are the organizer</p>
+
+      <p class="code-line"><code id="group-code"></code></p>
+      <div class="code-actions">
+        <button id="copy-code" class="secondary" type="button">Copy code</button>
+        <button id="copy-link" class="secondary" type="button">Copy invite link</button>
+      </div>
+      <p id="copy-status" class="muted copy-status" role="status" aria-live="polite"></p>
+
+      <div id="code-hint" class="hint-card" role="note" hidden>
+        <p>The code is the key. Anyone holding it can ask to join, so share it only with the people you are splitting with.</p>
+        <button id="dismiss-hint" class="link-button" type="button">Got it</button>
+      </div>
+    </section>
+
+    <section id="empty-ledger" class="panel" aria-labelledby="empty-title" hidden>
+      <h2 id="empty-title">The ledger is empty</h2>
+      <p class="muted">When the first expense arrives, three things happen in order:</p>
+      <ol class="steps">
+        <li><strong>Who paid.</strong> The expense records the person who put the money down.</li>
+        <li><strong>Split how.</strong> Equally, by share, by percentage, or by exact amount.</li>
+        <li><strong>Done.</strong> Each balance moves, and the end of the trip is one short list of transfers.</li>
+      </ol>
+    </section>
+
+    <section class="panel" aria-labelledby="server-title">
+      <h2 id="server-title">What the server can and cannot see</h2>
+      <p>
+        The code is the key, and it is made in this browser. The browser turns it into an
+        AES-256-GCM key and seals the group name and its currency before anything is sent, so the
+        request carries a hash of the code, a hash of a secret the browser makes, and two sealed blobs.
+      </p>
+      <p>
+        The server holds those ids and blobs, a join mode and a revision number. It cannot read the
+        group name or the currency, and it cannot read anything added to the ledger later. The code
+        itself never reaches it.
+      </p>
+      <p class="muted">
+        Honest limits: a code that leaks cannot be revoked, a device's own cache is plaintext, and the
+        server cannot check that a split adds up because it cannot read either number.
+      </p>
+    </section>
+
+    <noscript>
+      <p class="panel">
+        This page needs JavaScript: the code is turned into an encryption key in your browser, and
+        there is no server-side version of that.
+      </p>
+    </noscript>
 
     <p class="status">
-      In development — this page is a placeholder while the app is built.
+      In development — this page creates a group; the expense sheet and joining are still being built.
       <a href="/">The rest of the site is here.</a>
     </p>
   </main>
+
+  <script type="module" src="app.js"></script>
 </body>
 </html>

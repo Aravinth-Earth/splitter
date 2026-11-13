@@ -9,6 +9,10 @@
  * never transmitted — only a hash of it is.
  */
 
+/* The id and the sealed-blob shapes the Durable Objects check too, so the two checks cannot drift
+   apart: an id the edge accepts must be one the Group stores, and vice versa. */
+import { isId, isSealed } from './wire.js';
+
 const CANONICAL = '/w/expense-splitter';
 const API_PREFIX = `${CANONICAL}/api`;
 const VERSION = '0.1.0';
@@ -36,10 +40,14 @@ const SECURITY_HEADERS = {
   'strict-transport-security': 'max-age=15552000; includeSubDomains; preload'
 };
 
-function json(body, status = 200) {
+function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      ...headers
+    }
   });
 }
 
@@ -87,21 +95,26 @@ function notFound() {
   });
 }
 
-/* An id the client can send: a group id from crypto.js (64 lowercase hex, a hash of the code) or
-   the 22-character base64url shape a member id has. Both are opaque here — the ledger and the
-   Durable Object name only need to be unforgeable and stable, and neither is a secret we can read
-   anything out of. */
-const ID = /^(?:[A-Za-z0-9_-]{22}|[0-9a-f]{64})$/;
-/* A sealed value as crypto.js writes it: {iv, ct}, unpadded base64url, the iv 12 bytes. */
-const BASE64URL = /^[A-Za-z0-9_-]+$/;
-const IV_LENGTH = 16;
 /* A sealed name is a few hundred bytes; a body larger than this is not a create. The cap is a
    limit on the bytes received, not on `content-length`: a chunked body carries no length header,
    and a declared one is only a claim. */
 const MAX_BODY_BYTES = 64 * 1024;
 
-function isId(value) {
-  return typeof value === 'string' && ID.test(value);
+/**
+ * Whether the create may look at this request's body at all.
+ *
+ * `application/json`, with a charset if one is declared, and nothing else. Any other media type is
+ * a CORS-simple request: a page on another origin can send `text/plain` without a preflight, so a
+ * cross-site fetch could otherwise spend a slot here with no negotiation at all. The base type is
+ * compared whole rather than by prefix, so `application/json-patch+json` — a JSON type, but not the
+ * one this API speaks — is refused instead of half-matching. Media types are case-insensitive, so
+ * the comparison is too.
+ */
+function hasJsonContentType(request) {
+  const header = request.headers.get('content-type');
+  if (!header) return false;
+  const [mediaType] = header.split(';');
+  return mediaType.trim().toLowerCase() === 'application/json';
 }
 
 /**
@@ -146,21 +159,6 @@ async function readCappedBody(request) {
   return { text };
 }
 
-/* The Worker never opens a blob — it cannot, and must not be able to. It checks the envelope and
-   stores the bytes as they arrived. */
-function isSealed(value) {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof value.iv === 'string' &&
-    value.iv.length === IV_LENGTH &&
-    BASE64URL.test(value.iv) &&
-    typeof value.ct === 'string' &&
-    value.ct.length > 0 &&
-    BASE64URL.test(value.ct)
-  );
-}
-
 /**
  * One internal POST to a Durable Object.
  *
@@ -182,10 +180,15 @@ async function callDurable(stub, url, body) {
  *
  * The body carries no plaintext: `groupId` and `hostId` are hashes, and the name and meta are
  * sealed under a key derived from the code in the browser. Everything is refused before a Durable
- * Object is touched, so a malformed request costs no slot.
+ * Object is touched — the method, the media type and every field — so a malformed request costs no
+ * slot and no read.
  */
 async function createGroup(request, env) {
-  if (request.method !== 'POST') return json({ error: 'method' }, 405);
+  if (request.method !== 'POST') {
+    /* RFC 9110: a 405 has to name the methods it does allow, or a client has to guess. */
+    return json({ error: 'method' }, 405, { allow: 'POST' });
+  }
+  if (!hasJsonContentType(request)) return json({ error: 'body' }, 400);
 
   const body = await readCappedBody(request);
   if (body.tooLarge || body.failed) return json({ error: 'body' }, 400);
@@ -227,7 +230,13 @@ async function createGroup(request, env) {
 
   if (!initialised.ok) {
     /* Only a call that took the slot gives it back: a retry found the group already there, and it
-       must not free the slot the first create is holding. */
+       must not free the slot the first create is holding.
+
+       No HTTP request can reach this branch. The edge refuses every body the Group would refuse,
+       because both read the same shapes from wire.js, so an init that the DO answers with a
+       refusal cannot be produced by a request to /api/create. The path is therefore pinned by
+       `create: a refused init gives its slot back` in tests/create.test.mjs, which calls this
+       function with a Group binding that refuses — the release it records is this line. */
     if (slot.body.reserved) {
       await callDurable(registry, 'https://registry/release', { groupId }).catch(() => {});
     }

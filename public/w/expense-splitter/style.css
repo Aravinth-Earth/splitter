@@ -5,6 +5,9 @@
   --muted: #9198a1;
   --accent: #4c8dff;
   --border: #30363d;
+  /* Text on an accent fill: dark on the dark scheme's lighter blue, white on the light one's. */
+  --on-accent: #0d1117;
+  --danger: #ff7b72;
 }
 
 @media (prefers-color-scheme: light) {
@@ -15,22 +18,28 @@
     --muted: #59636e;
     --accent: #0969da;
     --border: #d1d9e0;
+    --on-accent: #ffffff;
+    --danger: #cf222e;
   }
 }
 
 * { box-sizing: border-box; }
+
+/* `display` on a class would otherwise win over the attribute, and a hidden panel is a promise. */
+[hidden] { display: none !important; }
 
 body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
   font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  overflow-wrap: break-word;
 }
 
 main {
   max-width: 42rem;
   margin: 0 auto;
-  padding: 3rem 1.25rem 4rem;
+  padding: 1.5rem 1rem 3rem;
 }
 
 h1 {
@@ -55,8 +64,182 @@ li { margin: 0.4rem 0; }
 
 .muted { color: var(--muted); font-size: 0.95rem; }
 
+a { color: var(--accent); }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ------------------------------------------------------------------ panels */
+
+.panel {
+  margin: 0 0 1rem;
+  padding: 1.25rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--card);
+}
+
+.panel > h2:first-child,
+.panel > .eyebrow + h2 { margin-top: 0; }
+
+.eyebrow {
+  margin: 0 0 0.25rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* ------------------------------------------------------------------- form */
+
+.field { margin: 0 0 1rem; }
+
+label {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-weight: 600;
+}
+
+input,
+select {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+input:focus-visible,
+select:focus-visible {
+  border-color: var(--accent);
+  outline-offset: 1px;
+}
+
+input[aria-invalid="true"] { border-color: var(--danger); }
+
+.hint {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+button {
+  min-height: 2.75rem;
+  border-radius: 0.5rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.primary {
+  width: 100%;
+  padding: 0.65rem 1rem;
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.primary:disabled {
+  cursor: progress;
+  opacity: 0.65;
+}
+
+.secondary {
+  flex: 1 1 8rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.secondary:hover { border-color: var(--accent); }
+
+.link-button {
+  padding: 0.5rem 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.form-error {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--danger);
+  border-left-width: 4px;
+  border-radius: 0.5rem;
+  background: var(--bg);
+  color: var(--danger);
+  font-size: 0.95rem;
+}
+
+/* ------------------------------------------------------------------ group */
+
+.group-head h2 {
+  margin-bottom: 0.15rem;
+  font-size: 1.5rem;
+  overflow-wrap: anywhere;
+}
+
+.who {
+  margin: 0;
+  font-weight: 600;
+}
+
+.group-head #role-line { margin: 0; }
+
+.code-line { margin: 1rem 0 0.5rem; }
+
+.code-line code {
+  display: block;
+  padding: 0.75rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 1.05rem;
+  letter-spacing: 0.06em;
+  text-align: center;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.code-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.copy-status {
+  min-height: 1.5rem;
+  margin: 0.5rem 0 0;
+}
+
+.hint-card {
+  margin-top: 1rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 0.5rem;
+  background: var(--bg);
+  font-size: 0.95rem;
+}
+
+.hint-card p { margin: 0 0 0.25rem; }
+
+.steps li { margin: 0.5rem 0; }
+
+/* --------------------------------------------------------------- page ends */
+
 .status {
-  margin-top: 2.5rem;
+  margin-top: 2rem;
   padding: 0.75rem 1rem;
   border: 1px solid var(--border);
   border-radius: 0.5rem;
@@ -64,4 +247,9 @@ li { margin: 0.4rem 0; }
   font-size: 0.95rem;
 }
 
-a { color: var(--accent); }
+/* A phone is the first screen this page is written for; the wide padding is the upgrade. */
+@media (min-width: 40rem) {
+  main { padding: 2.5rem 1.25rem 4rem; }
+  .panel { padding: 1.5rem 1.25rem; }
+  h1 { font-size: 2.25rem; }
+}

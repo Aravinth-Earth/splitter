@@ -20,8 +20,21 @@ import { fileURLToPath } from 'node:url';
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const API = '/w/expense-splitter/api';
 
-/** A port nothing is listening on, chosen by asking the OS for one. */
-export async function freePort() {
+/* How many ports to try before giving up. A bind race is worth another port; anything else fails
+   the same way on every port, so three attempts is headroom, not patience. */
+const PORT_ATTEMPTS = 3;
+
+/* What wrangler says when it cannot bind the port it was handed. */
+const PORT_IN_USE = /address already in use|EADDRINUSE/i;
+
+/**
+ * A port nothing is listening on, chosen by asking the OS for one.
+ *
+ * The probe socket is closed before anything binds the port — it has to be, or wrangler could not
+ * take it — so the port is free at this instant and not guaranteed to be free a moment later. A
+ * collision surfaces as a failed start with wrangler's own message, which `startWorker` retries.
+ */
+async function freePort() {
   return new Promise((resolve, reject) => {
     const server = createServer();
     server.unref();
@@ -34,14 +47,10 @@ export async function freePort() {
 }
 
 /**
- * Spawn the worker and wait until /api/health answers.
- *
- * @param {object} [options]
- * @param {Record<string, string|number>} [options.vars]  --var pairs for the run.
- * @param {number} [options.timeoutMs]                    how long health may take.
- * @returns {Promise<{baseUrl: string, port: number, stop: () => Promise<void>, output: () => string}>}
+ * One boot attempt on its own pair of ports. Returns when /api/health answers, throws when it does
+ * not — the thrown error carries wrangler's log so a caller can tell a bind race from a real fault.
  */
-export async function startWorker({ vars = {}, timeoutMs = 120_000 } = {}) {
+async function startAttempt({ vars, timeoutMs }) {
   const port = await freePort();
   /* Two suites that each boot a Worker would otherwise fight over the inspector socket: `wrangler
      dev` picks one by default, and the second holds it. `npm test` also runs files one at a time
@@ -64,6 +73,7 @@ export async function startWorker({ vars = {}, timeoutMs = 120_000 } = {}) {
   ];
   for (const [key, value] of Object.entries(vars)) args.push('--var', `${key}:${value}`);
 
+  const started = Date.now();
   const child = spawn('npx', args, {
     cwd: ROOT,
     // Its own process group: wrangler forks workerd, and only the group kill takes both down.
@@ -86,7 +96,15 @@ export async function startWorker({ vars = {}, timeoutMs = 120_000 } = {}) {
 
   const baseUrl = `http://127.0.0.1:${port}`;
 
-  async function stopWorker() {
+  /* A failure always carries the log and the time it took: a bare "never answered" costs another
+     five minutes of guessing, which is exactly what this helper exists to avoid. */
+  function failure(message) {
+    const error = new Error(`${message} after ${Date.now() - started} ms\n${log.trim()}`);
+    error.log = log;
+    return error;
+  }
+
+  async function stop() {
     if (child.pid) {
       try {
         process.kill(-child.pid, 'SIGTERM');
@@ -106,25 +124,59 @@ export async function startWorker({ vars = {}, timeoutMs = 120_000 } = {}) {
     if (existsSync(persistTo)) await rm(persistTo, { recursive: true, force: true });
   }
 
-  const deadline = Date.now() + timeoutMs;
-  let healthy = false;
+  /* The wait is a poll, not a fixed sleep: a measured cold start on this machine is 4.8–6.3 s from
+     `spawn` to the first healthy answer (three consecutive boots, warm `npx` cache), and the default
+     timeout is roughly twenty times that so a first run that has to build or fetch wrangler still
+     passes. A start that took longer than usual is visible in the failure message rather than
+     guessed at. */
+  const deadline = started + timeoutMs;
   while (Date.now() < deadline) {
-    if (exited) throw new Error(`wrangler dev exited (${exited.code ?? exited.signal})\n${log.trim()}`);
+    if (exited) {
+      await stop();
+      throw failure(`wrangler dev exited (${exited.code ?? exited.signal})`);
+    }
+    /* Checked while polling: a process that has already said it cannot bind will not recover, and
+       waiting out the whole timeout for it hides the one failure a new port fixes. */
+    if (PORT_IN_USE.test(log)) {
+      await stop();
+      throw failure(`wrangler dev could not bind port ${port}`);
+    }
     try {
       const response = await fetch(`${baseUrl}${API}/health`, { signal: AbortSignal.timeout(2000) });
-      if (response.ok) {
-        healthy = true;
-        break;
-      }
+      if (response.ok) return { baseUrl, stop };
     } catch {
       /* not listening yet */
     }
     await sleep(300);
   }
-  if (!healthy) {
-    await stopWorker();
-    throw new Error(`wrangler dev never answered /api/health on port ${port}\n${log.trim()}`);
-  }
 
-  return { baseUrl, port, stop: stopWorker, output: () => log };
+  await stop();
+  throw failure(`wrangler dev never answered ${API}/health on port ${port}`);
+}
+
+/**
+ * Spawn the worker and wait until /api/health answers.
+ *
+ * @param {object} [options]
+ * @param {Record<string, string|number>} [options.vars]  --var pairs for the run.
+ * @param {number} [options.timeoutMs]                    how long health may take, per attempt.
+ * @returns {Promise<{baseUrl: string, stop: () => Promise<void>}>}
+ */
+export async function startWorker({ vars = {}, timeoutMs = 120_000 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= PORT_ATTEMPTS; attempt += 1) {
+    try {
+      return await startAttempt({ vars, timeoutMs });
+    } catch (error) {
+      lastError = error;
+      /* A port taken between the probe in freePort() and wrangler's own bind is the only failure
+         another attempt can fix. Anything else — a build error, a missing binding, a bad `--var` —
+         would fail identically, so it is thrown the first time, with its log, rather than retried
+         into a longer and less informative wait. */
+      if (!PORT_IN_USE.test(String(error.log ?? error.message))) throw error;
+    }
+  }
+  throw new Error(
+    `wrangler dev could not bind a port in ${PORT_ATTEMPTS} attempts: ${lastError?.message}`
+  );
 }
