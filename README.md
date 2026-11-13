@@ -43,14 +43,13 @@ Issues are disabled here. Bug reports and questions are welcome by email, not as
 
 ## Development
 
-Nothing runs yet — this repo is at the scaffold stage. The commands it will have:
-
 ```bash
 npm run dev     # wrangler dev
 npm run check   # guards: no third-party refs, no inline handlers, no personal details, no banned copy
-npm test        # node:test — crypto, money math, merge, export
-npm run e2e     # throwaway Worker + two real Chromium profiles
+npm test        # node:test — crypto, and the Worker's routes against a throwaway wrangler dev
 ```
+
+`npm run e2e` — two real Chromium profiles against a live Worker — is planned, not written yet.
 
 **Deploys come from `main`.** Workers Builds is connected to this repository, so a merge to `main` builds and
 deploys. A manual `wrangler deploy` is break-glass only; prove what is live with
