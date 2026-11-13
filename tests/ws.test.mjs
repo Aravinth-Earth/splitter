@@ -144,7 +144,7 @@ async function createGroup(baseUrl) {
   });
   assert.equal(response.status, 200, 'the group must exist before a socket can reach it');
 
-  return { code, groupId, key, hostSecret, hostId };
+  return { code, groupId, key, hostSecret, hostId, nameBlob };
 }
 
 test('the member id the server derives is the id the browser derives', async () => {
@@ -191,13 +191,39 @@ test('a join writes a pending seat: waiting to the joiner, the name to the host'
 
   const update = await host.next();
   assert.equal(update.t, 'state');
+  assert.deepEqual(update.nameBlob, group.nameBlob, 'the sealed group name travels to the host');
   const pending = update.roster.find((member) => member.id === joinerId);
   assert.ok(pending, 'the organizer must see the person asking');
   assert.equal(pending.status, 'pending');
   assert.deepEqual(pending.nameBlob, joinerName, 'the host receives the sealed name, not the name');
 
-  const approved = update.roster.filter((member) => member.status === 'approved');
-  assert.equal(approved.length, 0, 'a pending person is not an approved member');
+  const approvedBefore = update.roster.filter((member) => member.status === 'approved');
+  assert.equal(approvedBefore.length, 0, 'a pending person is not an approved member');
+
+  host.send({ t: 'approve', memberId: joinerId });
+
+  const admitted = await joiner.next();
+  assert.equal(admitted.t, 'state');
+  assert.equal(admitted.role, 'member');
+  assert.deepEqual(admitted.nameBlob, group.nameBlob);
+  assert.ok(
+    admitted.roster.some((member) => member.id === joinerId && member.status === 'approved'),
+    'the admitted member is in the approved roster'
+  );
+  assert.ok(
+    !admitted.roster.some((member) => member.status === 'pending'),
+    'an approved member does not see pending names'
+  );
+
+  const afterApprove = await host.next();
+  assert.ok(
+    !afterApprove.roster.some((member) => member.id === joinerId && member.status === 'pending'),
+    'the request clears for the host'
+  );
+  assert.ok(
+    afterApprove.roster.some((member) => member.id === joinerId && member.status === 'approved'),
+    'the host sees the admitted member'
+  );
 });
 
 test('a wrong secret closes the socket with no frames', async (t) => {
@@ -313,4 +339,76 @@ test('a full group refuses the next join with a code and no seat', async (t) => 
   assert.deepEqual(refused, { t: 'refused', code: 'group_full' });
   const closed = await second.waitClosed();
   assert.equal(closed.code, 1008);
+});
+
+test('a declined request tells the person and leaves no pending seat', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const joinerSecret = randomSecret();
+  const joinerId = await idFromSecret(joinerSecret);
+  const joiner = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => joiner.close());
+  joiner.send({
+    t: 'auth',
+    id: joinerId,
+    secret: joinerSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Declined' })
+  });
+  assert.equal((await joiner.next()).t, 'waiting');
+  await host.next();
+
+  host.send({ t: 'reject', memberId: joinerId });
+
+  assert.deepEqual(await joiner.next(), { t: 'refused', code: 'declined' });
+  assert.equal((await joiner.waitClosed()).code, 1008);
+
+  const after = await host.next();
+  assert.ok(
+    !after.roster.some((member) => member.id === joinerId),
+    'a declined request is not on the roster'
+  );
+});
+
+test('a member cannot approve anyone', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const joinerSecret = randomSecret();
+  const joinerId = await idFromSecret(joinerSecret);
+  const joiner = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => joiner.close());
+  joiner.send({
+    t: 'auth',
+    id: joinerId,
+    secret: joinerSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Not host' })
+  });
+  assert.equal((await joiner.next()).t, 'waiting');
+  const hostState = await host.next();
+
+  joiner.send({ t: 'approve', memberId: joinerId });
+  assert.deepEqual(await joiner.next(), { t: 'refused', code: 'not_host' });
+  assert.equal((await joiner.waitClosed()).code, 1008);
+
+  /* No state frame is the proof: the host is not told that anything changed, because nothing did.
+     The roster the host already held is unchanged. */
+  assert.equal(hostState.roster.some((member) => member.id === joinerId), true);
+  await host.silence(500);
 });

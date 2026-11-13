@@ -186,10 +186,8 @@ export class Group {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  /** One frame decides who this socket is. Later frames belong to a protocol not served yet. */
+  /** One frame decides who this socket is; later frames are the host's actions. */
   async handleMessage(socket, message) {
-    if (this.identities.has(socket)) return;
-
     let frame;
     try {
       const text = typeof message === 'string' ? message : new TextDecoder().decode(message);
@@ -199,15 +197,77 @@ export class Group {
       return;
     }
 
-    if (frame === null || typeof frame !== 'object' || frame.t !== 'auth') {
+    if (frame === null || typeof frame !== 'object') {
       this.rejectSocket(socket, 'auth');
       return;
     }
 
     try {
+      if (this.identities.has(socket)) {
+        await this.handleAction(socket, frame);
+        return;
+      }
+      if (frame.t !== 'auth') {
+        this.rejectSocket(socket, 'auth');
+        return;
+      }
       await this.authenticateSocket(socket, frame);
     } catch {
       this.rejectSocket(socket, 'server');
+    }
+  }
+
+  /**
+   * The host's two decisions. Every action is gated on the socket's identity, never on a field the
+   * client sent: a member that forges `approve` changes nothing and is closed with `not_host`.
+   */
+  async handleAction(socket, frame) {
+    if (frame.t !== 'approve' && frame.t !== 'reject') return;
+
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta) return this.refuse(socket, 'unknown_group');
+
+    const identity = this.identities.get(socket);
+    if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
+
+    if (!isId(frame.memberId)) {
+      this.sendRefusal(socket, 'bad_request');
+      return;
+    }
+
+    const key = memberKey(frame.memberId);
+    const entry = await this.ctx.storage.get(key);
+    if (!entry || entry.status !== 'pending') {
+      this.sendRefusal(socket, 'not_pending');
+      await this.notifyHosts(meta);
+      return;
+    }
+
+    if (frame.t === 'approve') {
+      await this.ctx.storage.put(key, { ...entry, status: 'approved' });
+    } else {
+      await this.ctx.storage.put(key, { ...entry, status: 'removed' });
+    }
+
+    await this.notifyHosts(meta);
+    await this.notifyMember(meta, frame.memberId, frame.t === 'approve' ? 'approved' : 'declined');
+  }
+
+  /** A decision reaches the person waiting, if they still have a socket. */
+  async notifyMember(meta, memberId, outcome) {
+    for (const socket of this.sockets) {
+      if (this.identities.get(socket)?.memberId !== memberId) continue;
+      if (outcome === 'approved') {
+        this.identities.set(socket, { memberId, role: 'member' });
+        socket.send(JSON.stringify(await this.rosterFrame(meta, memberId, 'member')));
+        continue;
+      }
+      try {
+        socket.send(JSON.stringify({ t: 'refused', code: 'declined' }));
+        socket.close(1008, 'declined');
+      } catch {
+        /* already gone */
+      }
     }
   }
 
@@ -290,12 +350,13 @@ export class Group {
     const roster = [];
     const members = await this.members();
     for (const [key, entry] of members) {
+      if (entry.status === 'removed') continue;
       const id = key.slice(MEMBER_PREFIX.length);
       if (role === 'host' || entry.status === 'approved') {
         roster.push({ id, status: entry.status, nameBlob: entry.nameBlob });
       }
     }
-    return { t: 'state', rev: meta.rev, memberId, role, roster };
+    return { t: 'state', rev: meta.rev, memberId, role, nameBlob: meta.nameBlob, roster };
   }
 
   async notifyHosts(meta) {
@@ -313,6 +374,14 @@ export class Group {
   rejectSocket(socket, code) {
     try {
       socket.close(1008, code);
+    } catch {
+      /* already gone */
+    }
+  }
+
+  sendRefusal(socket, code) {
+    try {
+      socket.send(JSON.stringify({ t: 'refused', code }));
     } catch {
       /* already gone */
     }

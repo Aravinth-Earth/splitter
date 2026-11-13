@@ -27,6 +27,7 @@ import {
   groupIdFromCode,
   idFromSecret,
   normalizeCode,
+  open,
   randomSecret,
   seal
 } from './crypto.js';
@@ -282,6 +283,10 @@ export function init(doc = document, win = window) {
   const copyFallback = doc.getElementById('copy-fallback');
   const copyFallbackField = doc.getElementById('copy-fallback-field');
   const whoLine = doc.getElementById('who-line');
+  const roleLine = doc.getElementById('role-line');
+  const roster = doc.getElementById('roster');
+  const rosterList = doc.getElementById('roster-list');
+  const rosterEmpty = doc.getElementById('roster-empty');
   const codeHint = doc.getElementById('code-hint');
   const dismissHintButton = doc.getElementById('dismiss-hint');
   const emptyLedger = doc.getElementById('empty-ledger');
@@ -314,6 +319,7 @@ export function init(doc = document, win = window) {
   let pending = false;
   let joinPending = false;
   let joinSocket = null;
+  let hostSocket = null;
 
   form.addEventListener('submit', (event) => {
     /* A form with no action would still navigate, and a navigation is a lost create. */
@@ -394,6 +400,7 @@ export function init(doc = document, win = window) {
 
       hideError();
       showGroup({ code, name: fields.name, displayName: fields.displayName });
+      openHostSocket({ groupId: payload.groupId, memberId: payload.hostId, secret, code });
     } catch {
       showError(RETRY_MESSAGE);
     } finally {
@@ -428,18 +435,25 @@ export function init(doc = document, win = window) {
   }
 
   /** Replace the form with the group, in place: no modal, no confirmation, no second screen. */
-  function showGroup({ code, name, displayName }) {
+  function showGroup({ code, name, displayName, role = 'organizer' }) {
     group = { code };
 
     groupNameDisplay.textContent = name;
     groupCode.textContent = formatCode(code);
     whoLine.textContent = displayName;
     whoLine.hidden = false;
+    roleLine.textContent = role === 'organizer' ? 'you are the organizer' : 'you are a member';
+    roster.hidden = role !== 'organizer';
+    rosterList.textContent = '';
+    rosterEmpty.hidden = role !== 'organizer';
+    rosterEmpty.textContent = 'No one is waiting.';
     copyStatus.textContent = '';
     hideFallback();
     codeHint.hidden = false;
 
     createPanel.hidden = true;
+    joinPanel.hidden = true;
+    waitingPanel.hidden = true;
     groupHeader.hidden = false;
     emptyLedger.hidden = false;
 
@@ -626,7 +640,7 @@ export function init(doc = document, win = window) {
       socket.send(JSON.stringify({ t: 'auth', id: memberId, secret, mode: 'join', nameBlob }));
     });
 
-    socket.addEventListener('message', (event) => {
+    socket.addEventListener('message', async (event) => {
       let frame;
       try {
         frame = JSON.parse(event.data);
@@ -638,6 +652,20 @@ export function init(doc = document, win = window) {
         settled = true;
         waitingCopy.textContent =
           'The organizer has to let you in. Nothing from the group is shown until they do.';
+        return;
+      }
+
+      if (frame.t === 'state' && frame.role === 'member') {
+        settled = true;
+        let name = 'Your group';
+        try {
+          const key = await deriveGroupKey(code);
+          const opened = await open(key, frame.nameBlob);
+          if (typeof opened?.name === 'string') name = opened.name;
+        } catch {
+          /* the name stays a neutral label rather than an unreadable blob */
+        }
+        showGroup({ code, name, displayName: joinNameInput.value.trim(), role: 'member' });
         return;
       }
 
@@ -675,7 +703,124 @@ export function init(doc = document, win = window) {
     if (code === 'group_full') return 'That group already has 20 people in it.';
     if (code === 'rate_limited') return 'Too many attempts from here.';
     if (code === 'unknown_group') return 'No live group with that code.';
+    if (code === 'declined') return 'The organizer did not let you in.';
     return 'The group could not take the request. Try again.';
+  }
+
+  /* ------------------------------------------------------------ the organizer */
+
+  function openHostSocket({ groupId, memberId, secret, code }) {
+    closeHostSocket();
+
+    const url = new URL('api/ws', win.location.href);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.searchParams.set('room', groupId);
+
+    let socket;
+    try {
+      socket = new win.WebSocket(url.toString());
+    } catch {
+      rosterEmpty.textContent = 'Could not open a connection. Reload to continue.';
+      rosterEmpty.hidden = false;
+      return;
+    }
+
+    hostSocket = socket;
+    const key = deriveGroupKey(code);
+
+    socket.addEventListener('open', () => {
+      socket.send(JSON.stringify({ t: 'auth', id: memberId, secret, mode: 'resume' }));
+    });
+
+    socket.addEventListener('message', (event) => {
+      let frame;
+      try {
+        frame = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (frame.t === 'state') {
+        void renderRoster(frame, key);
+        return;
+      }
+      if (frame.t === 'refused') {
+        rosterEmpty.textContent = 'That request could not be completed.';
+        rosterEmpty.hidden = false;
+      }
+    });
+
+    socket.addEventListener('close', () => {
+      if (hostSocket !== socket) return;
+      hostSocket = null;
+      rosterEmpty.textContent = 'Connection lost. Reload to continue.';
+      rosterEmpty.hidden = false;
+    });
+
+    socket.addEventListener('error', () => {
+      /* the close event follows */
+    });
+  }
+
+  function closeHostSocket() {
+    if (!hostSocket) return;
+    const socket = hostSocket;
+    hostSocket = null;
+    try {
+      socket.close();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /** The names are sealed; the host has the code, so it can open them and nobody else can. */
+  async function renderRoster(frame, keyPromise) {
+    if (frame.role !== 'host') return;
+
+    const key = await keyPromise;
+    const pending = frame.roster.filter((member) => member.status === 'pending');
+
+    rosterList.textContent = '';
+    roster.hidden = false;
+    rosterEmpty.hidden = pending.length > 0;
+    rosterEmpty.textContent = 'No one is waiting.';
+
+    for (const member of pending) {
+      let name = 'Someone';
+      try {
+        const opened = await open(key, member.nameBlob);
+        if (typeof opened?.name === 'string') name = opened.name;
+      } catch {
+        name = 'Name could not be opened';
+      }
+
+      const chip = doc.createElement('li');
+      chip.className = 'chip';
+
+      const label = doc.createElement('span');
+      label.textContent = name;
+
+      const allow = doc.createElement('button');
+      allow.type = 'button';
+      allow.className = 'secondary';
+      allow.textContent = 'Let in';
+
+      const decline = doc.createElement('button');
+      decline.type = 'button';
+      decline.className = 'secondary';
+      decline.textContent = 'No';
+
+      const act = (type) => {
+        allow.disabled = true;
+        decline.disabled = true;
+        if (hostSocket) hostSocket.send(JSON.stringify({ t: type, memberId: member.id }));
+      };
+      allow.addEventListener('click', () => act('approve'));
+      decline.addEventListener('click', () => act('reject'));
+
+      chip.append(label, allow, decline);
+      rosterList.append(chip);
+    }
   }
 
   /* A short message in the live region, cleared after a few seconds. */
