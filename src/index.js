@@ -10,7 +10,6 @@
  */
 
 const CANONICAL = '/w/expense-splitter';
-const PREVIEW = '/w/expense-splitter-preview';
 const API_PREFIX = `${CANONICAL}/api`;
 const VERSION = '0.1.0';
 
@@ -53,9 +52,11 @@ function redirect(url, pathname) {
   });
 }
 
-/* A missing page has to link back to the prefix that served it, and one static file cannot know
-   which prefix that was — so the 404 is generated here, where the prefix is known. */
-function notFound(prefix) {
+/* A missing page links back to Splitter, and one static file cannot know the prefix it was served
+   under — so the 404 is generated here. There is one mount (`CANONICAL`): the preview prefix that
+   used to be rewritten onto it is gone, because a rewritten preview is a production URL at the
+   moment a write happens. A branch build now lives only at its own workers.dev preview host. */
+function notFound() {
   return new Response(`<!doctype html>
 <html lang="en">
 <head>
@@ -76,7 +77,7 @@ function notFound(prefix) {
 <main>
   <h1>Not found</h1>
   <p>That page does not exist.</p>
-  <p><a href="${prefix}/">Back to Splitter</a></p>
+  <p><a href="${CANONICAL}/">Back to Splitter</a></p>
 </main>
 </body>
 </html>
@@ -246,15 +247,6 @@ async function handleApi(request, env, url) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const prefix =
-      url.pathname === PREVIEW || url.pathname.startsWith(`${PREVIEW}/`) ? PREVIEW : CANONICAL;
-
-    /* The preview route serves the canonical asset tree, so a file is never moved at cutover:
-       /w/expense-splitter-preview/style.css reads /w/expense-splitter/style.css. */
-    if (url.pathname === PREVIEW) return redirect(url, `${PREVIEW}/`);
-    if (url.pathname.startsWith(`${PREVIEW}/`)) {
-      url.pathname = CANONICAL + url.pathname.slice(PREVIEW.length);
-    }
 
     if (url.pathname === CANONICAL) return redirect(url, `${CANONICAL}/`);
 
@@ -271,7 +263,7 @@ export default {
     const headers = new Headers(response.headers);
 
     if (response.status === 404) {
-      const page = notFound(prefix);
+      const page = notFound();
       for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
       for (const [name, value] of page.headers) headers.set(name, value);
       return new Response(page.body, { status: 404, headers });
