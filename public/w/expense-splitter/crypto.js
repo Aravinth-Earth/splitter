@@ -206,9 +206,38 @@ export async function open(key, sealed, associated) {
     throw new Error('splitter: this value was not sealed under this key');
   }
 
+  let value;
   try {
-    return JSON.parse(decoder.decode(plaintext));
+    value = JSON.parse(decoder.decode(plaintext));
   } catch {
     throw new Error('splitter: a sealed value carries JSON');
   }
+
+  /*
+   * A frame is a record: a plain object, and nothing else. The GCM tag proves who sealed these
+   * bytes, not what shape they are — any member of a group holds the group key, so any member can
+   * seal any payload. `JSON.parse` gives `{"__proto__": …}` back as an own property, and the first
+   * `Object.assign(target, opened)` would set the *target's* prototype instead of copying a field,
+   * handing whoever sealed it a property on someone else's page. The shape is checked here, once,
+   * so no caller has to remember to.
+   */
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('splitter: a sealed value carries a record, not a scalar or an array');
+  }
+  if (hasPrototypeKey(value)) {
+    throw new Error('splitter: a sealed value carries a __proto__ key');
+  }
+  return value;
+}
+
+/* A prototype key is refused at any depth: a record nests its own fields, and a merge that walks
+   into one of them would hand the same trap a level lower. `Object.keys` reads own properties
+   only, so an inherited `__proto__` is not what this is looking for. */
+function hasPrototypeKey(value) {
+  if (value === null || typeof value !== 'object') return false;
+  if (Object.keys(value).includes('__proto__')) return true;
+  for (const child of Array.isArray(value) ? value : Object.values(value)) {
+    if (hasPrototypeKey(child)) return true;
+  }
+  return false;
 }

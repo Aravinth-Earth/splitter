@@ -193,11 +193,35 @@ test('seal and open round-trip a JS object', async () => {
 
   assert.deepEqual(await open(key, sealed), value);
 
-  const list = await seal(key, [1, 2, 3]);
-  assert.deepEqual(await open(key, list), [1, 2, 3]);
+  /* A frame is a record: a scalar or an array is not something a caller can merge, so it is
+     refused at the door rather than handed on to code that expects fields. */
+  await assert.rejects(open(key, await seal(key, [1, 2, 3])), /record, not a scalar or an array/);
+  await assert.rejects(open(key, await seal(key, 'a bare string')), /record, not a scalar or an array/);
+  await assert.rejects(open(key, await seal(key, 42)), /record, not a scalar or an array/);
+  await assert.rejects(open(key, await seal(key, null)), /record, not a scalar or an array/);
+});
 
-  const text = await seal(key, 'a bare string');
-  assert.equal(await open(key, text), 'a bare string');
+test('a frame carrying a prototype key is refused', async () => {
+  const key = await deriveGroupKey(generateCode());
+
+  /* The frame is real on the wire: `JSON.parse` gives `__proto__` back as an own property, so any
+     member — who holds the group key — can seal exactly this. Without the guard the next
+     `Object.assign({}, opened)` would set the target's prototype instead of copying a field. */
+  const trap = JSON.parse('{"__proto__":{"polluted":1}}');
+  assert.equal(
+    Object.assign({}, trap).polluted,
+    1,
+    'the guard exists because merging this frame would pollute the target'
+  );
+
+  await assert.rejects(open(key, await seal(key, trap)), /__proto__/);
+
+  const nested = { split: JSON.parse('{"__proto__":{"polluted":1}}') };
+  await assert.rejects(open(key, await seal(key, nested)), /__proto__/, 'a trap one level down');
+
+  /* The guard refuses a key, not a word: an ordinary record that mentions it still opens. */
+  const ordinary = { note: '__proto__ is a string here' };
+  assert.deepEqual(await open(key, await seal(key, ordinary)), ordinary);
 });
 
 test('every seal carries a fresh 12-byte iv', async () => {
