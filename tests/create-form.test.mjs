@@ -23,14 +23,14 @@ import {
   normalizeCurrency,
   validateDisplayName,
   validateGroupName
-} from '../public/w/expense-splitter/app.js';
+} from '../public/app.js';
 import {
   deriveGroupKey,
   formatCode,
   generateCode,
   open,
   randomSecret
-} from '../public/w/expense-splitter/crypto.js';
+} from '../public/crypto.js';
 
 /* ----------------------------------------------------------------- group name */
 
@@ -247,13 +247,13 @@ test('a full ledger renders exactly the cap message and nothing else', () => {
 
 test('the invite link carries the code in the fragment', () => {
   const code = 'ABCDEFGHJKMNPQRS';
-  const link = inviteLink('https://example.test/w/expense-splitter/', code);
+  const link = inviteLink('https://expense-splitter.332321.xyz/', code);
 
-  assert.equal(link, `https://example.test/w/expense-splitter/#code=${formatCode(code)}`);
+  assert.equal(link, `https://expense-splitter.332321.xyz/#code=${formatCode(code)}`);
   assert.equal(formatCode(code), 'ABCD-EFGH-JKMN-PQRS', 'the fragment carries the formatted reading');
 
   const url = new URL(link);
-  assert.equal(url.pathname, '/w/expense-splitter/', 'the code must not be in the path');
+  assert.equal(url.pathname, '/', 'the code must not be in the path');
   assert.equal(url.search, '', 'the code must not be in the query string');
   assert.equal(
     url.hash,

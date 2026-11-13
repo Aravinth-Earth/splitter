@@ -1,8 +1,9 @@
 /**
  * Splitter — the Worker in front of the app.
  *
- * Two jobs: serve the static SPA through the ASSETS binding (adding the site's security
- * headers), and hand /api/* to the app's own handlers.
+ * The app owns the root of its own origin (expense-splitter.332321.xyz). Two jobs: serve the
+ * static SPA through the ASSETS binding (adding the site's security headers), and hand /api/*
+ * to the app's own handlers.
  *
  * Nothing here can read a group: names, amounts, descriptions and splits arrive as AES-GCM
  * blobs sealed in the browser under a key derived from the group code, and the code itself is
@@ -13,8 +14,7 @@
    apart: an id the edge accepts must be one the Group stores, and vice versa. */
 import { isId, isSealed } from './wire.js';
 
-const CANONICAL = '/w/expense-splitter';
-const API_PREFIX = `${CANONICAL}/api`;
+const API_PREFIX = '/api';
 const VERSION = '0.1.0';
 
 /* 'unsafe-inline' is needed by the pre-paint theme script in <head>; the page talks only to its
@@ -51,19 +51,9 @@ function json(body, status = 200, headers = {}) {
   });
 }
 
-function redirect(url, pathname) {
-  const target = new URL(url);
-  target.pathname = pathname;
-  return new Response(null, {
-    status: 301,
-    headers: { location: target.toString(), 'cache-control': 'no-store' }
-  });
-}
-
-/* A missing page links back to Splitter, and one static file cannot know the prefix it was served
-   under — so the 404 is generated here. There is one mount (`CANONICAL`): the preview prefix that
-   used to be rewritten onto it is gone, because a rewritten preview is a production URL at the
-   moment a write happens. A branch build now lives only at its own workers.dev preview host. */
+/* A missing page links back to Splitter, and one static file cannot know the origin it was served
+   under — so the 404 is generated here. The app is the whole of its origin, so every path that is
+   not an asset or an API route is a 404 from this Worker. */
 function notFound() {
   return new Response(`<!doctype html>
 <html lang="en">
@@ -85,7 +75,7 @@ function notFound() {
 <main>
   <h1>Not found</h1>
   <p>That page does not exist.</p>
-  <p><a href="${CANONICAL}/">Back to Splitter</a></p>
+  <p><a href="/">Back to Splitter</a></p>
 </main>
 </body>
 </html>
@@ -256,8 +246,6 @@ async function handleApi(request, env, url) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
-    if (url.pathname === CANONICAL) return redirect(url, `${CANONICAL}/`);
 
     if (url.pathname === API_PREFIX || url.pathname.startsWith(`${API_PREFIX}/`)) {
       try {

@@ -18,7 +18,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-export const API = '/w/expense-splitter/api';
+export const API = '/api';
 
 /* How many ports to try before giving up. A bind race is worth another port; anything else fails
    the same way on every port, so three attempts is headroom, not patience. */

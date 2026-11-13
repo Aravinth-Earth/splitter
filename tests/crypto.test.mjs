@@ -26,7 +26,7 @@ import {
   idFromSecret,
   seal,
   open
-} from '../public/w/expense-splitter/crypto.js';
+} from '../public/crypto.js';
 /* The server's half of the same envelope. The iv was counted as 16 characters in one file and 12
    bytes in the other, so the cross-check below is the point of the import, not a detail. */
 import { IV_BASE64_CHARS } from '../src/wire.js';

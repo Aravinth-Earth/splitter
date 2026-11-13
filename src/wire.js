@@ -21,7 +21,7 @@ const BASE64URL = /^[A-Za-z0-9_-]+$/;
  *
  * The number is characters because the value being checked is the string a client sent, not the
  * bytes it decodes to. It is 16 because crypto.js seals under `IV_BYTES` (12, see
- * public/w/expense-splitter/crypto.js), and an unpadded base64url encoding of 12 bytes is exactly
+ * public/crypto.js), and an unpadded base64url encoding of 12 bytes is exactly
  * 16 characters — the two numbers are one number written in two units, which is why this constant
  * is derived and asserted against crypto.js in the tests rather than trusted on its own.
  */
