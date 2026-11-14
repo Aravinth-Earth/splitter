@@ -243,6 +243,15 @@
       </form>
     </section>
 
+    <section id="charts" class="panel" aria-labelledby="charts-title" hidden>
+      <h2 id="charts-title">Paid and incurred</h2>
+      <div class="chart-tabs" role="radiogroup" aria-label="Chart view">
+        <label><input type="radio" name="chart-view" value="paid" checked /> Paid</label>
+        <label><input type="radio" name="chart-view" value="incurred" /> Incurred</label>
+      </div>
+      <div id="chart-host" class="chart-host"></div>
+    </section>
+
     <section id="settlement-panel" class="panel sheet" aria-labelledby="settlement-title" hidden>
       <h2 id="settlement-title">Record a payment</h2>
       <form id="settlement-form" novalidate>

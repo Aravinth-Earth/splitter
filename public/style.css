@@ -605,3 +605,49 @@ button {
   padding: 0.2rem 0.45rem;
   font-size: 0.85rem;
 }
+
+.chart-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.chart-tabs label {
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  font-size: 0.92rem;
+}
+
+.chart-host svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.bar-fill {
+  fill: var(--accent);
+}
+
+.bar-label,
+.bar-value {
+  fill: currentColor;
+  font-size: 8px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+@media print {
+  .chart-host svg {
+    break-inside: avoid;
+  }
+}

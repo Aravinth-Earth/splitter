@@ -43,6 +43,7 @@ import {
 } from './store.js';
 import { GroupSocket } from './sync.js';
 import { attribute, balances, ledgerContributions, settle } from './balance.js';
+import { renderChart, totals as chartTotals } from './charts.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -336,6 +337,9 @@ export function init(doc = document, win = window) {
   const balanceList = doc.getElementById('balance-list');
   const transferList = doc.getElementById('transfer-list');
   const settleNote = doc.getElementById('settle-note');
+  const chartsPanel = doc.getElementById('charts');
+  const chartHost = doc.getElementById('chart-host');
+  const chartModes = [...doc.querySelectorAll('input[name="chart-view"]')];
   const paymentList = doc.getElementById('payment-list');
   const recordPaymentButton = doc.getElementById('record-payment');
   const settlementPanel = doc.getElementById('settlement-panel');
@@ -436,6 +440,9 @@ export function init(doc = document, win = window) {
   let editingExpense = null;
   let customSeed = null;
   let lastBalances = {};
+  let lastChartIds = [];
+  let lastChartNames = new Map();
+  let lastChartExpenses = [];
   let multiPayer = false;
   let settlementDraftId = null;
   let pendingSettlementId = null;
@@ -494,6 +501,7 @@ export function init(doc = document, win = window) {
     updatePreview();
     updatePayerTotal();
   });
+  chartModes.forEach((radio) => radio.addEventListener('change', renderCharts));
   addPayerButton.addEventListener('click', expandPayers);
   addAnotherPayerButton.addEventListener('click', () => addPayerRow());
   payerRows.addEventListener('input', updatePayerTotal);
@@ -779,6 +787,7 @@ export function init(doc = document, win = window) {
     resumeSession = resume;
     ledgerPanel.hidden = true;
     balancesPanel.hidden = true;
+    chartsPanel.hidden = true;
     createPanel.hidden = true;
     groupHeader.hidden = true;
     emptyLedger.hidden = true;
@@ -808,6 +817,7 @@ export function init(doc = document, win = window) {
     resumeSession = null;
     ledgerPanel.hidden = true;
     balancesPanel.hidden = true;
+    chartsPanel.hidden = true;
     joinPanel.hidden = true;
     waitingPanel.hidden = true;
     groupHeader.hidden = true;
@@ -826,6 +836,7 @@ export function init(doc = document, win = window) {
     emptyLedger.hidden = true;
     ledgerPanel.hidden = true;
     balancesPanel.hidden = true;
+    chartsPanel.hidden = true;
     waitingPanel.hidden = false;
     waitingCode.textContent = formatCode(code);
     waitingTitle.textContent = 'Waiting for the organizer';
@@ -1562,6 +1573,28 @@ export function init(doc = document, win = window) {
     renderBalances();
   }
 
+  function chartMode() {
+    return chartModes.find((radio) => radio.checked)?.value ?? 'paid';
+  }
+
+  function renderCharts() {
+    if (groupHeader.hidden || lastChartExpenses.length === 0) {
+      chartsPanel.hidden = true;
+      chartHost.textContent = '';
+      return;
+    }
+
+    chartsPanel.hidden = false;
+    const { paid, incurred } = chartTotals(lastChartIds, lastChartExpenses);
+    const values = chartMode() === 'paid' ? paid : incurred;
+    renderChart(chartHost, values, {
+      doc,
+      names: Object.fromEntries(lastChartNames),
+      title: chartMode() === 'paid' ? 'Paid by member' : 'Incurred by member',
+      format: (paise) => formatPaise(paise, groupCurrency)
+    });
+  }
+
   function renderBalances() {
     if (groupHeader.hidden) {
       balancesPanel.hidden = true;
@@ -1601,6 +1634,9 @@ export function init(doc = document, win = window) {
       referenced.add(payment.from);
       referenced.add(payment.to);
     }
+    lastChartIds = [...referenced];
+    lastChartNames = new Map(members);
+    lastChartExpenses = expenses;
     const map = balances([...referenced], expenses, settlements);
     const proposal = settle(map);
     const contributions = ledgerContributions([...referenced], expenses, settlements);
@@ -1724,6 +1760,7 @@ export function init(doc = document, win = window) {
     }
 
     balancesPanel.hidden = false;
+    renderCharts();
   }
 
   function disarmDelete() {
