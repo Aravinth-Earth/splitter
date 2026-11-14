@@ -762,10 +762,11 @@ test('a stale base is a conflict, and a tombstone is final', async (t) => {
   assert.equal(revised.rev, 2);
   assert.deepEqual(revised.blob, second);
 
-  host.send({ t: 'put', id, base: 2, blob: second, deleted: true });
+  host.send({ t: 'put', id, base: 2, blob: null, deleted: true });
   const tombstone = await host.next();
   assert.equal(tombstone.deleted, true);
   assert.equal(tombstone.rev, 3);
+  assert.equal(tombstone.blob, null, 'a tombstone keeps no value');
 
   host.send({ t: 'put', id, base: 3, blob: first, deleted: false });
   assert.deepEqual(await host.next(), { t: 'refused', code: 'deleted', id });
@@ -829,4 +830,50 @@ test('the host name and the group meta travel in state when present', async (t) 
   assert.ok(self, 'the host is a roster entry when its name was sent');
   assert.equal(self.status, 'approved');
   assert.deepEqual(self.nameBlob, group.hostNameBlob);
+});
+
+
+test('an edit by another member keeps the creator and names the editor', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+  const member = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => member.close());
+  member.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Editor' })
+  });
+  assert.equal((await member.next()).t, 'waiting');
+  await host.next();
+  host.send({ t: 'approve', memberId });
+  assert.equal((await member.next()).role, 'member');
+  await host.next();
+
+  const id = randomSecret();
+  const first = await seal(group.key, { amount: 100 }, 'sp1:rec:test');
+  const second = await seal(group.key, { amount: 200 }, 'sp1:rec:test');
+
+  host.send({ t: 'put', id, base: 0, blob: first, deleted: false });
+  const created = await host.next();
+  assert.equal(created.author, group.hostId);
+  assert.equal(created.creator, group.hostId);
+  await member.next();
+
+  member.send({ t: 'put', id, base: 1, blob: second, deleted: false });
+  const edited = await host.next();
+  assert.equal(edited.rev, 2);
+  assert.equal(edited.creator, group.hostId, 'the creator stays the organizer');
+  assert.equal(edited.author, memberId, 'the last writer is the editor');
+  assert.deepEqual(edited.blob, second);
 });
