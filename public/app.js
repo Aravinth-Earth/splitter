@@ -44,6 +44,7 @@ import {
 import { GroupSocket } from './sync.js';
 import { attribute, balances, ledgerContributions, settle } from './balance.js';
 import { renderChart, totals as chartTotals } from './charts.js';
+import { mergeDiff } from './merge.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -436,6 +437,11 @@ export function init(doc = document, win = window) {
   let expenseDraftId = null;
   let pendingExpenseId = null;
   let pendingExpenseEdit = false;
+  let editingBaseValue = null;
+  let pendingExpenseValue = null;
+  let mergeNotice = null;
+  let mergeNoticeFields = [];
+  let mergeRetryId = null;
   let pendingDeleteId = null;
   let editingExpense = null;
   let customSeed = null;
@@ -2076,10 +2082,15 @@ export function init(doc = document, win = window) {
     closeSettlementSheet();
     expenseSheetOpen = true;
     editingExpense = record;
+    editingBaseValue = record ? record.value : null;
     customSeed = record ? new Map(Object.entries(record.value.split ?? {})) : null;
     expenseDraftId = record ? record.id : randomSecret();
     pendingExpenseId = null;
     pendingExpenseEdit = false;
+    pendingExpenseValue = null;
+    mergeNotice = null;
+    mergeNoticeFields = [];
+    mergeRetryId = null;
     pendingDeleteId = null;
     savingExpense = false;
     expenseError.hidden = true;
@@ -2132,6 +2143,11 @@ export function init(doc = document, win = window) {
     pendingExpenseEdit = false;
     savingExpense = false;
     editingExpense = null;
+    editingBaseValue = null;
+    pendingExpenseValue = null;
+    mergeNotice = null;
+    mergeNoticeFields = [];
+    mergeRetryId = null;
     customSeed = null;
     expenseSave.disabled = false;
     expenseCancel.disabled = false;
@@ -2364,6 +2380,10 @@ export function init(doc = document, win = window) {
         note: note.value
       };
       const blob = await seal(key, value, expenseAad(groupIdValue, expenseDraftId));
+      pendingExpenseValue = value;
+      mergeNotice = null;
+      mergeNoticeFields = [];
+      mergeRetryId = null;
       socket.send(
         {
           t: 'put',
@@ -2466,13 +2486,14 @@ export function init(doc = document, win = window) {
     ledger.set(frame.id, { ...frame, value });
     renderLedger();
 
-    if (frame.id === pendingExpenseId) {
+    if (frame.id === pendingExpenseId && (!selfId || frame.author === selfId)) {
       const wasEditing = pendingExpenseEdit;
+      const notice = mergeNotice;
       pendingExpenseId = null;
       pendingExpenseEdit = false;
       savingExpense = false;
       closeExpenseSheet();
-      setStatus(wasEditing ? 'Expense saved.' : 'Expense added.');
+      setStatus(notice ?? (wasEditing ? 'Expense saved.' : 'Expense added.'));
     }
     if (frame.id === pendingSettlementId) {
       pendingSettlementId = null;
@@ -2565,22 +2586,29 @@ export function init(doc = document, win = window) {
     const deleting = frame.id === pendingDeleteId;
     if (!editing && !deleting) return false;
 
+    if (frame.current?.deleted) {
+      ledger.delete(frame.id);
+      renderLedger();
+      if (editing) {
+        closeExpenseSheet();
+        setStatus('Someone deleted this expense.');
+      }
+      if (deleting) {
+        pendingDeleteId = null;
+        setStatus('Someone deleted this expense.');
+      }
+      return true;
+    }
+
+    if (editing && frame.current && editingBaseValue && pendingExpenseValue) {
+      groupSocket()?.ack(frame.id);
+      void mergeExpenseConflict(frame);
+      return true;
+    }
+
     if (frame.current) {
       void applyCurrentRecord(frame.current);
       if (editing) editingExpense = { ...frame.current };
-      if (frame.current.deleted) {
-        ledger.delete(frame.id);
-        renderLedger();
-        if (editing) {
-          closeExpenseSheet();
-          setStatus('Someone deleted this expense.');
-        }
-        if (deleting) {
-          pendingDeleteId = null;
-          setStatus('Someone deleted this expense.');
-        }
-        return true;
-      }
     }
 
     if (editing) {
@@ -2600,6 +2628,124 @@ export function init(doc = document, win = window) {
       setStatus('This expense changed elsewhere. Check it and try again.');
     }
     return true;
+  }
+
+  const MERGE_LABELS = {
+    description: 'description',
+    amountPaise: 'amount',
+    paidBy: 'payers',
+    split: 'shares',
+    date: 'date',
+    time: 'time',
+    note: 'note'
+  };
+
+  function fieldList(fields) {
+    const labels = fields.map((field) => MERGE_LABELS[field] ?? field);
+    if (labels.length === 0) return 'changes';
+    if (labels.length === 1) return labels[0];
+    return `${labels.slice(0, -1).join(', ')} and ${labels.at(-1)}`;
+  }
+
+  function mergeMessage(merged, peerName) {
+    const parts = [];
+    if (merged.mine.length > 0) parts.push(`kept your ${fieldList(merged.mine)}`);
+    if (merged.theirs.length > 0) parts.push(`took their ${fieldList(merged.theirs)}`);
+    if (merged.both.length > 0) parts.push(`your ${fieldList(merged.both)} saved over theirs`);
+    return parts.length === 0
+      ? `Merged with ${peerName}'s edit.`
+      : `Merged with ${peerName}'s edit — ${parts.join('; ')}.`;
+  }
+
+  function mergeBrokenMessage(broken, peerName) {
+    const amount = formatPaise(broken.amountPaise ?? 0, groupCurrency);
+    if (broken.reason === 'split') {
+      const total = formatPaise(broken.totalPaise ?? 0, groupCurrency);
+      return `Your amount (${amount}) and ${peerName}'s shares (${total}) no longer add up. Adjust one and save again.`;
+    }
+    if (broken.reason === 'payers') {
+      return `Your amount (${amount}) and ${peerName}'s payers no longer add up. Adjust them and save again.`;
+    }
+    return 'The merged amount is not valid. Check it and save again.';
+  }
+
+  /**
+   * A save lost its base: someone else wrote the record first. Merge the fields this editor
+   * changed with what the server holds, check the money fields still add up, and retry once.
+   * A second conflict stops rather than looping, with the latest version on screen.
+   */
+  async function mergeExpenseConflict(frame) {
+    if (!groupKeyPromise) return;
+    const key = await groupKeyPromise;
+    const groupIdValue = await groupIdPromise;
+    const currentValue = await decryptRecord(key, frame.current, groupIdValue);
+
+    if (!currentValue) {
+      finishExpenseConflict(
+        frame,
+        null,
+        'This expense changed elsewhere. The latest version is shown; check it and try again.'
+      );
+      return;
+    }
+
+    ledger.set(frame.current.id, { ...frame.current, value: currentValue });
+    renderLedger();
+
+    if (mergeRetryId === frame.id) {
+      const mine = fieldList(mergeNoticeFields);
+      finishExpenseConflict(
+        frame,
+        currentValue,
+        `This expense changed again before your merge was saved. Your ${mine} ${
+          mergeNoticeFields.length === 1 ? 'was' : 'were'
+        } not saved; the latest version is shown.`
+      );
+      return;
+    }
+
+    const merged = mergeDiff(editingBaseValue, pendingExpenseValue, currentValue);
+    const peerName = members.get(frame.current.author) || 'Someone';
+
+    if (merged.broken) {
+      openExpenseSheet({ ...frame.current, value: merged.value });
+      expenseFailure(mergeBrokenMessage(merged.broken, peerName), expenseAmount);
+      return;
+    }
+
+    mergeNotice = mergeMessage(merged, peerName);
+    mergeNoticeFields = [...merged.mine, ...merged.both];
+    pendingExpenseValue = merged.value;
+    editingBaseValue = currentValue;
+    editingExpense = { ...frame.current, value: currentValue };
+    mergeRetryId = frame.id;
+
+    try {
+      const blob = await seal(key, merged.value, expenseAad(groupIdValue, frame.id));
+      groupSocket()?.send(
+        { t: 'put', id: frame.id, base: frame.current.rev, blob, deleted: false },
+        { id: frame.id }
+      );
+    } catch {
+      finishExpenseConflict(
+        frame,
+        currentValue,
+        'The merged expense could not be sealed. Check the latest version and try again.'
+      );
+    }
+  }
+
+  function finishExpenseConflict(frame, currentValue, message) {
+    savingExpense = false;
+    pendingExpenseId = null;
+    pendingExpenseEdit = false;
+    mergeRetryId = null;
+    mergeNotice = null;
+    expenseSave.disabled = false;
+    expenseCancel.disabled = false;
+    expenseSave.textContent = 'Save changes';
+    if (currentValue) openExpenseSheet({ ...frame.current, value: currentValue });
+    expenseFailure(message, expenseSave);
   }
 
   /* A short message in the live region, cleared after a few seconds. */
