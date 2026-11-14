@@ -9,7 +9,8 @@
  *
  * A socket is identified by its first frame, not by the room id in its URL. That frame carries the
  * member's secret, and this file keeps only the hash comparison; a pending socket receives one
- * frame and nothing else.
+ * frame and nothing else. A failed join is counted by source in the Registry, and twelve failures
+ * in five minutes answer the next attempt with `rate_limited`.
  *
  * Storage is the key-value API on a SQLite-backed namespace: one key per record, so a later write
  * to a record cannot rewrite its neighbours, and the meta is written once.
@@ -50,6 +51,9 @@ export class Group {
        ever waiting on the connection. */
     this.sockets = new Set();
     this.identities = new Map();
+    /* The source address for the throttle, captured from Cloudflare at the upgrade and never from
+       a field a client sends. One row per socket, because one DO can hold several sources. */
+    this.clientIps = new Map();
   }
 
   /**
@@ -162,16 +166,19 @@ export class Group {
     const [client, server] = Object.values(pair);
     server.accept();
     this.sockets.add(server);
+    this.clientIps.set(server, request.headers.get('cf-connecting-ip') ?? 'local');
 
     server.addEventListener('message', (event) => {
       this.handleMessage(server, event.data).catch(() => this.rejectSocket(server, 'server'));
     });
     server.addEventListener('close', () => {
       this.identities.delete(server);
+      this.clientIps.delete(server);
       this.sockets.delete(server);
     });
     server.addEventListener('error', () => {
       this.identities.delete(server);
+      this.clientIps.delete(server);
       this.sockets.delete(server);
     });
 
@@ -348,7 +355,18 @@ export class Group {
       this.rejectSocket(socket, 'auth');
       return;
     }
+
+    const ip = this.clientIps.get(socket) ?? 'local';
+    /* Fail open on a Registry fault: the throttle is anti-abuse, not the lock on the door, and a
+       Registry outage must not stop every legitimate join. */
+    const gate = await this.callRegistry('/join-blocked', { ip }).catch(() => ({ blocked: false }));
+    if (gate.blocked) {
+      this.refuse(socket, 'rate_limited');
+      return;
+    }
+
     if (!isSealed(frame.nameBlob)) {
+      await this.noteJoinFailure(ip);
       this.rejectSocket(socket, 'blob');
       return;
     }
@@ -356,6 +374,7 @@ export class Group {
     const roster = await this.members();
     const occupied = 1 + [...roster.values()].filter((member) => member.status !== 'removed').length;
     if (occupied >= this.maxMembers()) {
+      await this.noteJoinFailure(ip);
       this.refuse(socket, 'group_full');
       return;
     }
@@ -392,6 +411,21 @@ export class Group {
     this.identities.set(socket, { memberId: frame.id, role: 'pending' });
     socket.send(JSON.stringify({ t: 'waiting', memberId: frame.id }));
     await this.notifyHosts(meta);
+  }
+
+  /** Ask the Registry, the one singleton that can count across groups. */
+  async callRegistry(path, body) {
+    const registry = this.env.REGISTRY.get(this.env.REGISTRY.idFromName('registry'));
+    const response = await registry.fetch(`https://registry${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    return response.json();
+  }
+
+  async noteJoinFailure(ip) {
+    await this.callRegistry('/join-failure', { ip }).catch(() => {});
   }
 
   /** Every roster entry, keyed by member id; the host lives in the meta, not here. */

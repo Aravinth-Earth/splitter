@@ -11,6 +11,8 @@
  */
 
 export const DEFAULT_MAX_GROUPS = 25;
+export const JOIN_LIMIT = 12;
+export const JOIN_WINDOW_MS = 5 * 60 * 1000;
 
 function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
@@ -30,6 +32,9 @@ export class Registry {
     /* No call is delivered until the table exists. */
     ctx.blockConcurrencyWhile(async () => {
       ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS slots (group_id TEXT PRIMARY KEY)');
+      ctx.storage.sql.exec(
+        'CREATE TABLE IF NOT EXISTS join_failures (ip TEXT NOT NULL, at INTEGER NOT NULL)'
+      );
     });
   }
 
@@ -72,6 +77,38 @@ export class Registry {
     this.ctx.storage.sql.exec('DELETE FROM slots WHERE group_id = ?', groupId);
   }
 
+  /** Drop counters outside the window; there is no alarm, so every read and write prunes first. */
+  pruneJoinFailures(now) {
+    this.ctx.storage.sql.exec('DELETE FROM join_failures WHERE at <= ?', now - JOIN_WINDOW_MS);
+  }
+
+  /**
+   * Whether this source has already failed to join twelve times in five minutes.
+   *
+   * The address is Cloudflare's `cf-connecting-ip`, never a field the client sends. Counts are
+   * global rather than per group on purpose: a per-group allowance would multiply by the number of
+   * live groups.
+   *
+   * @returns {{blocked: boolean, count: number}}
+   */
+  joinBlocked(ip, now = Date.now()) {
+    this.pruneJoinFailures(now);
+    const [{ n }] = this.ctx.storage.sql
+      .exec('SELECT COUNT(*) AS n FROM join_failures WHERE ip = ?', ip)
+      .toArray();
+    return { blocked: n >= JOIN_LIMIT, count: n };
+  }
+
+  /** Record one failed join attempt, then prune the window again. */
+  noteJoinFailure(ip, now = Date.now()) {
+    this.pruneJoinFailures(now);
+    this.ctx.storage.sql.exec('INSERT INTO join_failures (ip, at) VALUES (?, ?)', ip, now);
+    const [{ n }] = this.ctx.storage.sql
+      .exec('SELECT COUNT(*) AS n FROM join_failures WHERE ip = ?', ip)
+      .toArray();
+    return { count: n };
+  }
+
   async fetch(request) {
     if (request.method !== 'POST') {
       /* RFC 9110: a 405 has to name the methods it does allow. */
@@ -82,13 +119,23 @@ export class Registry {
        drop a slot for a caller that never asked to release one. Every internal call is written in
        this repo, so the set of paths is closed. */
     const { pathname } = new URL(request.url);
-    if (pathname !== '/reserve' && pathname !== '/release') return json({ error: 'not_found' }, 404);
-
-    const body = await request.json().catch(() => null);
-    if (typeof body !== 'object' || body === null || typeof body.groupId !== 'string') {
-      return json({ error: 'bad_request' }, 400);
+    if (!['/reserve', '/release', '/join-blocked', '/join-failure'].includes(pathname)) {
+      return json({ error: 'not_found' }, 404);
     }
 
+    const body = await request.json().catch(() => null);
+    if (typeof body !== 'object' || body === null) return json({ error: 'bad_request' }, 400);
+
+    if (pathname === '/join-blocked' || pathname === '/join-failure') {
+      if (typeof body.ip !== 'string' || body.ip === '' || body.ip.length > 64) {
+        return json({ error: 'bad_request' }, 400);
+      }
+      return pathname === '/join-blocked'
+        ? json(this.joinBlocked(body.ip))
+        : json(this.noteJoinFailure(body.ip));
+    }
+
+    if (typeof body.groupId !== 'string') return json({ error: 'bad_request' }, 400);
     if (pathname === '/reserve') return json(this.reserve(body.groupId));
 
     this.release(body.groupId);
