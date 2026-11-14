@@ -42,6 +42,7 @@ import {
   setLastGroup
 } from './store.js';
 import { GroupSocket } from './sync.js';
+import { balances, settle } from './balance.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -330,6 +331,10 @@ export function init(doc = document, win = window) {
   const emptyLedger = doc.getElementById('empty-ledger');
   const ledgerPanel = doc.getElementById('ledger');
   const ledgerList = doc.getElementById('ledger-list');
+  const balancesPanel = doc.getElementById('balances');
+  const balanceList = doc.getElementById('balance-list');
+  const transferList = doc.getElementById('transfer-list');
+  const settleNote = doc.getElementById('settle-note');
   const addExpenseButton = doc.getElementById('add-expense');
   const expensePanel = doc.getElementById('expense-panel');
   const expenseForm = doc.getElementById('expense-form');
@@ -735,6 +740,7 @@ export function init(doc = document, win = window) {
     group = null;
     resumeSession = resume;
     ledgerPanel.hidden = true;
+    balancesPanel.hidden = true;
     createPanel.hidden = true;
     groupHeader.hidden = true;
     emptyLedger.hidden = true;
@@ -762,6 +768,7 @@ export function init(doc = document, win = window) {
     group = null;
     resumeSession = null;
     ledgerPanel.hidden = true;
+    balancesPanel.hidden = true;
     joinPanel.hidden = true;
     waitingPanel.hidden = true;
     groupHeader.hidden = true;
@@ -778,6 +785,7 @@ export function init(doc = document, win = window) {
     groupHeader.hidden = true;
     emptyLedger.hidden = true;
     ledgerPanel.hidden = true;
+    balancesPanel.hidden = true;
     waitingPanel.hidden = false;
     waitingCode.textContent = formatCode(code);
     waitingTitle.textContent = 'Waiting for the organizer';
@@ -1423,6 +1431,7 @@ export function init(doc = document, win = window) {
     ledgerList.textContent = '';
     if (groupHeader.hidden) {
       ledgerPanel.hidden = true;
+      balancesPanel.hidden = true;
       return;
     }
     ledgerPanel.hidden = rows.length === 0;
@@ -1488,6 +1497,78 @@ export function init(doc = document, win = window) {
       row.append(left, side);
       ledgerList.append(row);
     }
+
+    renderBalances();
+  }
+
+  function renderBalances() {
+    if (groupHeader.hidden) {
+      balancesPanel.hidden = true;
+      return;
+    }
+
+    const expenses = [...ledger.values()]
+      .filter((record) => !record.pending && !record.deleted)
+      .map((record) => ({
+        id: record.id,
+        amountPaise: record.value.amountPaise,
+        paidBy: record.value.paidBy,
+        split: record.value.split
+      }));
+
+    const referenced = new Set(members.keys());
+    for (const expense of expenses) {
+      referenced.add(expense.paidBy);
+      for (const id of Object.keys(expense.split)) referenced.add(id);
+    }
+    const map = balances([...referenced], expenses);
+    const proposal = settle(map);
+    const names = new Map(members);
+
+    balanceList.textContent = '';
+    const ordered = Object.entries(map).sort(
+      ([left, leftValue], [right, rightValue]) =>
+        (names.get(left) ?? left).localeCompare(names.get(right) ?? right) || rightValue - leftValue
+    );
+    for (const [id, paise] of ordered) {
+      const row = doc.createElement('li');
+      const name = doc.createElement('span');
+      name.textContent = names.get(id) || 'Someone';
+      const value = doc.createElement('span');
+      if (paise > 0) {
+        value.className = 'owed';
+        value.textContent = `is owed ${formatPaise(paise, groupCurrency)}`;
+      } else if (paise < 0) {
+        value.className = 'owes';
+        value.textContent = `owes ${formatPaise(-paise, groupCurrency)}`;
+      } else {
+        value.textContent = 'settled';
+      }
+      row.append(name, value);
+      balanceList.append(row);
+    }
+
+    transferList.textContent = '';
+    for (const transfer of proposal.transfers) {
+      const row = doc.createElement('li');
+      row.textContent = `${names.get(transfer.from) || 'Someone'} pays ${
+        names.get(transfer.to) || 'Someone'
+      } ${formatPaise(transfer.amountPaise, groupCurrency)}`;
+      transferList.append(row);
+    }
+
+    const pending = [...ledger.values()].some((record) => record.pending);
+    if (proposal.transfers.length === 0) {
+      settleNote.textContent = pending
+        ? 'Everyone is settled on the synced expenses; one is still waiting to sync.'
+        : 'Everyone is settled.';
+    } else {
+      settleNote.textContent = proposal.exact
+        ? 'The fewest transfers we can find.'
+        : 'A short settle-up; with more than ten people we do not search for the absolute fewest.';
+    }
+
+    balancesPanel.hidden = false;
   }
 
   function disarmDelete() {
