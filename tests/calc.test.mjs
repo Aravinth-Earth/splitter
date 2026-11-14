@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { allocate, equal, percent, subset } from '../public/calc.js';
+import { allocate, custom, equal, percent, shares, subset } from '../public/calc.js';
 
 const ids = (count, prefix = 'm') => Array.from({ length: count }, (_, at) => `${prefix}${at}`);
 
@@ -104,4 +104,20 @@ test('calc: two hundred generated splits never lose or invent a paisa', () => {
     assert.equal(totalOf(shares), 1_000);
     assert.ok(Math.max(...values) - Math.min(...values) <= 1, 'equal shares differ by at most a paisa');
   }
+});
+
+test('calc: integer shares follow the same remainder rule', () => {
+  assert.deepEqual(shares(99_900, { big: 10, small: 1 }), { big: 90_819, small: 9_081 });
+  assert.deepEqual(shares(100, { a: 0, b: 1 }), { b: 100 }, 'a zero share is left out');
+  assert.throws(() => shares(100, { a: 0 }), /at least one weight above zero/);
+  assert.throws(() => shares(100, { a: -1 }), /non-negative whole number/);
+  assert.throws(() => shares(100, { a: 1.5 }), /non-negative whole number/);
+});
+
+test('calc: exact amounts must add to the expense, and zeros are left out', () => {
+  assert.deepEqual(custom(99_900, { a: 60_000, b: 39_900 }), { a: 60_000, b: 39_900 });
+  assert.deepEqual(custom(100, { a: 100, b: 0 }), { a: 100 }, 'a zero amount is not a zero share');
+  assert.throws(() => custom(99_900, { a: 60_000, b: 39_899 }), /must total the expense/);
+  assert.throws(() => custom(100, { a: 101 }), /must total the expense/);
+  assert.throws(() => custom(100, { a: -1 }), /non-negative whole number/);
 });

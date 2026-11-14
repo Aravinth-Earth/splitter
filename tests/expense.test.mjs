@@ -11,9 +11,11 @@ import test from 'node:test';
 import {
   MAX_PAISE,
   defaultPercentages,
+  defaultShares,
   expenseAad,
   formatPaise,
   parseAmount,
+  parseCustomAmount,
   splitFor,
   validateDate,
   validateDescription,
@@ -103,4 +105,53 @@ test('expense: description, note, date and time are validated before a save', ()
   assert.equal(validateDate('14/11/2026').ok, false);
   assert.deepEqual(validateTime('20:15'), { ok: true, value: '20:15' });
   assert.equal(validateTime('8pm').ok, false);
+});
+
+test('expense: shares and exact amounts feed the same preview and save', () => {
+  assert.deepEqual(defaultShares(['a', 'b']), { a: 1, b: 1 });
+
+  const byShares = splitFor({
+    mode: 'shares',
+    amountPaise: 99_900,
+    shareWeights: { big: 10, small: 1 }
+  });
+  assert.deepEqual(byShares, { ok: true, shares: { big: 90_819, small: 9_081 } });
+
+  const byAmounts = splitFor({
+    mode: 'custom',
+    amountPaise: 99_900,
+    amounts: { a: 60_000, b: 39_900 }
+  });
+  assert.deepEqual(byAmounts, { ok: true, shares: { a: 60_000, b: 39_900 } });
+
+  const short = splitFor({
+    mode: 'custom',
+    amountPaise: 99_900,
+    amounts: { a: 60_000, b: 39_899 }
+  });
+  assert.equal(short.ok, false);
+  assert.match(short.message, /Short by ₹0\.01/);
+
+  const over = splitFor({
+    mode: 'custom',
+    amountPaise: 100,
+    amounts: { a: 101 }
+  });
+  assert.equal(over.ok, false);
+  assert.match(over.message, /Over by ₹0\.01/);
+
+  assert.deepEqual(
+    splitFor({ mode: 'shares', amountPaise: 100, shareWeights: { a: 0, b: 0 } }).ok,
+    false
+  );
+});
+
+test('expense: a custom amount may be blank or zero, and no amount leaves the sheet', () => {
+  assert.deepEqual(parseCustomAmount(''), { ok: true, paise: 0 });
+  assert.deepEqual(parseCustomAmount('0'), { ok: true, paise: 0 });
+  assert.deepEqual(parseCustomAmount('600'), { ok: true, paise: 60_000 });
+  assert.deepEqual(parseCustomAmount('1.5'), { ok: true, paise: 150 });
+  assert.equal(parseCustomAmount('1.234').ok, false);
+  assert.equal(parseCustomAmount('-1').ok, false);
+  assert.equal(parseCustomAmount('1,00,00,000.01').ok, false);
 });
