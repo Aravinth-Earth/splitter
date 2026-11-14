@@ -604,3 +604,54 @@ test('the thirteenth failed join from one source is rate limited', async (t) => 
   assert.deepEqual(await blocked.next(), { t: 'refused', code: 'rate_limited' });
   assert.equal((await blocked.waitClosed()).code, 1008);
 });
+
+test('two sockets with one secret share one member entry', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const secret = randomSecret();
+  const id = await idFromSecret(secret);
+  const nameBlob = await seal(group.key, { name: 'Two Tabs' });
+
+  const first = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => first.close());
+  first.send({ t: 'auth', id, secret, mode: 'join', nameBlob });
+  assert.equal((await first.next()).t, 'waiting');
+  const afterFirst = await host.next();
+  assert.equal(
+    afterFirst.roster.filter((member) => member.id === id).length,
+    1,
+    'one pending entry after the first socket'
+  );
+
+  const second = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => second.close());
+  second.send({ t: 'auth', id, secret, mode: 'resume' });
+  assert.equal((await second.next()).t, 'waiting');
+  await host.silence(300);
+
+  host.send({ t: 'approve', memberId: id });
+  const firstState = await first.next();
+  const secondState = await second.next();
+  assert.equal(firstState.role, 'member');
+  assert.equal(secondState.role, 'member');
+  assert.equal(
+    firstState.roster.filter((member) => member.id === id).length,
+    1,
+    'one roster row for two sockets from one secret'
+  );
+
+  const afterApprove = await host.next();
+  assert.equal(
+    afterApprove.roster.filter((member) => member.id === id).length,
+    1,
+    'the host sees one member, not two'
+  );
+});

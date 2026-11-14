@@ -7,11 +7,11 @@
  * never travel as text — they are sealed under a key derived from the code — so the request carries
  * a hash of the code, a hash of this member's secret, and sealed blobs the server cannot open.
  *
- * The code is kept in memory only. Nothing in this module writes to browser storage on purpose: a
- * reload losing the group is expected until a group can be re-opened from a code, and a code
- * written to a store is a key written to a store. A join keeps its member secret in memory for the
- * same reason, so a refresh while waiting asks again with a new member id; #506 is the task that
- * gives a member a stored seat.
+ * The seat is remembered on this device: the member secret and group id in localStorage, the
+ * code — which is the key — in sessionStorage for this tab only. A reload resumes the last seat
+ * without a form; losing the secret creates a new member entry rather than impersonating the old
+ * one. A removed member's record is dropped with the explanation, and a group that no longer
+ * exists is forgotten.
  *
  * No presence chip and no "Add expense" action is rendered. Live presence and the expense sheet do
  * not exist yet, and a control that cannot do its job is a claim the code cannot keep.
@@ -31,6 +31,16 @@ import {
   randomSecret,
   seal
 } from './crypto.js';
+import {
+  codeFor,
+  forgetCode,
+  forgetSession,
+  lastGroup,
+  saveCode,
+  saveSession,
+  sessionFor,
+  setLastGroup
+} from './store.js';
 
 /** The currencies the page offers. The list is short on purpose: every pair is a rounding rule. */
 export const CURRENCIES = Object.freeze(['INR', 'EUR', 'USD', 'GBP']);
@@ -307,6 +317,22 @@ export function init(doc = document, win = window) {
   const waitingCopy = doc.getElementById('waiting-copy');
   const waitingCode = doc.getElementById('waiting-code');
   const waitingBack = doc.getElementById('waiting-back');
+  const notice = doc.getElementById('session-notice');
+
+  const local = (() => {
+    try {
+      return win.localStorage;
+    } catch {
+      return null;
+    }
+  })();
+  const tab = (() => {
+    try {
+      return win.sessionStorage;
+    } catch {
+      return null;
+    }
+  })();
 
   const createUrl = new URL(CREATE_PATH, win.location.href).toString();
   const pageBase = () => {
@@ -324,6 +350,7 @@ export function init(doc = document, win = window) {
   let joinSocket = null;
   let hostSocket = null;
   let currentMode = 'approval';
+  let resumeSession = null;
 
   form.addEventListener('submit', (event) => {
     /* A form with no action would still navigate, and a navigation is a lost create. */
@@ -410,6 +437,13 @@ export function init(doc = document, win = window) {
 
       hideError();
       showGroup({ code, name: fields.name, displayName: fields.displayName });
+      remember({
+        groupId: payload.groupId,
+        memberId: payload.hostId,
+        secret,
+        displayName: fields.displayName,
+        code
+      });
       openHostSocket({ groupId: payload.groupId, memberId: payload.hostId, secret, code });
     } catch {
       showError(RETRY_MESSAGE);
@@ -468,6 +502,8 @@ export function init(doc = document, win = window) {
   /** Replace the form with the group, in place: no modal, no confirmation, no second screen. */
   function showGroup({ code, name, displayName, role = 'organizer' }) {
     group = { code };
+    resumeSession = null;
+    hideNotice();
 
     groupNameDisplay.textContent = name;
     groupCode.textContent = formatCode(code);
@@ -523,6 +559,33 @@ export function init(doc = document, win = window) {
 
   /* --------------------------------------------------------------- joining */
 
+  function showNotice(message) {
+    notice.textContent = message;
+    notice.hidden = false;
+  }
+
+  function hideNotice() {
+    notice.textContent = '';
+    notice.hidden = true;
+  }
+
+  /** Keep the seat on this device: the secret locally, the code for this tab only. */
+  function remember({ groupId, memberId, secret, displayName, code }) {
+    saveSession(local, {
+      groupId,
+      memberId,
+      memberSecret: secret,
+      displayName
+    });
+    saveCode(tab, groupId, code);
+    setLastGroup(local, groupId);
+  }
+
+  function forget(groupId) {
+    forgetSession(local, groupId);
+    forgetCode(tab, groupId);
+  }
+
   function showJoinError(message) {
     joinError.textContent = message;
     joinError.hidden = false;
@@ -535,13 +598,16 @@ export function init(doc = document, win = window) {
 
   function setJoinBusy(busy) {
     joinButton.disabled = busy;
-    joinButton.textContent = busy ? 'Asking…' : 'Ask to join';
+    const idle = resumeSession ? 'Reopen group' : 'Ask to join';
+    joinButton.textContent = busy ? (resumeSession ? 'Reopening…' : 'Asking…') : idle;
   }
 
   /** The join sheet, with an optional code already in the field. */
-  function showJoin({ code = '', error = '' } = {}) {
+  function showJoin({ code = '', error = '', resume = null } = {}) {
     closeJoinSocket();
+    hideNotice();
     group = null;
+    resumeSession = resume;
     createPanel.hidden = true;
     groupHeader.hidden = true;
     emptyLedger.hidden = true;
@@ -552,16 +618,21 @@ export function init(doc = document, win = window) {
     joinNameInput.removeAttribute('aria-invalid');
     hideJoinError();
     if (code) joinCodeInput.value = formatCode(code);
+    if (resume) joinNameInput.value = resume.displayName;
     if (error) showJoinError(error);
+    else if (resume) showJoinError('Enter the code to reopen your group.');
+    joinButton.textContent = resume ? 'Reopen group' : 'Ask to join';
 
-    if (code) joinNameInput.focus();
+    if (code && !resume) joinNameInput.focus();
     else joinCodeInput.focus();
   }
 
   function showCreate() {
     closeJoinSocket();
     closeHostSocket();
+    hideNotice();
     group = null;
+    resumeSession = null;
     joinPanel.hidden = true;
     waitingPanel.hidden = true;
     groupHeader.hidden = true;
@@ -578,8 +649,10 @@ export function init(doc = document, win = window) {
     emptyLedger.hidden = true;
     waitingPanel.hidden = false;
     waitingCode.textContent = formatCode(code);
+    waitingTitle.textContent = 'Waiting for the organizer';
     waitingCopy.textContent =
       'The organizer has to let you in. Nothing from the group is shown until they do.';
+    waitingBack.hidden = false;
     waitingTitle.focus();
   }
 
@@ -611,6 +684,24 @@ export function init(doc = document, win = window) {
       return;
     }
 
+    if (resumeSession) {
+      const groupId = await groupIdFromCode(code.code);
+      if (groupId === resumeSession.groupId) {
+        saveCode(tab, groupId, code.code);
+        setLastGroup(local, groupId);
+        joinPending = true;
+        setJoinBusy(true);
+        try {
+          await resumeStored(resumeSession, code.code);
+        } finally {
+          joinPending = false;
+          setJoinBusy(false);
+        }
+        return;
+      }
+      resumeSession = null;
+    }
+
     joinPending = true;
     setJoinBusy(true);
 
@@ -632,7 +723,14 @@ export function init(doc = document, win = window) {
       const nameBlob = await seal(key, { name: name.value });
 
       showWaiting(code.code);
-      openJoinSocket({ groupId, memberId, secret, nameBlob, code: code.code });
+      openJoinSocket({
+        groupId,
+        memberId,
+        secret,
+        nameBlob,
+        code: code.code,
+        displayName: name.value
+      });
     } catch {
       showJoinError(RETRY_MESSAGE);
     } finally {
@@ -654,7 +752,177 @@ export function init(doc = document, win = window) {
     }
   }
 
-  function openJoinSocket({ groupId, memberId, secret, nameBlob, code }) {
+  /**
+   * Bring back a stored seat: one socket, the secret as proof, no form.
+   *
+   * The room is probed first because a group that no longer exists would otherwise fail a
+   * handshake with no reason a browser can read. A missing room forgets the seat and says the group
+   * has ended; a refused or removed member forgets it too, with the sentence the server chose.
+   */
+  async function resumeStored(session, code) {
+    hideNotice();
+    closeJoinSocket();
+    closeHostSocket();
+
+    const groupId = await groupIdFromCode(code);
+    if (groupId !== session.groupId) {
+      forget(session.groupId);
+      showJoin({ code, error: 'That code is for a different group.' });
+      return;
+    }
+
+    const reachable = await probeRoom(groupId);
+    if (reachable === 'missing') {
+      forget(groupId);
+      showCreate();
+      showNotice('This group has ended.');
+      return;
+    }
+    if (reachable === 'offline') {
+      showJoin({ code, error: OFFLINE_MESSAGE, resume: session });
+      return;
+    }
+
+    showWaiting(code);
+    waitingTitle.textContent = 'Reopening your group';
+    waitingCopy.textContent = 'Bringing back your seat…';
+    waitingBack.hidden = true;
+
+    const url = new URL('api/ws', win.location.href);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.searchParams.set('room', groupId);
+
+    let socket;
+    try {
+      socket = new win.WebSocket(url.toString());
+    } catch {
+      showJoin({ code, error: RETRY_MESSAGE, resume: session });
+      return;
+    }
+
+    joinSocket = socket;
+    const groupKey = deriveGroupKey(code);
+    let settled = false;
+    let shown = false;
+
+    socket.addEventListener('open', () => {
+      socket.send(
+        JSON.stringify({
+          t: 'auth',
+          id: session.memberId,
+          secret: session.memberSecret,
+          mode: 'resume'
+        })
+      );
+    });
+
+    socket.addEventListener('message', async (event) => {
+      let frame;
+      try {
+        frame = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (frame.t === 'waiting') {
+        settled = true;
+        showWaiting(code);
+        remember({
+          groupId,
+          memberId: session.memberId,
+          secret: session.memberSecret,
+          displayName: session.displayName,
+          code
+        });
+        return;
+      }
+
+      if (frame.t === 'state') {
+        settled = true;
+        const key = await groupKey;
+        let name = 'Your group';
+        try {
+          const opened = await open(key, frame.nameBlob);
+          if (typeof opened?.name === 'string') name = opened.name;
+        } catch {
+          /* a neutral label beats an unreadable blob */
+        }
+
+        if (frame.role === 'host') {
+          if (!shown) {
+            joinSocket = null;
+            hostSocket = socket;
+            showGroup({
+              code,
+              name,
+              displayName: session.displayName,
+              role: 'organizer'
+            });
+            shown = true;
+          }
+          await renderRoster(frame, Promise.resolve(key));
+        } else {
+          if (!shown) {
+            showGroup({
+              code,
+              name,
+              displayName: session.displayName,
+              role: 'member'
+            });
+            shown = true;
+          }
+          applyMode(frame.joinMode, 'member');
+        }
+
+        remember({
+          groupId,
+          memberId: session.memberId,
+          secret: session.memberSecret,
+          displayName: session.displayName,
+          code
+        });
+        return;
+      }
+
+      if (frame.t === 'removed') {
+        settled = true;
+        forget(groupId);
+        closeJoinSocket();
+        showJoin({ code, error: 'Removed from this group.' });
+        return;
+      }
+
+      if (frame.t === 'refused') {
+        settled = true;
+        closeJoinSocket();
+        if (frame.code === 'rate_limited') {
+          showJoin({ code, error: refusalMessage(frame.code), resume: session });
+        } else {
+          forget(groupId);
+          showJoin({ code, error: refusalMessage(frame.code) });
+        }
+      }
+    });
+
+    socket.addEventListener('close', () => {
+      if (hostSocket === socket) {
+        hostSocket = null;
+        rosterEmpty.textContent = 'Connection lost. Reload to continue.';
+        rosterEmpty.hidden = false;
+        return;
+      }
+      if (joinSocket !== socket) return;
+      joinSocket = null;
+      if (settled) return;
+      showJoin({ code, error: 'The group could not be reached. Try again.', resume: session });
+    });
+
+    socket.addEventListener('error', () => {
+      /* a close event follows */
+    });
+  }
+
+  function openJoinSocket({ groupId, memberId, secret, nameBlob, code, displayName }) {
     closeJoinSocket();
 
     const url = new URL('api/ws', win.location.href);
@@ -686,6 +954,7 @@ export function init(doc = document, win = window) {
 
       if (frame.t === 'waiting') {
         settled = true;
+        remember({ groupId, memberId, secret, displayName, code });
         waitingCopy.textContent =
           'The organizer has to let you in. Nothing from the group is shown until they do.';
         return;
@@ -709,8 +978,9 @@ export function init(doc = document, win = window) {
         } catch {
           /* the name stays a neutral label rather than an unreadable blob */
         }
-        showGroup({ code, name, displayName: joinNameInput.value.trim(), role: 'member' });
+        showGroup({ code, name, displayName: displayName || joinNameInput.value.trim(), role: 'member' });
         applyMode(frame.joinMode, 'member');
+        remember({ groupId, memberId, secret, displayName, code });
         if (frame.openAdmit) {
           setStatus("You're in — this group lets anyone with the code join.");
         }
@@ -719,6 +989,7 @@ export function init(doc = document, win = window) {
 
       if (frame.t === 'removed') {
         settled = true;
+        forget(groupId);
         closeJoinSocket();
         showJoin({ code, error: 'Removed from this group.' });
         return;
@@ -726,6 +997,7 @@ export function init(doc = document, win = window) {
 
       if (frame.t === 'refused') {
         settled = true;
+        forget(groupId);
         closeJoinSocket();
         showJoin({ code, error: refusalMessage(frame.code) });
       }
@@ -1004,23 +1276,49 @@ export function init(doc = document, win = window) {
     await copy(link, 'Invite link copied — it carries the code.');
   }
 
-  /* An invite link opens the join sheet with the code already there; the fragment never reaches
-     the server. A malformed one shows the sheet and the reason rather than doing nothing. */
-  const invitation = win.location.hash || win.location.search || '';
-  if (invitation) {
+  /* An invite link opens the join sheet with the code already there; a stored seat is resumed
+     before any form is shown. The fragment never reaches the server. */
+  async function bootSession() {
+    const invitation = win.location.hash || win.location.search || '';
     const invited = codeFromInput(invitation);
+
     if (invited.ok) {
+      const groupId = await groupIdFromCode(invited.code);
+      const stored = sessionFor(local, groupId);
+      if (stored) {
+        saveCode(tab, groupId, invited.code);
+        setLastGroup(local, groupId);
+        await resumeStored(stored, invited.code);
+        return;
+      }
       showJoin({ code: invited.code });
-    } else if (/[#?](?:code|c)=/i.test(invitation)) {
+      return;
+    }
+
+    if (invitation && /[#?](?:code|c)=/i.test(invitation)) {
       showJoin();
       joinCodeInput.value = invitation;
       showJoinError(invited.message);
+      return;
     }
+
+    const groupId = lastGroup(local);
+    const stored = groupId ? sessionFor(local, groupId) : null;
+    if (!stored) return;
+
+    const code = codeFor(tab, groupId);
+    if (code) {
+      await resumeStored(stored, code);
+      return;
+    }
+    showJoin({ resume: stored });
   }
 
-  /* A single marker for a page-level check: the form exists in the HTML before this module runs,
-     so a test that waits for the form can still click before the handlers are attached. */
   doc.documentElement.dataset.splitter = 'ready';
+  void bootSession().catch(() => {
+    showCreate();
+    showNotice('The saved seat could not be read. Enter the code to continue.');
+  });
 }
 
 /* Under `node --test` there is no document, so importing this module for its pure functions wires

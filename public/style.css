@@ -185,6 +185,16 @@ button {
   font-size: 0.95rem;
 }
 
+.notice {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 0.5rem;
+  background: var(--bg);
+  font-size: 0.95rem;
+}
+
 /* ------------------------------------------------------------------ group */
 
 .group-head h2 {
