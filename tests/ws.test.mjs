@@ -564,3 +564,43 @@ test('a member cannot change the join mode', async (t) => {
   assert.equal((await joiner.waitClosed()).code, 1008);
   await host.silence(400);
 });
+
+test('the thirteenth failed join from one source is rate limited', async (t) => {
+  /* A one-seat group refuses every join as full; each refusal is one failed attempt, and the
+     thirteenth from this source is answered before the group is asked again. */
+  const worker = await startWorker({ vars: { MAX_MEMBERS: '1' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const secret = randomSecret();
+    const id = await idFromSecret(secret);
+    const socket = await connect(socketUrl(worker.baseUrl, group.groupId));
+    t.after(() => socket.close());
+    socket.send({
+      t: 'auth',
+      id,
+      secret,
+      mode: 'join',
+      nameBlob: await seal(group.key, { name: `Full ${attempt}` })
+    });
+    assert.deepEqual(await socket.next(), { t: 'refused', code: 'group_full' }, `attempt ${attempt + 1}`);
+    assert.equal((await socket.waitClosed()).code, 1008);
+  }
+
+  const secret = randomSecret();
+  const id = await idFromSecret(secret);
+  const blocked = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => blocked.close());
+  blocked.send({
+    t: 'auth',
+    id,
+    secret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Too Many' })
+  });
+
+  assert.deepEqual(await blocked.next(), { t: 'refused', code: 'rate_limited' });
+  assert.equal((await blocked.waitClosed()).code, 1008);
+});

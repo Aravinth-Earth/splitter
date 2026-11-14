@@ -12,15 +12,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { DEFAULT_MAX_GROUPS, Registry } from '../src/registry.js';
+import { DEFAULT_MAX_GROUPS, JOIN_LIMIT, JOIN_WINDOW_MS, Registry } from '../src/registry.js';
 
 /** A Registry ctx backed by one Map, plus the three statements reserve and release use. */
 function fakeContext() {
   const rows = new Map();
+  const joinRows = [];
 
   function exec(statement, ...params) {
     const text = statement.replace(/\s+/g, ' ').trim();
     if (text.startsWith('CREATE TABLE IF NOT EXISTS slots')) return { toArray: () => [] };
+    if (text.startsWith('CREATE TABLE IF NOT EXISTS join_failures')) return { toArray: () => [] };
     if (text.startsWith('SELECT 1 FROM slots')) return { toArray: () => (rows.has(params[0]) ? [{}] : []) };
     if (text.startsWith('SELECT COUNT(*) AS held FROM slots')) return { toArray: () => [{ held: rows.size }] };
     if (text.startsWith('INSERT INTO slots')) {
@@ -31,11 +33,25 @@ function fakeContext() {
       rows.delete(params[0]);
       return { toArray: () => [] };
     }
+    if (text.startsWith('DELETE FROM join_failures')) {
+      for (let at = joinRows.length - 1; at >= 0; at -= 1) {
+        if (joinRows[at].at <= params[0]) joinRows.splice(at, 1);
+      }
+      return { toArray: () => [] };
+    }
+    if (text.startsWith('INSERT INTO join_failures')) {
+      joinRows.push({ ip: params[0], at: params[1] });
+      return { toArray: () => [] };
+    }
+    if (text.startsWith('SELECT COUNT(*) AS n FROM join_failures')) {
+      return { toArray: () => [{ n: joinRows.filter((row) => row.ip === params[0]).length }] };
+    }
     throw new Error(`fake sql: ${text}`);
   }
 
   return {
     rows,
+    joinRows,
     ctx: { storage: { sql: { exec } }, blockConcurrencyWhile: (fn) => fn() }
   };
 }
@@ -137,4 +153,32 @@ test('registry: a release without a group id is a bad request, not a no-op succe
   assert.equal(response.status, 400, 'a release that names nothing must not answer ok');
   assert.deepEqual(await response.json(), { error: 'bad_request' });
   assert.equal(rows.size, 1, 'the held slot must survive a malformed release');
+});
+
+
+test('registry: twelve failed joins from one address block it, and the window clears', () => {
+  const { ctx, joinRows } = fakeContext();
+  const registry = new Registry(ctx, {});
+  const now = 1_000_000;
+
+  for (let count = 0; count < JOIN_LIMIT; count += 1) {
+    assert.equal(registry.noteJoinFailure('203.0.113.9', now).count, count + 1);
+  }
+
+  assert.deepEqual(registry.joinBlocked('203.0.113.9', now), {
+    blocked: true,
+    count: JOIN_LIMIT
+  });
+  assert.deepEqual(
+    registry.joinBlocked('198.51.100.4', now),
+    { blocked: false, count: 0 },
+    'another source is not affected'
+  );
+
+  assert.equal(
+    registry.joinBlocked('203.0.113.9', now + JOIN_WINDOW_MS).blocked,
+    false,
+    'the window expires'
+  );
+  assert.equal(joinRows.length, 0, 'the expired rows are pruned');
 });
