@@ -273,3 +273,70 @@ test('balance: attribution sums to the leg for two hundred random ledgers', () =
     assert.ok(allZero(apply(map, proposal)));
   }
 });
+
+test('balance: more than one payer is credited its own amount', () => {
+  const members = ['a', 'b'];
+  const result = balances(members, [
+    {
+      id: 'e1',
+      amountPaise: 1_000,
+      paidBy: [
+        { memberId: 'a', amountPaise: 600 },
+        { memberId: 'b', amountPaise: 400 }
+      ],
+      split: { a: 500, b: 500 }
+    }
+  ]);
+  assert.deepEqual(result, { a: 100, b: -100 });
+
+  const contributions = ledgerContributions(members, [
+    {
+      id: 'e1',
+      amountPaise: 1_000,
+      paidBy: [
+        { memberId: 'a', amountPaise: 600 },
+        { memberId: 'b', amountPaise: 400 }
+      ],
+      split: { a: 500, b: 500 }
+    }
+  ]);
+  assert.deepEqual(contributions.b, [{ recordId: 'e1', kind: 'expense', amountPaise: 500 }]);
+});
+
+test('balance: payer rows must be positive, distinct and total the expense', () => {
+  const members = ['a', 'b'];
+  const base = {
+    id: 'e1',
+    amountPaise: 1_000,
+    split: { a: 500, b: 500 }
+  };
+
+  assert.deepEqual(
+    balances(members, [
+      { ...base, paidBy: [{ memberId: 'a', amountPaise: 500 }, { memberId: 'b', amountPaise: 500 }] }
+    ]),
+    { a: 0, b: 0 }
+  );
+
+  assert.throws(
+    () => balances(members, [{ ...base, paidBy: [{ memberId: 'a', amountPaise: 600 }] }]),
+    /payers must total|total the expense/
+  );
+  assert.throws(
+    () =>
+      balances(members, [
+        {
+          ...base,
+          paidBy: [{ memberId: 'a', amountPaise: 500 }, { memberId: 'a', amountPaise: 500 }]
+        }
+      ]),
+    /appears twice/
+  );
+  assert.throws(
+    () =>
+      balances(members, [
+        { ...base, paidBy: [{ memberId: 'a', amountPaise: 0 }, { memberId: 'b', amountPaise: 1_000 }] }
+      ]),
+    /positive whole number/
+  );
+});
