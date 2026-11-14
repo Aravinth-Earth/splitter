@@ -455,11 +455,16 @@ export class Group {
       this.sendFrame(socket, { t: 'refused', code: 'bad_request', id: frame.id });
       return;
     }
-    if (!isSealed(frame.blob)) {
+    if (typeof frame.deleted !== 'boolean') {
       this.sendFrame(socket, { t: 'refused', code: 'bad_request', id: frame.id });
       return;
     }
-    if (typeof frame.deleted !== 'boolean') {
+    if (frame.deleted) {
+      if (frame.blob !== undefined && frame.blob !== null && !isSealed(frame.blob)) {
+        this.sendFrame(socket, { t: 'refused', code: 'bad_request', id: frame.id });
+        return;
+      }
+    } else if (!isSealed(frame.blob)) {
       this.sendFrame(socket, { t: 'refused', code: 'bad_request', id: frame.id });
       return;
     }
@@ -488,9 +493,10 @@ export class Group {
     const record = {
       id: frame.id,
       rev: rev + 1,
-      blob: frame.blob,
+      blob: frame.deleted ? null : frame.blob,
       deleted: frame.deleted,
       author: identity.memberId,
+      creator: existing?.creator ?? existing?.author ?? identity.memberId,
       at: Date.now()
     };
 

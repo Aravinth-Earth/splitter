@@ -404,8 +404,15 @@ export function init(doc = document, win = window) {
   let expenseSheetOpen = false;
   let expenseDraftId = null;
   let pendingExpenseId = null;
+  let pendingExpenseEdit = false;
+  let pendingDeleteId = null;
+  let editingExpense = null;
+  let customSeed = null;
   let savingExpense = false;
   let previewShares = null;
+  let armedDeleteId = null;
+  let armedDeleteButton = null;
+  let deleteTimer = null;
 
   form.addEventListener('submit', (event) => {
     /* A form with no action would still navigate, and a navigation is a lost create. */
@@ -443,7 +450,7 @@ export function init(doc = document, win = window) {
     hostSocket.send(JSON.stringify({ t: 'mode', mode: next }));
   });
 
-  addExpenseButton.addEventListener('click', openExpenseSheet);
+  addExpenseButton.addEventListener('click', () => openExpenseSheet());
   expenseForm.addEventListener('submit', (event) => {
     void saveExpense(event);
   });
@@ -1456,6 +1463,7 @@ export function init(doc = document, win = window) {
       (left, right) => (left.at ?? 0) - (right.at ?? 0) || (left.id < right.id ? -1 : 1)
     );
 
+    disarmDelete();
     ledgerList.textContent = '';
     if (groupHeader.hidden) {
       ledgerPanel.hidden = true;
@@ -1475,16 +1483,75 @@ export function init(doc = document, win = window) {
       const meta = doc.createElement('p');
       meta.className = 'expense-meta';
       const payer = members.get(value.paidBy) || 'Someone';
-      meta.textContent = `Paid by ${payer} · ${value.date} ${value.time}`;
+      const creator = record.creator ?? record.author;
+      const edited = creator && creator !== record.author;
+      const editor = members.get(record.author) || 'Someone';
+      meta.textContent =
+        `Paid by ${payer} · ${value.date} ${value.time}` + (edited ? ` · edited by ${editor}` : '');
       left.append(title, meta);
+
+      const side = doc.createElement('div');
+      side.className = 'expense-side';
 
       const amount = doc.createElement('span');
       amount.className = 'expense-amount';
       amount.textContent = formatPaise(value.amountPaise, groupCurrency);
 
-      row.append(left, amount);
+      const actions = doc.createElement('div');
+      actions.className = 'expense-actions';
+
+      const edit = doc.createElement('button');
+      edit.type = 'button';
+      edit.className = 'secondary';
+      edit.textContent = 'Edit';
+      edit.addEventListener('click', () => openExpenseSheet(record));
+
+      const remove = doc.createElement('button');
+      remove.type = 'button';
+      remove.className = 'secondary';
+      remove.textContent = 'Delete';
+      remove.addEventListener('click', () => armDelete(record, remove));
+
+      actions.append(edit, remove);
+      side.append(amount, actions);
+      row.append(left, side);
       ledgerList.append(row);
     }
+  }
+
+  function disarmDelete() {
+    if (deleteTimer !== null) win.clearTimeout(deleteTimer);
+    deleteTimer = null;
+    armedDeleteId = null;
+    if (armedDeleteButton) {
+      armedDeleteButton.textContent = 'Delete';
+      armedDeleteButton.classList.remove('is-armed');
+    }
+    armedDeleteButton = null;
+  }
+
+  function armDelete(record, button) {
+    if (armedDeleteId !== record.id) {
+      disarmDelete();
+      armedDeleteId = record.id;
+      armedDeleteButton = button;
+      button.textContent = 'Delete? It leaves every screen';
+      button.classList.add('is-armed');
+      deleteTimer = win.setTimeout(disarmDelete, 4_000);
+      return;
+    }
+
+    disarmDelete();
+    const socket = activeSocket();
+    if (!socket) {
+      setStatus('The group is not connected. Try again.');
+      return;
+    }
+    pendingDeleteId = record.id;
+    button.disabled = true;
+    socket.send(
+      JSON.stringify({ t: 'put', id: record.id, base: record.rev, blob: null, deleted: true })
+    );
   }
 
   function renderPayerOptions() {
@@ -1570,6 +1637,8 @@ export function init(doc = document, win = window) {
         input.type = 'text';
         input.inputMode = 'decimal';
         input.placeholder = '0.00';
+        const seed = customSeed?.get(id);
+        if (Number.isSafeInteger(seed)) input.value = (seed / 100).toFixed(2);
         input.dataset.memberId = id;
         input.dataset.amount = '1';
         label.append(text, input);
@@ -1655,28 +1724,37 @@ export function init(doc = document, win = window) {
     } ${Object.keys(split.shares).length === 1 ? 'person' : 'people'}.`;
   }
 
-  function openExpenseSheet() {
-    if (!group) return;
+  function openExpenseSheet(record = null) {
+    if (!group || record?.deleted) return;
+
     expenseSheetOpen = true;
-    expenseDraftId = randomSecret();
+    editingExpense = record;
+    customSeed = record ? new Map(Object.entries(record.value.split ?? {})) : null;
+    expenseDraftId = record ? record.id : randomSecret();
     pendingExpenseId = null;
+    pendingExpenseEdit = false;
+    pendingDeleteId = null;
     savingExpense = false;
     expenseError.hidden = true;
     expenseError.textContent = '';
-    expenseDescription.value = '';
-    expenseAmount.value = '';
-    expenseNote.value = '';
-    expenseDate.value = todayDate();
-    expenseTime.value = nowTime();
+
+    const value = record?.value ?? null;
+    expenseDescription.value = value?.description ?? '';
+    expenseAmount.value = value ? (value.amountPaise / 100).toFixed(2) : '';
+    expenseNote.value = value?.note ?? '';
+    expenseDate.value = value?.date ?? todayDate();
+    expenseTime.value = value?.time ?? nowTime();
     expenseSave.disabled = false;
     expenseCancel.disabled = false;
-    expenseSave.textContent = 'Save expense';
+    expenseSave.textContent = record ? 'Save changes' : 'Save expense';
     expenseCurrency.textContent = groupCurrency;
+
     splitModes.forEach((radio) => {
-      radio.checked = radio.value === 'equal';
+      radio.checked = radio.value === (record ? 'custom' : 'equal');
     });
 
     renderPayerOptions();
+    if (value?.paidBy && members.has(value.paidBy)) expensePayer.value = value.paidBy;
     renderSplit();
     expensePanel.hidden = false;
     expenseDescription.focus();
@@ -1688,7 +1766,10 @@ export function init(doc = document, win = window) {
     expenseError.hidden = true;
     expenseError.textContent = '';
     pendingExpenseId = null;
+    pendingExpenseEdit = false;
     savingExpense = false;
+    editingExpense = null;
+    customSeed = null;
     expenseSave.disabled = false;
     expenseCancel.disabled = false;
     expenseSave.textContent = 'Save expense';
@@ -1734,6 +1815,7 @@ export function init(doc = document, win = window) {
     if (!socket) return expenseFailure('The group is not connected. Try again.', expenseSave);
 
     savingExpense = true;
+    pendingExpenseEdit = Boolean(editingExpense);
     expenseSave.disabled = true;
     expenseCancel.disabled = true;
     expenseSave.textContent = 'Saving…';
@@ -1753,22 +1835,56 @@ export function init(doc = document, win = window) {
       const blob = await seal(key, value, expenseAad(groupIdValue, expenseDraftId));
       pendingExpenseId = expenseDraftId;
       socket.send(
-        JSON.stringify({ t: 'put', id: expenseDraftId, base: 0, blob, deleted: false })
+        JSON.stringify({
+          t: 'put',
+          id: expenseDraftId,
+          base: editingExpense ? editingExpense.rev : 0,
+          blob,
+          deleted: false
+        })
       );
     } catch {
       savingExpense = false;
       expenseSave.disabled = false;
       expenseCancel.disabled = false;
-      expenseSave.textContent = 'Save expense';
+      expenseSave.textContent = editingExpense ? 'Save changes' : 'Save expense';
       expenseFailure('The expense could not be sealed. Try again.', expenseSave);
     }
+  }
+
+  async function applyCurrentRecord(current) {
+    if (!current || !groupKeyPromise) return;
+    const key = await groupKeyPromise;
+    const groupIdValue = await groupIdPromise;
+    if (current.deleted) {
+      ledger.delete(current.id);
+      renderLedger();
+      return;
+    }
+    const value = await decryptRecord(key, current, groupIdValue);
+    if (!value) return;
+    ledger.set(current.id, { ...current, value });
+    renderLedger();
   }
 
   async function handleRecordFrame(frame) {
     if (!groupKeyPromise) return;
     const key = await groupKeyPromise;
     const groupIdValue = await groupIdPromise;
-    if (frame.deleted) return;
+
+    if (frame.deleted) {
+      ledger.delete(frame.id);
+      renderLedger();
+      if (frame.id === pendingDeleteId) {
+        pendingDeleteId = null;
+        setStatus('Expense deleted.');
+      }
+      if (editingExpense?.id === frame.id) {
+        closeExpenseSheet();
+        setStatus('Someone deleted this expense.');
+      }
+      return;
+    }
 
     const value = await decryptRecord(key, frame, groupIdValue);
     if (!value) return;
@@ -1776,40 +1892,91 @@ export function init(doc = document, win = window) {
     renderLedger();
 
     if (frame.id === pendingExpenseId) {
+      const wasEditing = pendingExpenseEdit;
       pendingExpenseId = null;
+      pendingExpenseEdit = false;
       savingExpense = false;
       closeExpenseSheet();
-      setStatus('Expense added.');
+      setStatus(wasEditing ? 'Expense saved.' : 'Expense added.');
     }
   }
 
   function handleExpenseRefusal(frame) {
+    if (frame.id === pendingDeleteId) {
+      pendingDeleteId = null;
+      if (frame.code === 'deleted') {
+        ledger.delete(frame.id);
+        renderLedger();
+        setStatus('Someone deleted this expense.');
+      } else {
+        setStatus('The expense could not be deleted. Try again.');
+      }
+      return true;
+    }
+
     if (!savingExpense || frame.id !== pendingExpenseId) return false;
     savingExpense = false;
     pendingExpenseId = null;
+    pendingExpenseEdit = false;
     expenseSave.disabled = false;
     expenseCancel.disabled = false;
-    expenseSave.textContent = 'Save expense';
+    expenseSave.textContent = editingExpense ? 'Save changes' : 'Save expense';
     const message =
       frame.code === 'too_large'
         ? 'That expense is too large to save.'
         : frame.code === 'deleted'
-          ? 'This expense was deleted.'
+          ? 'Someone deleted this expense.'
           : frame.code === 'unapproved'
             ? 'You are not approved to add expenses.'
             : 'The expense could not be saved. Try again.';
+    if (frame.code === 'deleted') {
+      ledger.delete(frame.id);
+      renderLedger();
+      if (editingExpense?.id === frame.id) closeExpenseSheet();
+    }
     expenseFailure(message, expenseSave);
     return true;
   }
 
   function handleExpenseConflict(frame) {
-    if (!savingExpense || frame.id !== pendingExpenseId) return false;
-    savingExpense = false;
-    pendingExpenseId = null;
-    expenseSave.disabled = false;
-    expenseCancel.disabled = false;
-    expenseSave.textContent = 'Save expense';
-    expenseFailure('This expense changed elsewhere. Try again.', expenseSave);
+    const editing = frame.id === pendingExpenseId;
+    const deleting = frame.id === pendingDeleteId;
+    if (!editing && !deleting) return false;
+
+    if (frame.current) {
+      void applyCurrentRecord(frame.current);
+      if (editing) editingExpense = { ...frame.current };
+      if (frame.current.deleted) {
+        ledger.delete(frame.id);
+        renderLedger();
+        if (editing) {
+          closeExpenseSheet();
+          setStatus('Someone deleted this expense.');
+        }
+        if (deleting) {
+          pendingDeleteId = null;
+          setStatus('Someone deleted this expense.');
+        }
+        return true;
+      }
+    }
+
+    if (editing) {
+      savingExpense = false;
+      pendingExpenseId = null;
+      pendingExpenseEdit = false;
+      expenseSave.disabled = false;
+      expenseCancel.disabled = false;
+      expenseSave.textContent = editingExpense ? 'Save changes' : 'Save expense';
+      expenseFailure(
+        'This expense changed elsewhere. The latest version is shown; check it and try again.',
+        expenseSave
+      );
+    }
+    if (deleting) {
+      pendingDeleteId = null;
+      setStatus('This expense changed elsewhere. Check it and try again.');
+    }
     return true;
   }
 

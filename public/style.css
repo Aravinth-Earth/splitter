@@ -371,6 +371,28 @@ button {
   white-space: nowrap;
 }
 
+.expense-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+}
+
+.expense-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.expense-actions button {
+  padding: 0.2rem 0.45rem;
+  font-size: 0.85rem;
+}
+
+.expense-actions button.is-armed {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
 /* ------------------------------------------------------------ expense sheet */
 
 .sheet {
