@@ -329,6 +329,128 @@ button {
 
 .steps li { margin: 0.5rem 0; }
 
+/* ------------------------------------------------------------- the ledger */
+
+.group-actions {
+  margin: 0.85rem 0 0;
+}
+
+.ledger-list {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.expense-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--bg);
+}
+
+.expense-row h3 {
+  margin: 0 0 0.15rem;
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.expense-meta {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.expense-amount {
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------ expense sheet */
+
+.sheet {
+  border-color: var(--accent);
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.field-row .field {
+  flex: 1 1 9rem;
+}
+
+.split {
+  margin: 1rem 0 0;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+.split legend {
+  padding: 0 0.3rem;
+  font-weight: 600;
+}
+
+.split-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.split-tabs label {
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  font-size: 0.92rem;
+}
+
+.split-inputs {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.split-inputs label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.split-inputs input[type="number"] {
+  width: 5.5rem;
+}
+
+.split-preview {
+  margin: 0.4rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.split-preview li {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.2rem 0;
+  border-bottom: 1px dashed var(--border);
+}
+
+.sheet-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
 /* --------------------------------------------------------------- page ends */
 
 .status {

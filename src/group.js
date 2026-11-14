@@ -442,35 +442,36 @@ export class Group {
    */
   async writeRecord(socket, frame) {
     const identity = this.identities.get(socket);
+    const refusedId = typeof frame.id === 'string' ? frame.id : null;
     if (!identity || (identity.role !== 'host' && identity.role !== 'member')) {
-      this.sendRefusal(socket, 'unapproved');
+      this.sendFrame(socket, { t: 'refused', code: 'unapproved', id: refusedId });
       return;
     }
     if (typeof frame.id !== 'string' || !isId(frame.id)) {
-      this.sendRefusal(socket, 'bad_request');
+      this.sendFrame(socket, { t: 'refused', code: 'bad_request', id: refusedId });
       return;
     }
     if (!Number.isSafeInteger(frame.base) || frame.base < 0) {
-      this.sendRefusal(socket, 'bad_request');
+      this.sendFrame(socket, { t: 'refused', code: 'bad_request', id: frame.id });
       return;
     }
     if (!isSealed(frame.blob)) {
-      this.sendRefusal(socket, 'bad_request');
+      this.sendFrame(socket, { t: 'refused', code: 'bad_request', id: frame.id });
       return;
     }
     if (typeof frame.deleted !== 'boolean') {
-      this.sendRefusal(socket, 'bad_request');
+      this.sendFrame(socket, { t: 'refused', code: 'bad_request', id: frame.id });
       return;
     }
     if (JSON.stringify(frame).length > MAX_RECORD_BYTES) {
-      this.sendRefusal(socket, 'too_large');
+      this.sendFrame(socket, { t: 'refused', code: 'too_large', id: frame.id });
       return;
     }
 
     const key = recordKey(frame.id);
     const existing = await this.ctx.storage.get(key);
     if (existing?.deleted) {
-      this.sendRefusal(socket, 'deleted');
+      this.sendFrame(socket, { t: 'refused', code: 'deleted', id: frame.id });
       return;
     }
 
