@@ -214,6 +214,11 @@ button {
 
 .mode-row { margin: 0.25rem 0 0; }
 
+.connection {
+  margin: 0.15rem 0 0;
+  color: var(--accent);
+}
+
 .code-line { margin: 1rem 0 0.5rem; }
 
 .code-line code {
@@ -391,6 +396,14 @@ button {
 .expense-actions button.is-armed {
   border-color: var(--danger);
   color: var(--danger);
+}
+
+.expense-row.pending {
+  border-style: dashed;
+}
+
+.expense-row.pending .expense-meta {
+  color: var(--accent);
 }
 
 /* ------------------------------------------------------------ expense sheet */
