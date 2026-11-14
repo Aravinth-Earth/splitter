@@ -41,6 +41,7 @@ import {
   sessionFor,
   setLastGroup
 } from './store.js';
+import { GroupSocket } from './sync.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -318,6 +319,7 @@ export function init(doc = document, win = window) {
   const whoLine = doc.getElementById('who-line');
   const roleLine = doc.getElementById('role-line');
   const joinModeLine = doc.getElementById('join-mode');
+  const connection = doc.getElementById('connection');
   const toggleModeButton = doc.getElementById('toggle-mode');
   const roster = doc.getElementById('roster');
   const rosterPending = doc.getElementById('roster-pending');
@@ -444,10 +446,10 @@ export function init(doc = document, win = window) {
     void submitJoin();
   });
   toggleModeButton.addEventListener('click', () => {
-    if (!hostSocket || hostSocket.readyState !== 1) return;
+    if (!hostSocket?.isOpen) return;
     const next = currentMode === 'open' ? 'approval' : 'open';
     toggleModeButton.disabled = true;
-    hostSocket.send(JSON.stringify({ t: 'mode', mode: next }));
+    hostSocket.send({ t: 'mode', mode: next });
   });
 
   addExpenseButton.addEventListener('click', () => openExpenseSheet());
@@ -575,6 +577,32 @@ export function init(doc = document, win = window) {
           : 'Open joining to anyone with the code';
     } else {
       toggleModeButton.hidden = true;
+    }
+  }
+
+  /** The connection is a state a person can see, not a toast that disappears mid-drop. */
+  function setConnection(status) {
+    if (!connection) return;
+    if (status === 'open' || status === 'closed') {
+      connection.hidden = true;
+      connection.textContent = '';
+    } else {
+      connection.hidden = false;
+      connection.textContent =
+        status === 'offline'
+          ? 'Offline — changes will sync when the connection returns.'
+          : status === 'reconnecting'
+            ? 'Reconnecting…'
+            : 'Connecting…';
+    }
+
+    if (status !== 'open') toggleModeButton.disabled = true;
+    if (!waitingPanel.hidden) {
+      if (status === 'offline') {
+        waitingCopy.textContent = 'Offline — this will continue when the connection returns.';
+      } else if (status === 'reconnecting' || status === 'connecting') {
+        waitingCopy.textContent = 'Reconnecting…';
+      }
     }
   }
 
@@ -867,16 +895,16 @@ export function init(doc = document, win = window) {
     closeJoinSocket();
     closeHostSocket();
 
-    const groupId = await groupIdFromCode(code);
-    if (groupId !== session.groupId) {
+    const groupIdValue = await groupIdFromCode(code);
+    if (groupIdValue !== session.groupId) {
       forget(session.groupId);
       showJoin({ code, error: 'That code is for a different group.' });
       return;
     }
 
-    const reachable = await probeRoom(groupId);
+    const reachable = await probeRoom(groupIdValue);
     if (reachable === 'missing') {
-      forget(groupId);
+      forget(groupIdValue);
       showCreate();
       showNotice('This group has ended.');
       return;
@@ -893,150 +921,120 @@ export function init(doc = document, win = window) {
 
     const url = new URL('api/ws', win.location.href);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    url.searchParams.set('room', groupId);
+    url.searchParams.set('room', groupIdValue);
 
+    const groupKey = deriveGroupKey(code);
+    let shown = false;
     let socket;
-    try {
-      socket = new win.WebSocket(url.toString());
-    } catch {
-      showJoin({ code, error: RETRY_MESSAGE, resume: session });
-      return;
-    }
+    socket = new GroupSocket({
+      url: url.toString(),
+      auth: { t: 'auth', id: session.memberId, secret: session.memberSecret, mode: 'resume' },
+      win,
+      Ctor: win.WebSocket,
+      onStatus: (status) => {
+        setConnection(status);
+        if (status === 'closed' && !shown && !waitingPanel.hidden) {
+          showJoin({
+            code,
+            error: 'The saved seat could not be opened. Enter the code again.',
+            resume: session
+          });
+        }
+      },
+      onFrame: async (frame) => {
+        if (frame.t === 'waiting') {
+          showWaiting(code);
+          remember({
+            groupId: groupIdValue,
+            memberId: session.memberId,
+            secret: session.memberSecret,
+            displayName: session.displayName,
+            code
+          });
+          return;
+        }
+
+        if (frame.t === 'state') {
+          const key = await groupKey;
+          let name = 'Your group';
+          try {
+            const opened = await open(key, frame.nameBlob);
+            if (typeof opened?.name === 'string') name = opened.name;
+          } catch {
+            /* a neutral label beats an unreadable blob */
+          }
+
+          if (frame.role === 'host') {
+            if (!shown) {
+              joinSocket = null;
+              hostSocket = socket;
+              showGroup({
+                code,
+                name,
+                displayName: session.displayName,
+                role: 'organizer',
+                memberId: session.memberId
+              });
+              shown = true;
+            }
+            await renderRoster(frame, Promise.resolve(key));
+            await applyGroupState(frame, Promise.resolve(key));
+          } else {
+            if (!shown) {
+              showGroup({
+                code,
+                name,
+                displayName: session.displayName,
+                role: 'member',
+                memberId: session.memberId
+              });
+              shown = true;
+            }
+            applyMode(frame.joinMode, 'member');
+            await applyGroupState(frame, Promise.resolve(key));
+          }
+
+          remember({
+            groupId: groupIdValue,
+            memberId: session.memberId,
+            secret: session.memberSecret,
+            displayName: session.displayName,
+            code
+          });
+          return;
+        }
+
+        if (frame.t === 'record') {
+          void handleRecordFrame(frame);
+          return;
+        }
+        if (frame.t === 'conflict') {
+          handleExpenseConflict(frame);
+          return;
+        }
+        if (frame.t === 'removed') {
+          forget(groupIdValue);
+          socket.close();
+          joinSocket = null;
+          showJoin({ code, error: 'Removed from this group.' });
+          return;
+        }
+        if (frame.t === 'refused') {
+          if (handleExpenseRefusal(frame)) return;
+          socket.close();
+          joinSocket = null;
+          if (frame.code === 'rate_limited') {
+            showJoin({ code, error: refusalMessage(frame.code), resume: session });
+          } else {
+            forget(groupIdValue);
+            showJoin({ code, error: refusalMessage(frame.code) });
+          }
+        }
+      }
+    });
 
     joinSocket = socket;
-    const groupKey = deriveGroupKey(code);
-    let settled = false;
-    let shown = false;
-
-    socket.addEventListener('open', () => {
-      socket.send(
-        JSON.stringify({
-          t: 'auth',
-          id: session.memberId,
-          secret: session.memberSecret,
-          mode: 'resume'
-        })
-      );
-    });
-
-    socket.addEventListener('message', async (event) => {
-      let frame;
-      try {
-        frame = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-
-      if (frame.t === 'waiting') {
-        settled = true;
-        showWaiting(code);
-        remember({
-          groupId,
-          memberId: session.memberId,
-          secret: session.memberSecret,
-          displayName: session.displayName,
-          code
-        });
-        return;
-      }
-
-      if (frame.t === 'state') {
-        settled = true;
-        const key = await groupKey;
-        let name = 'Your group';
-        try {
-          const opened = await open(key, frame.nameBlob);
-          if (typeof opened?.name === 'string') name = opened.name;
-        } catch {
-          /* a neutral label beats an unreadable blob */
-        }
-
-        if (frame.role === 'host') {
-          if (!shown) {
-            joinSocket = null;
-            hostSocket = socket;
-            showGroup({
-              code,
-              name,
-              displayName: session.displayName,
-              role: 'organizer',
-              memberId: session.memberId
-            });
-            shown = true;
-          }
-          await renderRoster(frame, Promise.resolve(key));
-          await applyGroupState(frame, Promise.resolve(key));
-        } else {
-          if (!shown) {
-            showGroup({
-              code,
-              name,
-              displayName: session.displayName,
-              role: 'member',
-              memberId: session.memberId
-            });
-            shown = true;
-          }
-          applyMode(frame.joinMode, 'member');
-          await applyGroupState(frame, Promise.resolve(key));
-        }
-
-        remember({
-          groupId,
-          memberId: session.memberId,
-          secret: session.memberSecret,
-          displayName: session.displayName,
-          code
-        });
-        return;
-      }
-
-      if (frame.t === 'record') {
-        void handleRecordFrame(frame);
-        return;
-      }
-
-      if (frame.t === 'conflict' && handleExpenseConflict(frame)) return;
-
-      if (frame.t === 'removed') {
-        settled = true;
-        forget(groupId);
-        closeJoinSocket();
-        showJoin({ code, error: 'Removed from this group.' });
-        return;
-      }
-
-      if (frame.t === 'refused') {
-        if (handleExpenseRefusal(frame)) return;
-        settled = true;
-        closeJoinSocket();
-        if (frame.code === 'rate_limited') {
-          showJoin({ code, error: refusalMessage(frame.code), resume: session });
-        } else {
-          forget(groupId);
-          showJoin({ code, error: refusalMessage(frame.code) });
-        }
-      }
-    });
-
-    socket.addEventListener('close', () => {
-      if (hostSocket === socket) {
-        hostSocket = null;
-        rosterEmpty.textContent = 'Connection lost. Reload to continue.';
-        rosterEmpty.hidden = false;
-        expenseConnectionLost();
-        return;
-      }
-      if (joinSocket !== socket) return;
-      joinSocket = null;
-      expenseConnectionLost();
-      if (settled) return;
-      showJoin({ code, error: 'The group could not be reached. Try again.', resume: session });
-    });
-
-    socket.addEventListener('error', () => {
-      /* a close event follows */
-    });
+    socket.connect();
   }
 
   function openJoinSocket({ groupId, memberId, secret, nameBlob, code, displayName }) {
@@ -1047,106 +1045,78 @@ export function init(doc = document, win = window) {
     url.searchParams.set('room', groupId);
 
     let socket;
-    try {
-      socket = new win.WebSocket(url.toString());
-    } catch {
-      waitingCopy.textContent = 'Could not open a connection. Try again.';
-      return;
-    }
-
-    joinSocket = socket;
-    let settled = false;
-
-    socket.addEventListener('open', () => {
-      socket.send(JSON.stringify({ t: 'auth', id: memberId, secret, mode: 'join', nameBlob }));
-    });
-
-    socket.addEventListener('message', async (event) => {
-      let frame;
-      try {
-        frame = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-
-      if (frame.t === 'waiting') {
-        settled = true;
-        remember({ groupId, memberId, secret, displayName, code });
-        waitingCopy.textContent =
-          'The organizer has to let you in. Nothing from the group is shown until they do.';
-        return;
-      }
-
-      if (frame.t === 'state' && frame.role === 'member') {
-        settled = true;
-
-        /* A member already in the group only needs the mode when it changes; the first state after
-           a join is what replaces the waiting screen. */
-        if (group) {
-          applyMode(frame.joinMode, 'member');
-          void applyGroupState(frame, groupKeyPromise);
+    socket = new GroupSocket({
+      url: url.toString(),
+      auth: { t: 'auth', id: memberId, secret, mode: 'join', nameBlob },
+      win,
+      Ctor: win.WebSocket,
+      onStatus: (status) => setConnection(status),
+      onFrame: async (frame) => {
+        if (frame.t === 'waiting') {
+          remember({ groupId, memberId, secret, displayName, code });
+          waitingCopy.textContent =
+            'The organizer has to let you in. Nothing from the group is shown until they do.';
           return;
         }
 
-        let name = 'Your group';
-        try {
-          const key = await deriveGroupKey(code);
-          const opened = await open(key, frame.nameBlob);
-          if (typeof opened?.name === 'string') name = opened.name;
-        } catch {
-          /* the name stays a neutral label rather than an unreadable blob */
+        if (frame.t === 'state' && frame.role === 'member') {
+          if (group) {
+            applyMode(frame.joinMode, 'member');
+            await applyGroupState(frame, groupKeyPromise);
+            return;
+          }
+
+          let name = 'Your group';
+          try {
+            const key = await deriveGroupKey(code);
+            const opened = await open(key, frame.nameBlob);
+            if (typeof opened?.name === 'string') name = opened.name;
+          } catch {
+            /* the name stays a neutral label rather than an unreadable blob */
+          }
+          showGroup({
+            code,
+            name,
+            displayName: displayName || joinNameInput.value.trim(),
+            role: 'member',
+            memberId
+          });
+          applyMode(frame.joinMode, 'member');
+          await applyGroupState(frame, groupKeyPromise);
+          remember({ groupId, memberId, secret, displayName, code });
+          if (frame.openAdmit) {
+            setStatus("You're in — this group lets anyone with the code join.");
+          }
+          return;
         }
-        showGroup({
-          code,
-          name,
-          displayName: displayName || joinNameInput.value.trim(),
-          role: 'member',
-          memberId
-        });
-        applyMode(frame.joinMode, 'member');
-        void applyGroupState(frame, groupKeyPromise);
-        remember({ groupId, memberId, secret, displayName, code });
-        if (frame.openAdmit) {
-          setStatus("You're in — this group lets anyone with the code join.");
+
+        if (frame.t === 'record') {
+          void handleRecordFrame(frame);
+          return;
         }
-        return;
-      }
-
-      if (frame.t === 'record') {
-        void handleRecordFrame(frame);
-        return;
-      }
-
-      if (frame.t === 'conflict' && handleExpenseConflict(frame)) return;
-
-      if (frame.t === 'removed') {
-        settled = true;
-        forget(groupId);
-        closeJoinSocket();
-        showJoin({ code, error: 'Removed from this group.' });
-        return;
-      }
-
-      if (frame.t === 'refused') {
-        if (handleExpenseRefusal(frame)) return;
-        settled = true;
-        forget(groupId);
-        closeJoinSocket();
-        showJoin({ code, error: refusalMessage(frame.code) });
+        if (frame.t === 'conflict') {
+          handleExpenseConflict(frame);
+          return;
+        }
+        if (frame.t === 'removed') {
+          forget(groupId);
+          socket.close();
+          joinSocket = null;
+          showJoin({ code, error: 'Removed from this group.' });
+          return;
+        }
+        if (frame.t === 'refused') {
+          if (handleExpenseRefusal(frame)) return;
+          socket.close();
+          joinSocket = null;
+          forget(groupId);
+          showJoin({ code, error: refusalMessage(frame.code) });
+        }
       }
     });
 
-    socket.addEventListener('close', () => {
-      if (joinSocket !== socket) return;
-      joinSocket = null;
-      expenseConnectionLost();
-      if (settled) return;
-      waitingCopy.textContent = 'The connection closed before the group answered. Try again.';
-    });
-
-    socket.addEventListener('error', () => {
-      /* A close event follows, and that is where the message is set. */
-    });
+    joinSocket = socket;
+    socket.connect();
   }
 
   function closeJoinSocket() {
@@ -1177,73 +1147,51 @@ export function init(doc = document, win = window) {
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
     url.searchParams.set('room', groupId);
 
+    const key = deriveGroupKey(code);
+    toggleModeButton.disabled = true;
+
     let socket;
-    try {
-      toggleModeButton.disabled = true;
-      socket = new win.WebSocket(url.toString());
-    } catch {
-      rosterEmpty.textContent = 'Could not open a connection. Reload to continue.';
-      rosterEmpty.hidden = false;
-      return;
-    }
+    socket = new GroupSocket({
+      url: url.toString(),
+      auth: { t: 'auth', id: memberId, secret, mode: 'resume' },
+      win,
+      Ctor: win.WebSocket,
+      onStatus: (status) => {
+        setConnection(status);
+        if (status === 'open') toggleModeButton.disabled = false;
+      },
+      onFrame: (frame) => {
+        if (frame.t === 'state') {
+          void renderRoster(frame, key);
+          void applyGroupState(frame, key);
+          return;
+        }
+        if (frame.t === 'record') {
+          void handleRecordFrame(frame);
+          return;
+        }
+        if (frame.t === 'conflict') {
+          handleExpenseConflict(frame);
+          return;
+        }
+        if (frame.t === 'refused') {
+          if (handleExpenseRefusal(frame)) return;
+          rosterEmpty.textContent = 'That request could not be completed.';
+          rosterEmpty.hidden = false;
+          toggleModeButton.disabled = false;
+        }
+      }
+    });
 
     hostSocket = socket;
-    const key = deriveGroupKey(code);
-
-    socket.addEventListener('open', () => {
-      toggleModeButton.disabled = false;
-      socket.send(JSON.stringify({ t: 'auth', id: memberId, secret, mode: 'resume' }));
-    });
-
-    socket.addEventListener('message', (event) => {
-      let frame;
-      try {
-        frame = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-
-      if (frame.t === 'state') {
-        void renderRoster(frame, key);
-        void applyGroupState(frame, key);
-        return;
-      }
-      if (frame.t === 'record') {
-        void handleRecordFrame(frame);
-        return;
-      }
-      if (frame.t === 'conflict' && handleExpenseConflict(frame)) return;
-      if (frame.t === 'refused') {
-        if (handleExpenseRefusal(frame)) return;
-        rosterEmpty.textContent = 'That request could not be completed.';
-        rosterEmpty.hidden = false;
-        toggleModeButton.disabled = false;
-      }
-    });
-
-    socket.addEventListener('close', () => {
-      if (hostSocket !== socket) return;
-      hostSocket = null;
-      rosterEmpty.textContent = 'Connection lost. Reload to continue.';
-      rosterEmpty.hidden = false;
-      toggleModeButton.disabled = true;
-      expenseConnectionLost();
-    });
-
-    socket.addEventListener('error', () => {
-      /* the close event follows */
-    });
+    socket.connect();
   }
 
   function closeHostSocket() {
     if (!hostSocket) return;
     const socket = hostSocket;
     hostSocket = null;
-    try {
-      socket.close();
-    } catch {
-      /* already gone */
-    }
+    socket.close();
   }
 
   /* One armed removal at a time; the second click within four seconds is the one that acts. */
@@ -1321,7 +1269,7 @@ export function init(doc = document, win = window) {
       const act = (type) => {
         allow.disabled = true;
         decline.disabled = true;
-        if (hostSocket) hostSocket.send(JSON.stringify({ t: type, memberId: member.id }));
+        if (hostSocket) hostSocket.send({ t: type, memberId: member.id });
       };
       allow.addEventListener('click', () => act('approve'));
       decline.addEventListener('click', () => act('reject'));
@@ -1354,7 +1302,7 @@ export function init(doc = document, win = window) {
 
         disarm();
         remove.disabled = true;
-        if (hostSocket) hostSocket.send(JSON.stringify({ t: 'remove', memberId: member.id }));
+        if (hostSocket) hostSocket.send({ t: 'remove', memberId: member.id });
       });
 
       chip.append(label, remove);
@@ -1393,9 +1341,13 @@ export function init(doc = document, win = window) {
   }
 
   /** The socket this page is already holding: the host's, or the member's. */
+  function groupSocket() {
+    return hostSocket ?? joinSocket;
+  }
+
   function activeSocket() {
-    if (hostSocket && hostSocket.readyState === 1) return hostSocket;
-    if (joinSocket && joinSocket.readyState === 1) return joinSocket;
+    if (hostSocket?.isOpen) return hostSocket;
+    if (joinSocket?.isOpen) return joinSocket;
     return null;
   }
 
@@ -1442,11 +1394,15 @@ export function init(doc = document, win = window) {
     if (selfId && !nextMembers.has(selfId)) nextMembers.set(selfId, selfName || 'You');
     members = nextMembers;
 
+    const pendingEntries = [...ledger.values()].filter((entry) => entry.pending);
     const nextLedger = new Map();
     for (const record of frame.records ?? []) {
       if (record.deleted) continue;
       const value = await decryptRecord(key, record, groupIdValue);
       if (value) nextLedger.set(record.id, { ...record, value });
+    }
+    for (const entry of pendingEntries) {
+      if (!nextLedger.has(entry.id)) nextLedger.set(entry.id, entry);
     }
     ledger = nextLedger;
 
@@ -1482,6 +1438,21 @@ export function init(doc = document, win = window) {
       title.textContent = value.description;
       const meta = doc.createElement('p');
       meta.className = 'expense-meta';
+      if (record.pending) {
+        meta.textContent = 'Waiting to sync';
+        left.append(title, meta);
+        const side = doc.createElement('div');
+        side.className = 'expense-side';
+        const amount = doc.createElement('span');
+        amount.className = 'expense-amount';
+        amount.textContent = formatPaise(value.amountPaise, groupCurrency);
+        side.append(amount);
+        row.classList.add('pending');
+        row.append(left, side);
+        ledgerList.append(row);
+        continue;
+      }
+
       const payer = members.get(value.paidBy) || 'Someone';
       const creator = record.creator ?? record.author;
       const edited = creator && creator !== record.author;
@@ -1550,7 +1521,8 @@ export function init(doc = document, win = window) {
     pendingDeleteId = record.id;
     button.disabled = true;
     socket.send(
-      JSON.stringify({ t: 'put', id: record.id, base: record.rev, blob: null, deleted: true })
+      { t: 'put', id: record.id, base: record.rev, blob: null, deleted: true },
+      { id: record.id }
     );
   }
 
@@ -1779,15 +1751,6 @@ export function init(doc = document, win = window) {
     renderLedger();
   }
 
-  function expenseConnectionLost() {
-    if (!savingExpense) return;
-    savingExpense = false;
-    expenseSave.disabled = false;
-    expenseCancel.disabled = false;
-    expenseSave.textContent = 'Save expense';
-    expenseFailure('The group is not connected. Try again.', expenseSave);
-  }
-
   async function saveExpense(event) {
     event.preventDefault();
     if (!group || savingExpense) return;
@@ -1811,8 +1774,11 @@ export function init(doc = document, win = window) {
     if (!split.ok) return expenseFailure(split.message, splitInputs);
     previewShares = split.shares;
 
-    const socket = activeSocket();
+    const socket = groupSocket();
     if (!socket) return expenseFailure('The group is not connected. Try again.', expenseSave);
+    if (!socket.isOpen && editingExpense) {
+      return expenseFailure('Editing needs a connection. Try again.', expenseSave);
+    }
 
     savingExpense = true;
     pendingExpenseEdit = Boolean(editingExpense);
@@ -1833,16 +1799,38 @@ export function init(doc = document, win = window) {
         note: note.value
       };
       const blob = await seal(key, value, expenseAad(groupIdValue, expenseDraftId));
-      pendingExpenseId = expenseDraftId;
       socket.send(
-        JSON.stringify({
+        {
           t: 'put',
           id: expenseDraftId,
           base: editingExpense ? editingExpense.rev : 0,
           blob,
           deleted: false
-        })
+        },
+        { id: expenseDraftId }
       );
+
+      if (!socket.isOpen) {
+        ledger.set(expenseDraftId, {
+          id: expenseDraftId,
+          rev: 0,
+          pending: true,
+          blob,
+          value,
+          at: Date.now(),
+          author: selfId,
+          creator: selfId
+        });
+        savingExpense = false;
+        pendingExpenseId = null;
+        pendingExpenseEdit = false;
+        closeExpenseSheet();
+        renderLedger();
+        setStatus('Waiting to sync.');
+        return;
+      }
+
+      pendingExpenseId = expenseDraftId;
     } catch {
       savingExpense = false;
       expenseSave.disabled = false;
@@ -1867,10 +1855,31 @@ export function init(doc = document, win = window) {
     renderLedger();
   }
 
+  async function settlePendingConflict(frame) {
+    const pending = ledger.get(frame.id);
+    if (!pending?.pending || !groupKeyPromise) return;
+    const key = await groupKeyPromise;
+    const groupIdValue = await groupIdPromise;
+
+    if (frame.current && !frame.current.deleted) {
+      const currentValue = await decryptRecord(key, frame.current, groupIdValue);
+      const same = currentValue && JSON.stringify(currentValue) === JSON.stringify(pending.value);
+      ledger.set(frame.id, { ...frame.current, value: currentValue });
+      renderLedger();
+      setStatus(same ? 'Expense added.' : 'That expense was not saved; it changed elsewhere.');
+      return;
+    }
+
+    ledger.delete(frame.id);
+    renderLedger();
+    setStatus('That expense was not saved.');
+  }
+
   async function handleRecordFrame(frame) {
     if (!groupKeyPromise) return;
     const key = await groupKeyPromise;
     const groupIdValue = await groupIdPromise;
+    groupSocket()?.ack(frame.id);
 
     if (frame.deleted) {
       ledger.delete(frame.id);
@@ -1902,6 +1911,14 @@ export function init(doc = document, win = window) {
   }
 
   function handleExpenseRefusal(frame) {
+    if (ledger.get(frame.id)?.pending) {
+      groupSocket()?.ack(frame.id);
+      ledger.delete(frame.id);
+      renderLedger();
+      setStatus('The expense could not be saved. Try again.');
+      return true;
+    }
+
     if (frame.id === pendingDeleteId) {
       pendingDeleteId = null;
       if (frame.code === 'deleted') {
@@ -1939,6 +1956,12 @@ export function init(doc = document, win = window) {
   }
 
   function handleExpenseConflict(frame) {
+    if (ledger.get(frame.id)?.pending) {
+      groupSocket()?.ack(frame.id);
+      void settlePendingConflict(frame);
+      return true;
+    }
+
     const editing = frame.id === pendingExpenseId;
     const deleting = frame.id === pendingDeleteId;
     if (!editing && !deleting) return false;
