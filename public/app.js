@@ -42,7 +42,7 @@ import {
   setLastGroup
 } from './store.js';
 import { GroupSocket } from './sync.js';
-import { balances, settle } from './balance.js';
+import { attribute, balances, ledgerContributions, settle } from './balance.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -1560,6 +1560,7 @@ export function init(doc = document, win = window) {
     const settlements = [...ledger.values()]
       .filter((record) => !record.pending && !record.deleted && record.value?.kind === 'settlement')
       .map((record) => ({
+        id: record.id,
         from: record.value.from,
         to: record.value.to,
         amountPaise: record.value.amountPaise
@@ -1570,8 +1571,14 @@ export function init(doc = document, win = window) {
       referenced.add(expense.paidBy);
       for (const id of Object.keys(expense.split)) referenced.add(id);
     }
+    for (const payment of settlements) {
+      referenced.add(payment.from);
+      referenced.add(payment.to);
+    }
     const map = balances([...referenced], expenses, settlements);
     const proposal = settle(map);
+    const contributions = ledgerContributions([...referenced], expenses, settlements);
+    const transfers = attribute(proposal.transfers, contributions);
     lastBalances = map;
     const names = new Map(members);
 
@@ -1599,18 +1606,55 @@ export function init(doc = document, win = window) {
     }
 
     transferList.textContent = '';
-    for (const transfer of proposal.transfers) {
+    for (const transfer of transfers) {
       const row = doc.createElement('li');
+      const body = doc.createElement('div');
       const label = doc.createElement('span');
       label.textContent = `${names.get(transfer.from) || 'Someone'} pays ${
         names.get(transfer.to) || 'Someone'
       } ${formatPaise(transfer.amountPaise, groupCurrency)}`;
+      body.append(label);
+
+      const why = doc.createElement('button');
+      why.type = 'button';
+      why.className = 'link-button';
+      why.textContent = 'Why?';
+      const via = doc.createElement('ul');
+      via.className = 'via-list';
+      via.hidden = true;
+      for (const source of transfer.via) {
+        const record = ledger.get(source.recordId);
+        const line = doc.createElement('li');
+        if (record?.value?.kind === 'settlement') {
+          line.textContent = `Payment from ${names.get(record.value.from) || 'Someone'} to ${
+            names.get(record.value.to) || 'Someone'
+          } · ${formatPaise(source.amountPaise, groupCurrency)}`;
+        } else if (record?.value) {
+          line.textContent = `${record.value.description} · share ${formatPaise(
+            source.amountPaise,
+            groupCurrency
+          )}`;
+        } else {
+          line.textContent = `Record · ${formatPaise(source.amountPaise, groupCurrency)}`;
+        }
+        via.append(line);
+      }
+      why.addEventListener('click', () => {
+        via.hidden = !via.hidden;
+        why.textContent = via.hidden ? 'Why?' : 'Hide';
+      });
+      body.append(why, via);
+
       const pay = doc.createElement('button');
       pay.type = 'button';
       pay.className = 'secondary';
       pay.textContent = 'Mark as paid';
       pay.addEventListener('click', () => openSettlement(transfer));
-      row.append(label, pay);
+
+      const actions = doc.createElement('div');
+      actions.className = 'transfer-actions';
+      actions.append(pay);
+      row.append(body, actions);
       transferList.append(row);
     }
 

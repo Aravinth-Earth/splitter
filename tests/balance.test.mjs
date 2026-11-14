@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { balances, exactSettle, greedySettle, settle } from '../public/balance.js';
+import { attribute, balances, exactSettle, greedySettle, ledgerContributions, settle } from '../public/balance.js';
 import { allocate } from '../public/calc.js';
 
 function apply(balancesMap, transfers) {
@@ -192,4 +192,84 @@ test('balance: a recorded payment clears the leg it corresponds to, deleting it 
 
   const restored = balances(members, expenses, []);
   assert.deepEqual(settle(restored).transfers, proposal.transfers);
+});
+
+
+test('balance: a transfer expands to the exact shares that produced it', () => {
+  const members = ['a', 'b'];
+  const expenses = [
+    { id: 'e1', amountPaise: 100, paidBy: 'a', split: { a: 50, b: 50 } },
+    { id: 'e2', amountPaise: 40, paidBy: 'a', split: { a: 10, b: 30 } }
+  ];
+
+  const map = balances(members, expenses);
+  const contributions = ledgerContributions(members, expenses);
+  const proposal = attribute(settle(map).transfers, contributions);
+
+  assert.equal(proposal.length, 1);
+  assert.equal(proposal[0].amountPaise, 80);
+  assert.deepEqual(proposal[0].via, [
+    { recordId: 'e1', kind: 'expense', amountPaise: 50 },
+    { recordId: 'e2', kind: 'expense', amountPaise: 30 }
+  ]);
+  assert.equal(
+    proposal[0].via.reduce((sum, row) => sum + row.amountPaise, 0),
+    proposal[0].amountPaise
+  );
+});
+
+test('balance: attribution sums to the leg for two hundred random ledgers', () => {
+  let state = 0x13579bdf;
+
+  function random() {
+    state = (state * 1_664_525 + 1_013_904_223) >>> 0;
+    return state / 2 ** 32;
+  }
+
+  for (let sample = 0; sample < 200; sample += 1) {
+    const count = Math.floor(random() * 8) + 2;
+    const members = Array.from({ length: count }, (_, index) => `m${index}`);
+    const expenses = [];
+    const settlements = [];
+
+    for (let index = 0; index < Math.floor(random() * 6); index += 1) {
+      const amount = Math.floor(random() * 50_000) + 1;
+      const payer = members[Math.floor(random() * count)];
+      const chosen = members.filter(() => random() < 0.7);
+      if (chosen.length === 0) chosen.push(payer);
+      expenses.push({
+        id: `e${index}`,
+        amountPaise: amount,
+        paidBy: payer,
+        split: allocate(amount, Object.fromEntries(chosen.map((id) => [id, 1])))
+      });
+    }
+    for (let index = 0; index < 2; index += 1) {
+      if (random() < 0.3) {
+        const from = members[Math.floor(random() * count)];
+        const to = members[Math.floor(random() * count)];
+        if (from === to) continue;
+        settlements.push({
+          id: `s${index}`,
+          from,
+          to,
+          amountPaise: Math.floor(random() * 3_000) + 1
+        });
+      }
+    }
+
+    const map = balances(members, expenses, settlements);
+    const contributions = ledgerContributions(members, expenses, settlements);
+    const proposal = attribute(settle(map).transfers, contributions);
+
+    for (const transfer of proposal) {
+      assert.equal(
+        transfer.via.reduce((sum, row) => sum + row.amountPaise, 0),
+        transfer.amountPaise,
+        `sample ${sample}`
+      );
+      assert.ok(transfer.via.every((row) => row.amountPaise > 0 && row.recordId));
+    }
+    assert.ok(allZero(apply(map, proposal)));
+  }
 });

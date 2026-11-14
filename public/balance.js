@@ -200,3 +200,95 @@ export function settle(balancesMap, options = {}) {
   }
   return exactSettle(balancesMap, options);
 }
+
+
+/**
+ * The negative side of every member's ledger: the shares and received settlements that make them
+ * owe. Only those are needed to explain a transfer; the credits (paid expenses, settlements they
+ * made) are what brought the net down, not what a transfer settles.
+ *
+ * Each row carries the record id and the kind, so the screen can name the expense or payment.
+ *
+ * @returns {Record<string, Array<{recordId: string, kind: 'expense'|'settlement', amountPaise: number}>>}
+ */
+export function ledgerContributions(members, expenses = [], settlements = []) {
+  if (!Array.isArray(members)) throw new Error('splitter: members must be a list');
+  const result = Object.fromEntries(members.map((id) => [id, []]));
+  const add = (id, row) => {
+    if (row.amountPaise <= 0) return;
+    if (!result[id]) result[id] = [];
+    result[id].push(row);
+  };
+
+  for (const expense of expenses) {
+    if (!Number.isSafeInteger(expense.amountPaise) || expense.amountPaise <= 0) {
+      throw new Error('splitter: an expense must be a positive whole number of paise');
+    }
+    if (typeof expense.id !== 'string' || expense.id === '') {
+      throw new Error('splitter: an expense needs an id');
+    }
+    let shared = 0;
+    for (const [id, paise] of Object.entries(expense.split ?? {})) {
+      if (!Number.isSafeInteger(paise) || paise < 0) {
+        throw new Error(`splitter: the share for ${id} must be a non-negative whole number of paise`);
+      }
+      add(id, { recordId: expense.id, kind: 'expense', amountPaise: paise });
+      shared += paise;
+    }
+    if (shared !== expense.amountPaise) {
+      throw new Error('splitter: an expense split must total its amount');
+    }
+  }
+
+  for (const payment of settlements) {
+    if (!Number.isSafeInteger(payment.amountPaise) || payment.amountPaise <= 0) {
+      throw new Error('splitter: a settlement must be a positive whole number of paise');
+    }
+    if (typeof payment.id !== 'string' || payment.id === '') {
+      throw new Error('splitter: a settlement needs an id');
+    }
+    add(payment.to, { recordId: payment.id, kind: 'settlement', amountPaise: payment.amountPaise });
+  }
+
+  for (const rows of Object.values(result)) {
+    rows.sort(
+      (left, right) =>
+        (left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0) ||
+        (left.kind < right.kind ? -1 : 1)
+    );
+  }
+  return result;
+}
+
+/**
+ * Attach the source rows to each transfer.
+ *
+ * Attribution walks the debtor's negative rows in record order, taking as much of each as the
+ * transfer needs. The sum of every `via` amount equals the transfer exactly; the grouper decides
+ * the legs, and this decides only how to explain them.
+ *
+ * @returns {Array<{from: string, to: string, amountPaise: number,
+ *   via: Array<{recordId: string, kind: string, amountPaise: number}>}>}
+ */
+export function attribute(transfers, contributions) {
+  const remaining = new Map();
+  for (const [id, rows] of Object.entries(contributions)) {
+    remaining.set(id, rows.map((row) => ({ ...row })));
+  }
+
+  return transfers.map((transfer) => {
+    const rows = remaining.get(transfer.from) ?? [];
+    let need = transfer.amountPaise;
+    const via = [];
+    while (need > 0 && rows.length > 0) {
+      const row = rows[0];
+      const take = Math.min(need, row.amountPaise);
+      via.push({ recordId: row.recordId, kind: row.kind, amountPaise: take });
+      row.amountPaise -= take;
+      need -= take;
+      if (row.amountPaise === 0) rows.shift();
+    }
+    if (need !== 0) throw new Error('splitter: a transfer exceeds the debt it explains');
+    return { ...transfer, via };
+  });
+}
