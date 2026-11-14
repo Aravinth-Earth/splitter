@@ -655,3 +655,157 @@ test('two sockets with one secret share one member entry', async (t) => {
     'the host sees one member, not two'
   );
 });
+
+test('one write reaches the host and an approved member, and never a pending socket', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+  const member = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => member.close());
+  member.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Reader' })
+  });
+  assert.equal((await member.next()).t, 'waiting');
+  await host.next();
+
+  host.send({ t: 'approve', memberId });
+  assert.equal((await member.next()).role, 'member');
+  await host.next();
+
+  const pendingSecret = randomSecret();
+  const pendingId = await idFromSecret(pendingSecret);
+  const pending = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => pending.close());
+  pending.send({
+    t: 'auth',
+    id: pendingId,
+    secret: pendingSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Waiting' })
+  });
+  assert.equal((await pending.next()).t, 'waiting');
+  await host.next();
+
+  const recordId = randomSecret();
+  const blob = await seal(group.key, { description: 'Dinner', amount: 1_000 }, 'sp1:rec:test');
+  host.send({ t: 'put', id: recordId, base: 0, blob, deleted: false });
+
+  const hostRecord = await host.next();
+  assert.equal(hostRecord.t, 'record');
+  assert.equal(hostRecord.rev, 1);
+  assert.equal(hostRecord.author, group.hostId);
+  assert.deepEqual(hostRecord.blob, blob);
+
+  const memberRecord = await member.next();
+  assert.equal(memberRecord.t, 'record');
+  assert.equal(memberRecord.id, recordId);
+  assert.equal(memberRecord.rev, 1);
+
+  await pending.silence(500);
+
+  /* A second host socket is the author's other tab: the state carries the ledger. */
+  const otherHost = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => otherHost.close());
+  otherHost.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  const hostState = await otherHost.next();
+  assert.equal(hostState.t, 'state');
+  assert.equal(hostState.records.length, 1);
+  assert.equal(hostState.records[0].id, recordId);
+
+  /* Admission after a write carries the ledger to the new member, never to a pending socket. */
+  host.send({ t: 'approve', memberId: pendingId });
+  const admitted = await pending.next();
+  assert.equal(admitted.t, 'state');
+  assert.equal(admitted.records.length, 1);
+  assert.equal(admitted.records[0].id, recordId);
+});
+
+test('a stale base is a conflict, and a tombstone is final', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const id = randomSecret();
+  const first = await seal(group.key, { amount: 100 }, 'sp1:rec:test');
+  const second = await seal(group.key, { amount: 200 }, 'sp1:rec:test');
+
+  host.send({ t: 'put', id, base: 0, blob: first, deleted: false });
+  assert.equal((await host.next()).rev, 1);
+
+  host.send({ t: 'put', id, base: 0, blob: second, deleted: false });
+  const conflict = await host.next();
+  assert.equal(conflict.t, 'conflict');
+  assert.equal(conflict.current.rev, 1);
+  assert.deepEqual(conflict.current.blob, first, 'the stored ciphertext comes back to the writer');
+  await host.silence(300);
+
+  host.send({ t: 'put', id, base: 1, blob: second, deleted: false });
+  const revised = await host.next();
+  assert.equal(revised.rev, 2);
+  assert.deepEqual(revised.blob, second);
+
+  host.send({ t: 'put', id, base: 2, blob: second, deleted: true });
+  const tombstone = await host.next();
+  assert.equal(tombstone.deleted, true);
+  assert.equal(tombstone.rev, 3);
+
+  host.send({ t: 'put', id, base: 3, blob: first, deleted: false });
+  assert.deepEqual(await host.next(), { t: 'refused', code: 'deleted' });
+});
+
+test('a pending socket cannot write, and the frame cap is enforced', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const pendingSecret = randomSecret();
+  const pendingId = await idFromSecret(pendingSecret);
+  const pending = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => pending.close());
+  pending.send({
+    t: 'auth',
+    id: pendingId,
+    secret: pendingSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'No Write' })
+  });
+  assert.equal((await pending.next()).t, 'waiting');
+  await host.next();
+
+  pending.send({
+    t: 'put',
+    id: randomSecret(),
+    base: 0,
+    blob: await seal(group.key, { amount: 1 }, 'sp1:rec:test'),
+    deleted: false
+  });
+  assert.deepEqual(await pending.next(), { t: 'refused', code: 'unapproved' });
+  await host.silence(400);
+
+  const huge = { iv: 'A'.repeat(16), ct: 'A'.repeat(70_000) };
+  host.send({ t: 'put', id: randomSecret(), base: 0, blob: huge, deleted: false });
+  assert.deepEqual(await host.next(), { t: 'refused', code: 'too_large' });
+});

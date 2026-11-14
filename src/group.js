@@ -24,11 +24,17 @@ import { isId, isSealed } from './wire.js';
 
 export const GROUP_KEY = 'meta';
 const MEMBER_PREFIX = 'member:';
+const RECORD_PREFIX = 'record:';
 const DEFAULT_MAX_MEMBERS = 20;
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
+const MAX_RECORD_BYTES = 64 * 1024;
 
 function memberKey(id) {
   return `${MEMBER_PREFIX}${id}`;
+}
+
+function recordKey(id) {
+  return `${RECORD_PREFIX}${id}`;
 }
 
 function json(body, status = 200, headers = {}) {
@@ -229,6 +235,14 @@ export class Group {
    * client sent: a member that forges `approve` changes nothing and is closed with `not_host`.
    */
   async handleAction(socket, frame) {
+    if (frame.t === 'put') {
+      await this.writeRecord(socket, frame);
+      return;
+    }
+    if (frame.t === 'ping') {
+      this.sendFrame(socket, { t: 'pong' });
+      return;
+    }
     if (frame.t !== 'approve' && frame.t !== 'reject' && frame.t !== 'remove' && frame.t !== 'mode') {
       return;
     }
@@ -413,6 +427,92 @@ export class Group {
     await this.notifyHosts(meta);
   }
 
+  /**
+   * One accepted write to one record.
+   *
+   * The server assigns the revision; the client names the revision it wrote from. A stale base is a
+   * conflict carrying the stored ciphertext, which only a key holder can open. A tombstone is final:
+   * a later put against it is refused rather than resurrecting an expense the group deleted.
+   */
+  async writeRecord(socket, frame) {
+    const identity = this.identities.get(socket);
+    if (!identity || (identity.role !== 'host' && identity.role !== 'member')) {
+      this.sendRefusal(socket, 'unapproved');
+      return;
+    }
+    if (typeof frame.id !== 'string' || !isId(frame.id)) {
+      this.sendRefusal(socket, 'bad_request');
+      return;
+    }
+    if (!Number.isSafeInteger(frame.base) || frame.base < 0) {
+      this.sendRefusal(socket, 'bad_request');
+      return;
+    }
+    if (!isSealed(frame.blob)) {
+      this.sendRefusal(socket, 'bad_request');
+      return;
+    }
+    if (typeof frame.deleted !== 'boolean') {
+      this.sendRefusal(socket, 'bad_request');
+      return;
+    }
+    if (JSON.stringify(frame).length > MAX_RECORD_BYTES) {
+      this.sendRefusal(socket, 'too_large');
+      return;
+    }
+
+    const key = recordKey(frame.id);
+    const existing = await this.ctx.storage.get(key);
+    if (existing?.deleted) {
+      this.sendRefusal(socket, 'deleted');
+      return;
+    }
+
+    const rev = existing?.rev ?? 0;
+    if (frame.base !== rev) {
+      this.sendFrame(socket, {
+        t: 'conflict',
+        id: frame.id,
+        current: existing ? { ...existing } : null
+      });
+      return;
+    }
+
+    const record = {
+      id: frame.id,
+      rev: rev + 1,
+      blob: frame.blob,
+      deleted: frame.deleted,
+      author: identity.memberId,
+      at: Date.now()
+    };
+
+    await this.ctx.storage.put(key, record);
+    await this.broadcastRecord(record);
+  }
+
+  /** Every accepted write reaches every approved socket, including the author's other tabs. */
+  async broadcastRecord(record) {
+    const frame = JSON.stringify({ t: 'record', ...record });
+    for (const socket of this.sockets) {
+      const identity = this.identities.get(socket);
+      if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
+      try {
+        socket.send(frame);
+      } catch {
+        /* a socket that is already gone is not a reason to stop telling the others */
+      }
+    }
+  }
+
+  sendFrame(socket, frame) {
+    try {
+      socket.send(JSON.stringify(frame));
+    } catch {
+      /* already gone */
+    }
+  }
+
   /** Ask the Registry, the one singleton that can count across groups. */
   async callRegistry(path, body) {
     const registry = this.env.REGISTRY.get(this.env.REGISTRY.idFromName('registry'));
@@ -450,6 +550,13 @@ export class Group {
         roster.push({ id, status: entry.status, nameBlob: entry.nameBlob });
       }
     }
+    const records = [];
+    if (role === 'host' || role === 'member') {
+      const stored = await this.ctx.storage.list({ prefix: RECORD_PREFIX });
+      for (const [, record] of stored) records.push({ ...record });
+      records.sort((left, right) => left.at - right.at || (left.id < right.id ? -1 : 1));
+    }
+
     return {
       t: 'state',
       rev: meta.rev,
@@ -457,7 +564,8 @@ export class Group {
       role,
       joinMode: meta.joinMode === 'open' ? 'open' : 'approval',
       nameBlob: meta.nameBlob,
-      roster
+      roster,
+      records
     };
   }
 
