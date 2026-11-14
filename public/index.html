@@ -117,6 +117,7 @@
       <p id="role-line" class="muted">you are the organizer</p>
       <p id="join-mode" class="muted"></p>
       <p class="mode-row"><button id="toggle-mode" class="link-button" type="button" hidden></button></p>
+      <p class="group-actions"><button id="add-expense" class="primary" type="button">Add expense</button></p>
 
       <p class="code-line"><code id="group-code"></code></p>
       <div class="code-actions">
@@ -152,6 +153,69 @@
         <li><strong>Split how.</strong> Equally, by share, by percentage, or by exact amount.</li>
         <li><strong>Done.</strong> Each balance moves, and the end of the trip is one short list of transfers.</li>
       </ol>
+    </section>
+
+    <section id="ledger" class="panel" aria-labelledby="ledger-title" hidden>
+      <h2 id="ledger-title">Expenses</h2>
+      <ul id="ledger-list" class="ledger-list"></ul>
+    </section>
+
+    <section id="expense-panel" class="panel sheet" aria-labelledby="expense-title" hidden>
+      <h2 id="expense-title">Add an expense</h2>
+      <form id="expense-form" novalidate>
+        <div class="field">
+          <label for="expense-description">Description</label>
+          <input id="expense-description" type="text" autocomplete="off" placeholder="Dinner, cab, the hotel" />
+          <p class="hint">1 to 120 characters.</p>
+        </div>
+
+        <div class="field">
+          <label for="expense-amount">Amount <span id="expense-currency" class="muted"></span></label>
+          <input id="expense-amount" type="text" inputmode="decimal" autocomplete="off" placeholder="0.00" />
+          <p class="hint">At most 1,00,00,000, with two decimals.</p>
+        </div>
+
+        <div class="field">
+          <label for="expense-payer">Paid by</label>
+          <select id="expense-payer"></select>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="expense-date">Date</label>
+            <input id="expense-date" type="date" />
+          </div>
+          <div class="field">
+            <label for="expense-time">Time</label>
+            <input id="expense-time" type="time" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="expense-note">Note <span class="muted">(optional)</span></label>
+          <textarea id="expense-note" rows="2"></textarea>
+        </div>
+
+        <fieldset class="split">
+          <legend>Split</legend>
+          <div class="split-tabs" role="radiogroup" aria-label="How to split this expense">
+            <label><input type="radio" name="split-mode" value="equal" checked /> Equally</label>
+            <label><input type="radio" name="split-mode" value="chosen" /> Chosen people</label>
+            <label><input type="radio" name="split-mode" value="percent" /> Percent</label>
+          </div>
+          <div id="split-inputs" class="split-inputs"></div>
+          <h3 class="eyebrow">Each person pays</h3>
+          <ul id="split-preview" class="split-preview"></ul>
+          <p id="split-note" class="muted"></p>
+        </fieldset>
+
+        <p id="expense-error" class="form-error" role="alert" hidden></p>
+
+        <div class="sheet-actions">
+          <button id="expense-save" class="primary" type="submit">Save expense</button>
+          <button id="expense-cancel" class="secondary" type="button">Cancel</button>
+        </div>
+      </form>
     </section>
 
     <section class="panel" aria-labelledby="server-title">

@@ -155,17 +155,17 @@ test('a create payload is two ids and two sealed blobs, and no plaintext name', 
   const code = generateCode();
   const secret = randomSecret();
   const name = 'Zanzibar Ledger';
-  const payload = await createPayload({ code, secret, name });
+  const payload = await createPayload({ code, secret, name, displayName: 'Aravinth' });
 
   assert.deepEqual(
     Object.keys(payload).sort(),
-    ['groupId', 'hostId', 'metaBlob', 'nameBlob'],
-    'the body has exactly the four fields the Worker reads'
+    ['groupId', 'hostId', 'hostNameBlob', 'metaBlob', 'nameBlob'],
+    'the body has exactly the fields the Worker reads'
   );
   assert.match(payload.groupId, /^[0-9a-f]{64}$/, 'the group id is the hash of the code');
   assert.match(payload.hostId, /^[A-Za-z0-9_-]{22}$/, 'the host id is a 22-character base64url id');
 
-  for (const blob of [payload.nameBlob, payload.metaBlob]) {
+  for (const blob of [payload.nameBlob, payload.hostNameBlob, payload.metaBlob]) {
     assert.deepEqual(Object.keys(blob).sort(), ['ct', 'iv'], 'a sealed value is {iv, ct}');
     assert.match(blob.iv, /^[A-Za-z0-9_-]{16}$/, 'the iv is 12 bytes in unpadded base64url');
   }
@@ -174,6 +174,7 @@ test('a create payload is two ids and two sealed blobs, and no plaintext name', 
   const wire = JSON.stringify(payload);
   assert.ok(!('name' in payload), 'there is no plaintext name field');
   assert.ok(!wire.includes(name), 'the name must not appear in the body as text');
+  assert.ok(!wire.includes('Aravinth'), 'the organizer name must not appear in the body as text');
   assert.ok(
     !Buffer.from(payload.nameBlob.ct, 'base64url').includes(Buffer.from(name)),
     'the sealed name must not contain the name in the clear'
@@ -181,6 +182,11 @@ test('a create payload is two ids and two sealed blobs, and no plaintext name', 
 
   const key = await deriveGroupKey(code);
   assert.deepEqual(await open(key, payload.nameBlob), { name }, 'the sealed name opens under the code');
+  assert.deepEqual(
+    await open(key, payload.hostNameBlob),
+    { name: 'Aravinth' },
+    'the sealed organizer name opens under the code'
+  );
   assert.deepEqual(
     await open(key, payload.metaBlob),
     { currency: 'INR' },
@@ -190,15 +196,15 @@ test('a create payload is two ids and two sealed blobs, and no plaintext name', 
 
 test('the sealed meta carries the chosen currency', async () => {
   const code = generateCode();
-  const payload = await createPayload({ code, secret: randomSecret(), name: 'Trip', currency: 'eur' });
+  const payload = await createPayload({ code, secret: randomSecret(), name: 'Trip', displayName: 'Aravinth', currency: 'eur' });
 
   assert.deepEqual(await open(await deriveGroupKey(code), payload.metaBlob), { currency: 'EUR' });
 });
 
 test('one code is one group id, and every seal has a fresh IV', async () => {
   const code = generateCode();
-  const first = await createPayload({ code, secret: randomSecret(), name: 'Trip' });
-  const second = await createPayload({ code, secret: randomSecret(), name: 'Trip' });
+  const first = await createPayload({ code, secret: randomSecret(), name: 'Trip', displayName: 'Aravinth' });
+  const second = await createPayload({ code, secret: randomSecret(), name: 'Trip', displayName: 'Aravinth' });
 
   assert.equal(second.groupId, first.groupId, 'the same code must name the same group');
   assert.notEqual(second.hostId, first.hostId, 'two members must not share one member id');
@@ -225,7 +231,11 @@ test('a payload cannot be built from nothing', async () => {
     'a payload without a secret has no host id'
   );
   await assert.rejects(
-    createPayload({ code, secret, name: '   ' }),
+    createPayload({ code, secret, name: 'Trip' }),
+    /organizer name/
+  );
+  await assert.rejects(
+    createPayload({ code, secret, name: '   ', displayName: 'Aravinth' }),
     /needs a group name/,
     'a blank name must not be sealed'
   );

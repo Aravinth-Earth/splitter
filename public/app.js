@@ -41,6 +41,17 @@ import {
   sessionFor,
   setLastGroup
 } from './store.js';
+import {
+  defaultPercentages,
+  expenseAad,
+  formatPaise,
+  parseAmount,
+  splitFor,
+  validateDate,
+  validateDescription,
+  validateNote,
+  validateTime
+} from './expense.js';
 
 /** The currencies the page offers. The list is short on purpose: every pair is a rounding rule. */
 export const CURRENCIES = Object.freeze(['INR', 'EUR', 'USD', 'GBP']);
@@ -133,15 +144,21 @@ export function normalizeCurrency(value) {
 }
 
 /**
- * The body `/api/create` reads: two ids and two sealed values, and nothing else.
+ * The body `/api/create` reads: two ids and three sealed values, and nothing else.
  *
  * The key is derived here and used here, and is not returned: nothing on this page opens a sealed
  * value after the create, and the code — which is kept — re-derives the same key on this device.
  * What matters for the promise is that neither the code nor the key is ever written anywhere.
  *
- * @returns {Promise<{groupId: string, hostId: string, nameBlob: {iv: string, ct: string}, metaBlob: {iv: string, ct: string}}>}
+ * @returns {Promise<{groupId: string, hostId: string, nameBlob: {iv: string, ct: string}, hostNameBlob: {iv: string, ct: string}, metaBlob: {iv: string, ct: string}}>}
  */
-export async function createPayload({ code, secret, name, currency = DEFAULT_CURRENCY } = {}) {
+export async function createPayload({
+  code,
+  secret,
+  name,
+  displayName,
+  currency = DEFAULT_CURRENCY
+} = {}) {
   if (typeof code !== 'string' || code === '') {
     throw new Error('splitter: a create payload needs a group code');
   }
@@ -150,6 +167,9 @@ export async function createPayload({ code, secret, name, currency = DEFAULT_CUR
   }
   if (typeof name !== 'string' || name.trim() === '') {
     throw new Error('splitter: a create payload needs a group name');
+  }
+  if (typeof displayName !== 'string' || displayName.trim() === '') {
+    throw new Error('splitter: a create payload needs the organizer name');
   }
 
   const [key, groupId, hostId] = await Promise.all([
@@ -162,6 +182,7 @@ export async function createPayload({ code, secret, name, currency = DEFAULT_CUR
     groupId,
     hostId,
     nameBlob: await seal(key, { name }),
+    hostNameBlob: await seal(key, { name: displayName.trim() }),
     metaBlob: await seal(key, { currency: normalizeCurrency(currency) })
   };
 }
@@ -303,6 +324,25 @@ export function init(doc = document, win = window) {
   const codeHint = doc.getElementById('code-hint');
   const dismissHintButton = doc.getElementById('dismiss-hint');
   const emptyLedger = doc.getElementById('empty-ledger');
+  const ledgerPanel = doc.getElementById('ledger');
+  const ledgerList = doc.getElementById('ledger-list');
+  const addExpenseButton = doc.getElementById('add-expense');
+  const expensePanel = doc.getElementById('expense-panel');
+  const expenseForm = doc.getElementById('expense-form');
+  const expenseDescription = doc.getElementById('expense-description');
+  const expenseAmount = doc.getElementById('expense-amount');
+  const expensePayer = doc.getElementById('expense-payer');
+  const expenseDate = doc.getElementById('expense-date');
+  const expenseTime = doc.getElementById('expense-time');
+  const expenseNote = doc.getElementById('expense-note');
+  const expenseCurrency = doc.getElementById('expense-currency');
+  const splitInputs = doc.getElementById('split-inputs');
+  const splitPreview = doc.getElementById('split-preview');
+  const splitNote = doc.getElementById('split-note');
+  const splitModes = [...doc.querySelectorAll('input[name="split-mode"]')];
+  const expenseError = doc.getElementById('expense-error');
+  const expenseSave = doc.getElementById('expense-save');
+  const expenseCancel = doc.getElementById('expense-cancel');
 
   const joinPanel = doc.getElementById('join-panel');
   const joinForm = doc.getElementById('join-form');
@@ -351,6 +391,19 @@ export function init(doc = document, win = window) {
   let hostSocket = null;
   let currentMode = 'approval';
   let resumeSession = null;
+  let groupId = null;
+  let groupIdPromise = null;
+  let groupKeyPromise = null;
+  let selfId = null;
+  let selfName = '';
+  let groupCurrency = DEFAULT_CURRENCY;
+  let members = new Map();
+  let ledger = new Map();
+  let expenseSheetOpen = false;
+  let expenseDraftId = null;
+  let pendingExpenseId = null;
+  let savingExpense = false;
+  let previewShares = null;
 
   form.addEventListener('submit', (event) => {
     /* A form with no action would still navigate, and a navigation is a lost create. */
@@ -388,6 +441,16 @@ export function init(doc = document, win = window) {
     hostSocket.send(JSON.stringify({ t: 'mode', mode: next }));
   });
 
+  addExpenseButton.addEventListener('click', openExpenseSheet);
+  expenseForm.addEventListener('submit', (event) => {
+    void saveExpense(event);
+  });
+  expenseCancel.addEventListener('click', closeExpenseSheet);
+  splitModes.forEach((radio) => radio.addEventListener('change', renderSplit));
+  splitInputs.addEventListener('input', updatePreview);
+  splitInputs.addEventListener('change', updatePreview);
+  expenseAmount.addEventListener('input', updatePreview);
+
   /**
    * Submit once, or explain why not.
    *
@@ -419,6 +482,7 @@ export function init(doc = document, win = window) {
         code,
         secret,
         name: fields.name,
+        displayName: fields.displayName,
         currency: fields.currency
       });
 
@@ -436,7 +500,13 @@ export function init(doc = document, win = window) {
       }
 
       hideError();
-      showGroup({ code, name: fields.name, displayName: fields.displayName });
+      showGroup({
+        code,
+        name: fields.name,
+        displayName: fields.displayName,
+        memberId: payload.hostId,
+        currency: fields.currency
+      });
       remember({
         groupId: payload.groupId,
         memberId: payload.hostId,
@@ -500,10 +570,28 @@ export function init(doc = document, win = window) {
   }
 
   /** Replace the form with the group, in place: no modal, no confirmation, no second screen. */
-  function showGroup({ code, name, displayName, role = 'organizer' }) {
+  function showGroup({ code, name, displayName, role = 'organizer', memberId = null, currency = DEFAULT_CURRENCY }) {
     group = { code };
     resumeSession = null;
     hideNotice();
+
+    groupId = null;
+    groupIdPromise = groupIdFromCode(code);
+    void groupIdPromise.then((value) => {
+      groupId = value;
+    });
+    groupKeyPromise = deriveGroupKey(code);
+    selfId = memberId;
+    selfName = displayName || 'You';
+    groupCurrency = normalizeCurrency(currency);
+    members = new Map();
+    if (memberId) members.set(memberId, selfName);
+    ledger = new Map();
+    expenseDraftId = null;
+    pendingExpenseId = null;
+    savingExpense = false;
+    closeExpenseSheet();
+    renderLedger();
 
     groupNameDisplay.textContent = name;
     groupCode.textContent = formatCode(code);
@@ -605,9 +693,11 @@ export function init(doc = document, win = window) {
   /** The join sheet, with an optional code already in the field. */
   function showJoin({ code = '', error = '', resume = null } = {}) {
     closeJoinSocket();
+    closeExpenseSheet();
     hideNotice();
     group = null;
     resumeSession = resume;
+    ledgerPanel.hidden = true;
     createPanel.hidden = true;
     groupHeader.hidden = true;
     emptyLedger.hidden = true;
@@ -630,9 +720,11 @@ export function init(doc = document, win = window) {
   function showCreate() {
     closeJoinSocket();
     closeHostSocket();
+    closeExpenseSheet();
     hideNotice();
     group = null;
     resumeSession = null;
+    ledgerPanel.hidden = true;
     joinPanel.hidden = true;
     waitingPanel.hidden = true;
     groupHeader.hidden = true;
@@ -643,10 +735,12 @@ export function init(doc = document, win = window) {
   }
 
   function showWaiting(code) {
+    closeExpenseSheet();
     createPanel.hidden = true;
     joinPanel.hidden = true;
     groupHeader.hidden = true;
     emptyLedger.hidden = true;
+    ledgerPanel.hidden = true;
     waitingPanel.hidden = false;
     waitingCode.textContent = formatCode(code);
     waitingTitle.textContent = 'Waiting for the organizer';
@@ -856,22 +950,26 @@ export function init(doc = document, win = window) {
               code,
               name,
               displayName: session.displayName,
-              role: 'organizer'
+              role: 'organizer',
+              memberId: session.memberId
             });
             shown = true;
           }
           await renderRoster(frame, Promise.resolve(key));
+          await applyGroupState(frame, Promise.resolve(key));
         } else {
           if (!shown) {
             showGroup({
               code,
               name,
               displayName: session.displayName,
-              role: 'member'
+              role: 'member',
+              memberId: session.memberId
             });
             shown = true;
           }
           applyMode(frame.joinMode, 'member');
+          await applyGroupState(frame, Promise.resolve(key));
         }
 
         remember({
@@ -884,6 +982,13 @@ export function init(doc = document, win = window) {
         return;
       }
 
+      if (frame.t === 'record') {
+        void handleRecordFrame(frame);
+        return;
+      }
+
+      if (frame.t === 'conflict' && handleExpenseConflict(frame)) return;
+
       if (frame.t === 'removed') {
         settled = true;
         forget(groupId);
@@ -893,6 +998,7 @@ export function init(doc = document, win = window) {
       }
 
       if (frame.t === 'refused') {
+        if (handleExpenseRefusal(frame)) return;
         settled = true;
         closeJoinSocket();
         if (frame.code === 'rate_limited') {
@@ -909,10 +1015,12 @@ export function init(doc = document, win = window) {
         hostSocket = null;
         rosterEmpty.textContent = 'Connection lost. Reload to continue.';
         rosterEmpty.hidden = false;
+        expenseConnectionLost();
         return;
       }
       if (joinSocket !== socket) return;
       joinSocket = null;
+      expenseConnectionLost();
       if (settled) return;
       showJoin({ code, error: 'The group could not be reached. Try again.', resume: session });
     });
@@ -967,6 +1075,7 @@ export function init(doc = document, win = window) {
            a join is what replaces the waiting screen. */
         if (group) {
           applyMode(frame.joinMode, 'member');
+          void applyGroupState(frame, groupKeyPromise);
           return;
         }
 
@@ -978,14 +1087,28 @@ export function init(doc = document, win = window) {
         } catch {
           /* the name stays a neutral label rather than an unreadable blob */
         }
-        showGroup({ code, name, displayName: displayName || joinNameInput.value.trim(), role: 'member' });
+        showGroup({
+          code,
+          name,
+          displayName: displayName || joinNameInput.value.trim(),
+          role: 'member',
+          memberId
+        });
         applyMode(frame.joinMode, 'member');
+        void applyGroupState(frame, groupKeyPromise);
         remember({ groupId, memberId, secret, displayName, code });
         if (frame.openAdmit) {
           setStatus("You're in — this group lets anyone with the code join.");
         }
         return;
       }
+
+      if (frame.t === 'record') {
+        void handleRecordFrame(frame);
+        return;
+      }
+
+      if (frame.t === 'conflict' && handleExpenseConflict(frame)) return;
 
       if (frame.t === 'removed') {
         settled = true;
@@ -996,6 +1119,7 @@ export function init(doc = document, win = window) {
       }
 
       if (frame.t === 'refused') {
+        if (handleExpenseRefusal(frame)) return;
         settled = true;
         forget(groupId);
         closeJoinSocket();
@@ -1006,6 +1130,7 @@ export function init(doc = document, win = window) {
     socket.addEventListener('close', () => {
       if (joinSocket !== socket) return;
       joinSocket = null;
+      expenseConnectionLost();
       if (settled) return;
       waitingCopy.textContent = 'The connection closed before the group answered. Try again.';
     });
@@ -1071,9 +1196,16 @@ export function init(doc = document, win = window) {
 
       if (frame.t === 'state') {
         void renderRoster(frame, key);
+        void applyGroupState(frame, key);
         return;
       }
+      if (frame.t === 'record') {
+        void handleRecordFrame(frame);
+        return;
+      }
+      if (frame.t === 'conflict' && handleExpenseConflict(frame)) return;
       if (frame.t === 'refused') {
+        if (handleExpenseRefusal(frame)) return;
         rosterEmpty.textContent = 'That request could not be completed.';
         rosterEmpty.hidden = false;
         toggleModeButton.disabled = false;
@@ -1085,6 +1217,8 @@ export function init(doc = document, win = window) {
       hostSocket = null;
       rosterEmpty.textContent = 'Connection lost. Reload to continue.';
       rosterEmpty.hidden = false;
+      toggleModeButton.disabled = true;
+      expenseConnectionLost();
     });
 
     socket.addEventListener('error', () => {
@@ -1134,7 +1268,9 @@ export function init(doc = document, win = window) {
 
     const key = await keyPromise;
     const pending = frame.roster.filter((member) => member.status === 'pending');
-    const approved = frame.roster.filter((member) => member.status === 'approved');
+    const approved = frame.roster.filter(
+      (member) => member.status === 'approved' && member.id !== frame.memberId
+    );
 
     applyMode(frame.joinMode, 'host');
     disarm();
@@ -1215,6 +1351,412 @@ export function init(doc = document, win = window) {
       chip.append(label, remove);
       rosterApproved.append(chip);
     }
+  }
+
+  /* ------------------------------------------------------------- the ledger */
+
+  function expenseMode() {
+    return splitModes.find((radio) => radio.checked)?.value ?? 'equal';
+  }
+
+  function splitMembers() {
+    return [...members.entries()].sort(
+      (left, right) => left[1].localeCompare(right[1]) || (left[0] < right[0] ? -1 : 1)
+    );
+  }
+
+  function expenseFailure(message, field) {
+    expenseError.textContent = message;
+    expenseError.hidden = false;
+    field?.focus?.();
+  }
+
+  function todayDate() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  }
+
+  function nowTime() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  }
+
+  /** The socket this page is already holding: the host's, or the member's. */
+  function activeSocket() {
+    if (hostSocket && hostSocket.readyState === 1) return hostSocket;
+    if (joinSocket && joinSocket.readyState === 1) return joinSocket;
+    return null;
+  }
+
+  async function decryptRecord(key, record, groupIdValue) {
+    try {
+      const value = await open(key, record.blob, expenseAad(groupIdValue, record.id));
+      if (
+        value === null ||
+        typeof value !== 'object' ||
+        typeof value.description !== 'string' ||
+        !Number.isSafeInteger(value.amountPaise)
+      ) {
+        return null;
+      }
+      return value;
+    } catch {
+      return null;
+    }
+  }
+
+  /** The people and the ledger, rebuilt from a state frame the viewer is allowed to see. */
+  async function applyGroupState(frame, keyPromise) {
+    const key = await keyPromise;
+    const groupIdValue = await groupIdPromise;
+    if (!groupIdValue) return;
+    groupId = groupIdValue;
+    selfId = frame.memberId;
+
+    if (frame.metaBlob) {
+      try {
+        const meta = await open(key, frame.metaBlob);
+        if (meta?.currency) groupCurrency = normalizeCurrency(meta.currency);
+      } catch {
+        /* the selected currency stays the fallback */
+      }
+    }
+
+    const previousMembers = [...members.keys()].join(',');
+    const nextMembers = new Map();
+    for (const member of frame.roster ?? []) {
+      if (member.status !== 'approved') continue;
+      nextMembers.set(member.id, await nameOf(key, member.nameBlob));
+    }
+    if (selfId && !nextMembers.has(selfId)) nextMembers.set(selfId, selfName || 'You');
+    members = nextMembers;
+
+    const nextLedger = new Map();
+    for (const record of frame.records ?? []) {
+      if (record.deleted) continue;
+      const value = await decryptRecord(key, record, groupIdValue);
+      if (value) nextLedger.set(record.id, { ...record, value });
+    }
+    ledger = nextLedger;
+
+    renderLedger();
+    if (expenseSheetOpen) {
+      renderPayerOptions();
+      if ([...members.keys()].join(',') !== previousMembers) renderSplit();
+      else updatePreview();
+    }
+  }
+
+  function renderLedger() {
+    const rows = [...ledger.values()].sort(
+      (left, right) => (left.at ?? 0) - (right.at ?? 0) || (left.id < right.id ? -1 : 1)
+    );
+
+    ledgerList.textContent = '';
+    if (groupHeader.hidden) {
+      ledgerPanel.hidden = true;
+      return;
+    }
+    ledgerPanel.hidden = rows.length === 0;
+    emptyLedger.hidden = rows.length !== 0;
+
+    for (const record of rows) {
+      const value = record.value;
+      const row = doc.createElement('li');
+      row.className = 'expense-row';
+
+      const left = doc.createElement('div');
+      const title = doc.createElement('h3');
+      title.textContent = value.description;
+      const meta = doc.createElement('p');
+      meta.className = 'expense-meta';
+      const payer = members.get(value.paidBy) || 'Someone';
+      meta.textContent = `Paid by ${payer} · ${value.date} ${value.time}`;
+      left.append(title, meta);
+
+      const amount = doc.createElement('span');
+      amount.className = 'expense-amount';
+      amount.textContent = formatPaise(value.amountPaise, groupCurrency);
+
+      row.append(left, amount);
+      ledgerList.append(row);
+    }
+  }
+
+  function renderPayerOptions() {
+    const current = expensePayer.value;
+    expensePayer.textContent = '';
+
+    for (const [id, name] of splitMembers()) {
+      const option = doc.createElement('option');
+      option.value = id;
+      option.textContent = name;
+      expensePayer.append(option);
+    }
+
+    if (current && members.has(current)) expensePayer.value = current;
+    else if (selfId && members.has(selfId)) expensePayer.value = selfId;
+    else if (expensePayer.options.length > 0) expensePayer.selectedIndex = 0;
+  }
+
+  function renderSplit() {
+    const entries = splitMembers();
+    splitInputs.textContent = '';
+    const mode = expenseMode();
+
+    if (mode === 'equal') {
+      splitNote.textContent = `Split equally between ${entries.length} ${
+        entries.length === 1 ? 'person' : 'people'
+      }.`;
+    } else if (mode === 'chosen') {
+      splitNote.textContent = 'Tick the people who share this expense.';
+      for (const [id, name] of entries) {
+        const label = doc.createElement('label');
+        const text = doc.createElement('span');
+        text.textContent = name;
+        const box = doc.createElement('input');
+        box.type = 'checkbox';
+        box.checked = true;
+        box.dataset.memberId = id;
+        label.append(text, box);
+        splitInputs.append(label);
+      }
+    } else {
+      const defaults = defaultPercentages(entries.map(([id]) => id));
+      splitNote.textContent = 'The percentages must total 100.';
+      for (const [id, name] of entries) {
+        const label = doc.createElement('label');
+        const text = doc.createElement('span');
+        text.textContent = name;
+        const input = doc.createElement('input');
+        input.type = 'number';
+        input.min = '0';
+        input.max = '100';
+        input.step = '0.1';
+        input.value = String(defaults[id] ?? 0);
+        input.dataset.memberId = id;
+        label.append(text, input);
+        splitInputs.append(label);
+      }
+    }
+
+    updatePreview();
+  }
+
+  function currentSplit() {
+    const amount = parseAmount(expenseAmount.value);
+    if (!amount.ok) return { ok: false, message: amount.message };
+
+    const entries = splitMembers();
+    if (entries.length === 0) return { ok: false, message: 'No one is in the group yet.' };
+
+    const mode = expenseMode();
+    if (mode === 'equal') {
+      return splitFor({
+        mode,
+        amountPaise: amount.paise,
+        memberIds: entries.map(([id]) => id)
+      });
+    }
+    if (mode === 'chosen') {
+      const chosenIds = [...splitInputs.querySelectorAll('input[type="checkbox"]:checked')].map(
+        (input) => input.dataset.memberId
+      );
+      return splitFor({ mode, amountPaise: amount.paise, chosenIds });
+    }
+
+    const percentages = {};
+    for (const input of splitInputs.querySelectorAll('input[type="number"]')) {
+      percentages[input.dataset.memberId] = Number(input.value);
+    }
+    return splitFor({ mode, amountPaise: amount.paise, percentages });
+  }
+
+  function updatePreview() {
+    previewShares = null;
+    splitPreview.textContent = '';
+    const split = currentSplit();
+    if (!split.ok) {
+      splitNote.textContent = split.message;
+      return;
+    }
+
+    previewShares = split.shares;
+    const names = new Map(splitMembers());
+    for (const [id, paise] of Object.entries(split.shares)) {
+      const row = doc.createElement('li');
+      const name = doc.createElement('span');
+      name.textContent = names.get(id) || 'Someone';
+      const amount = doc.createElement('span');
+      amount.textContent = formatPaise(paise, groupCurrency);
+      row.append(name, amount);
+      splitPreview.append(row);
+    }
+
+    const total = Object.values(split.shares).reduce((sum, paise) => sum + paise, 0);
+    splitNote.textContent = `${formatPaise(total, groupCurrency)} split between ${
+      Object.keys(split.shares).length
+    } ${Object.keys(split.shares).length === 1 ? 'person' : 'people'}.`;
+  }
+
+  function openExpenseSheet() {
+    if (!group) return;
+    expenseSheetOpen = true;
+    expenseDraftId = randomSecret();
+    pendingExpenseId = null;
+    savingExpense = false;
+    expenseError.hidden = true;
+    expenseError.textContent = '';
+    expenseDescription.value = '';
+    expenseAmount.value = '';
+    expenseNote.value = '';
+    expenseDate.value = todayDate();
+    expenseTime.value = nowTime();
+    expenseSave.disabled = false;
+    expenseCancel.disabled = false;
+    expenseSave.textContent = 'Save expense';
+    expenseCurrency.textContent = groupCurrency;
+    splitModes.forEach((radio) => {
+      radio.checked = radio.value === 'equal';
+    });
+
+    renderPayerOptions();
+    renderSplit();
+    expensePanel.hidden = false;
+    expenseDescription.focus();
+  }
+
+  function closeExpenseSheet() {
+    expenseSheetOpen = false;
+    expensePanel.hidden = true;
+    expenseError.hidden = true;
+    expenseError.textContent = '';
+    pendingExpenseId = null;
+    savingExpense = false;
+    expenseSave.disabled = false;
+    expenseCancel.disabled = false;
+    expenseSave.textContent = 'Save expense';
+    splitInputs.textContent = '';
+    splitPreview.textContent = '';
+    splitNote.textContent = '';
+    renderLedger();
+  }
+
+  function expenseConnectionLost() {
+    if (!savingExpense) return;
+    savingExpense = false;
+    expenseSave.disabled = false;
+    expenseCancel.disabled = false;
+    expenseSave.textContent = 'Save expense';
+    expenseFailure('The group is not connected. Try again.', expenseSave);
+  }
+
+  async function saveExpense(event) {
+    event.preventDefault();
+    if (!group || savingExpense) return;
+
+    expenseError.hidden = true;
+    const description = validateDescription(expenseDescription.value);
+    if (!description.ok) return expenseFailure(description.message, expenseDescription);
+    const amount = parseAmount(expenseAmount.value);
+    if (!amount.ok) return expenseFailure(amount.message, expenseAmount);
+    const date = validateDate(expenseDate.value);
+    if (!date.ok) return expenseFailure(date.message, expenseDate);
+    const time = validateTime(expenseTime.value);
+    if (!time.ok) return expenseFailure(time.message, expenseTime);
+    const note = validateNote(expenseNote.value);
+    if (!note.ok) return expenseFailure(note.message, expenseNote);
+    if (!members.has(expensePayer.value)) {
+      return expenseFailure('Choose who paid.', expensePayer);
+    }
+
+    const split = currentSplit();
+    if (!split.ok) return expenseFailure(split.message, splitInputs);
+    previewShares = split.shares;
+
+    const socket = activeSocket();
+    if (!socket) return expenseFailure('The group is not connected. Try again.', expenseSave);
+
+    savingExpense = true;
+    expenseSave.disabled = true;
+    expenseCancel.disabled = true;
+    expenseSave.textContent = 'Saving…';
+
+    try {
+      const key = await groupKeyPromise;
+      const groupIdValue = await groupIdPromise;
+      const value = {
+        description: description.value,
+        amountPaise: amount.paise,
+        paidBy: expensePayer.value,
+        split: split.shares,
+        date: date.value,
+        time: time.value,
+        note: note.value
+      };
+      const blob = await seal(key, value, expenseAad(groupIdValue, expenseDraftId));
+      pendingExpenseId = expenseDraftId;
+      socket.send(
+        JSON.stringify({ t: 'put', id: expenseDraftId, base: 0, blob, deleted: false })
+      );
+    } catch {
+      savingExpense = false;
+      expenseSave.disabled = false;
+      expenseCancel.disabled = false;
+      expenseSave.textContent = 'Save expense';
+      expenseFailure('The expense could not be sealed. Try again.', expenseSave);
+    }
+  }
+
+  async function handleRecordFrame(frame) {
+    if (!groupKeyPromise) return;
+    const key = await groupKeyPromise;
+    const groupIdValue = await groupIdPromise;
+    if (frame.deleted) return;
+
+    const value = await decryptRecord(key, frame, groupIdValue);
+    if (!value) return;
+    ledger.set(frame.id, { ...frame, value });
+    renderLedger();
+
+    if (frame.id === pendingExpenseId) {
+      pendingExpenseId = null;
+      savingExpense = false;
+      closeExpenseSheet();
+      setStatus('Expense added.');
+    }
+  }
+
+  function handleExpenseRefusal(frame) {
+    if (!savingExpense || frame.id !== pendingExpenseId) return false;
+    savingExpense = false;
+    pendingExpenseId = null;
+    expenseSave.disabled = false;
+    expenseCancel.disabled = false;
+    expenseSave.textContent = 'Save expense';
+    const message =
+      frame.code === 'too_large'
+        ? 'That expense is too large to save.'
+        : frame.code === 'deleted'
+          ? 'This expense was deleted.'
+          : frame.code === 'unapproved'
+            ? 'You are not approved to add expenses.'
+            : 'The expense could not be saved. Try again.';
+    expenseFailure(message, expenseSave);
+    return true;
+  }
+
+  function handleExpenseConflict(frame) {
+    if (!savingExpense || frame.id !== pendingExpenseId) return false;
+    savingExpense = false;
+    pendingExpenseId = null;
+    expenseSave.disabled = false;
+    expenseCancel.disabled = false;
+    expenseSave.textContent = 'Save expense';
+    expenseFailure('This expense changed elsewhere. Try again.', expenseSave);
+    return true;
   }
 
   /* A short message in the live region, cleared after a few seconds. */

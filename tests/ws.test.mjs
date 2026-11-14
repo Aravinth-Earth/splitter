@@ -768,7 +768,7 @@ test('a stale base is a conflict, and a tombstone is final', async (t) => {
   assert.equal(tombstone.rev, 3);
 
   host.send({ t: 'put', id, base: 3, blob: first, deleted: false });
-  assert.deepEqual(await host.next(), { t: 'refused', code: 'deleted' });
+  assert.deepEqual(await host.next(), { t: 'refused', code: 'deleted', id });
 });
 
 test('a pending socket cannot write, and the frame cap is enforced', async (t) => {
@@ -795,19 +795,21 @@ test('a pending socket cannot write, and the frame cap is enforced', async (t) =
   assert.equal((await pending.next()).t, 'waiting');
   await host.next();
 
+  const writeId = randomSecret();
   pending.send({
     t: 'put',
-    id: randomSecret(),
+    id: writeId,
     base: 0,
     blob: await seal(group.key, { amount: 1 }, 'sp1:rec:test'),
     deleted: false
   });
-  assert.deepEqual(await pending.next(), { t: 'refused', code: 'unapproved' });
+  assert.deepEqual(await pending.next(), { t: 'refused', code: 'unapproved', id: writeId });
   await host.silence(400);
 
+  const hugeId = randomSecret();
   const huge = { iv: 'A'.repeat(16), ct: 'A'.repeat(70_000) };
-  host.send({ t: 'put', id: randomSecret(), base: 0, blob: huge, deleted: false });
-  assert.deepEqual(await host.next(), { t: 'refused', code: 'too_large' });
+  host.send({ t: 'put', id: hugeId, base: 0, blob: huge, deleted: false });
+  assert.deepEqual(await host.next(), { t: 'refused', code: 'too_large', id: hugeId });
 });
 
 
