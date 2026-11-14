@@ -74,9 +74,14 @@ export class Group {
    *
    * @returns {Promise<{ok: true, created: boolean} | {ok: false, error: string}>}
    */
-  async init({ hostId, nameBlob, metaBlob = null } = {}) {
+  async init({ hostId, nameBlob, hostNameBlob = null, metaBlob = null } = {}) {
     if (!isId(hostId)) return { ok: false, error: 'hostId' };
     if (!isSealed(nameBlob)) return { ok: false, error: 'blob' };
+    /* The host's own name is optional for a group created before it was sent; when present it is
+       the host's roster entry, sealed like every other member name. */
+    if (hostNameBlob !== null && hostNameBlob !== undefined && !isSealed(hostNameBlob)) {
+      return { ok: false, error: 'blob' };
+    }
     /* Absent meta is normal — a group can be created with only a name — but a meta that is present
        and unsealed is a caller error, not something to store half of. */
     if (metaBlob !== null && metaBlob !== undefined && !isSealed(metaBlob)) {
@@ -91,6 +96,7 @@ export class Group {
       joinMode: 'approval',
       rev: 0,
       nameBlob,
+      hostNameBlob: hostNameBlob ?? null,
       metaBlob: metaBlob ?? null
     });
     return { ok: true, created: true };
@@ -542,6 +548,9 @@ export class Group {
        group's, not a person's, and putting it in a member slot would name the organizer after the
        group. The host's own name is the one the page already holds. */
     const roster = [];
+    if (isSealed(meta.hostNameBlob)) {
+      roster.push({ id: meta.hostId, status: 'approved', nameBlob: meta.hostNameBlob });
+    }
     const members = await this.members();
     for (const [key, entry] of members) {
       if (entry.status === 'removed') continue;
@@ -564,6 +573,8 @@ export class Group {
       role,
       joinMode: meta.joinMode === 'open' ? 'open' : 'approval',
       nameBlob: meta.nameBlob,
+      metaBlob: meta.metaBlob ?? null,
+      hostId: meta.hostId,
       roster,
       records
     };

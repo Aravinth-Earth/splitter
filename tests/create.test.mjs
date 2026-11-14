@@ -366,6 +366,7 @@ test('create: a successful create reserves, initialises, and releases nothing', 
   assert.deepEqual(calls[1].body, {
     hostId: body.hostId,
     nameBlob: body.nameBlob,
+    hostNameBlob: null,
     metaBlob: body.metaBlob
   });
 });

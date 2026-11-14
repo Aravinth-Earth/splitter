@@ -124,27 +124,27 @@ function socketUrl(baseUrl, groupId) {
   return `${baseUrl.replace(/^http/, 'ws')}/api/ws?room=${groupId}`;
 }
 
-async function createGroup(baseUrl) {
+async function createGroup(baseUrl, { hostName = null } = {}) {
   const code = generateCode();
   const groupId = await groupIdFromCode(code);
   const key = await deriveGroupKey(code);
   const hostSecret = randomSecret();
   const hostId = await idFromSecret(hostSecret);
   const nameBlob = await seal(key, { name: 'Host' });
+  const hostNameBlob = hostName === null ? null : await seal(key, { name: hostName });
+  const metaBlob = await seal(key, { currency: 'INR' });
+
+  const body = { groupId, hostId, nameBlob, metaBlob };
+  if (hostNameBlob) body.hostNameBlob = hostNameBlob;
 
   const response = await fetch(`${baseUrl}/api/create`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      groupId,
-      hostId,
-      nameBlob,
-      metaBlob: await seal(key, { currency: 'INR' })
-    })
+    body: JSON.stringify(body)
   });
   assert.equal(response.status, 200, 'the group must exist before a socket can reach it');
 
-  return { code, groupId, key, hostSecret, hostId, nameBlob };
+  return { code, groupId, key, hostSecret, hostId, nameBlob, hostNameBlob, metaBlob };
 }
 
 test('the member id the server derives is the id the browser derives', async () => {
@@ -808,4 +808,23 @@ test('a pending socket cannot write, and the frame cap is enforced', async (t) =
   const huge = { iv: 'A'.repeat(16), ct: 'A'.repeat(70_000) };
   host.send({ t: 'put', id: randomSecret(), base: 0, blob: huge, deleted: false });
   assert.deepEqual(await host.next(), { t: 'refused', code: 'too_large' });
+});
+
+
+test('the host name and the group meta travel in state when present', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl, { hostName: 'Organizer' });
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+
+  const state = await host.next();
+  assert.equal(state.hostId, group.hostId);
+  assert.deepEqual(state.metaBlob, group.metaBlob, 'the currency meta reaches a key holder');
+  const self = state.roster.find((member) => member.id === group.hostId);
+  assert.ok(self, 'the host is a roster entry when its name was sent');
+  assert.equal(self.status, 'approved');
+  assert.deepEqual(self.nameBlob, group.hostNameBlob);
 });
