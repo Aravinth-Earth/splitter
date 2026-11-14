@@ -79,6 +79,11 @@ export function expenseAad(groupId, id) {
   return `sp1:rec:${groupId}/kind:expense/id:${id}`;
 }
 
+/** A settlement has its own label, so it cannot be opened as an expense or the other way round. */
+export function settlementAad(groupId, id) {
+  return `sp1:rec:${groupId}/kind:settlement/id:${id}`;
+}
+
 /** A description as it will be stored, counted by code point like the group name. */
 export function validateDescription(input) {
   if (typeof input !== 'string') return { ok: false, message: 'Enter a description.' };

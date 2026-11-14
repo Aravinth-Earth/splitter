@@ -50,6 +50,7 @@ import {
   formatPaise,
   parseAmount,
   parseCustomAmount,
+  settlementAad,
   splitFor,
   validateDate,
   validateDescription,
@@ -335,6 +336,19 @@ export function init(doc = document, win = window) {
   const balanceList = doc.getElementById('balance-list');
   const transferList = doc.getElementById('transfer-list');
   const settleNote = doc.getElementById('settle-note');
+  const paymentList = doc.getElementById('payment-list');
+  const recordPaymentButton = doc.getElementById('record-payment');
+  const settlementPanel = doc.getElementById('settlement-panel');
+  const settlementForm = doc.getElementById('settlement-form');
+  const settleFrom = doc.getElementById('settle-from');
+  const settleTo = doc.getElementById('settle-to');
+  const settleAmount = doc.getElementById('settle-amount');
+  const settleDate = doc.getElementById('settle-date');
+  const settleTime = doc.getElementById('settle-time');
+  const settleNoteInput = doc.getElementById('settle-note');
+  const settleError = doc.getElementById('settle-error');
+  const settleSave = doc.getElementById('settle-save');
+  const settleCancel = doc.getElementById('settle-cancel');
   const addExpenseButton = doc.getElementById('add-expense');
   const expensePanel = doc.getElementById('expense-panel');
   const expenseForm = doc.getElementById('expense-form');
@@ -415,6 +429,10 @@ export function init(doc = document, win = window) {
   let pendingDeleteId = null;
   let editingExpense = null;
   let customSeed = null;
+  let lastBalances = {};
+  let settlementDraftId = null;
+  let pendingSettlementId = null;
+  let savingSettlement = false;
   let savingExpense = false;
   let previewShares = null;
   let armedDeleteId = null;
@@ -466,6 +484,11 @@ export function init(doc = document, win = window) {
   splitInputs.addEventListener('input', updatePreview);
   splitInputs.addEventListener('change', updatePreview);
   expenseAmount.addEventListener('input', updatePreview);
+  recordPaymentButton.addEventListener('click', () => openSettlement(null));
+  settlementForm.addEventListener('submit', (event) => {
+    void saveSettlement(event);
+  });
+  settleCancel.addEventListener('click', closeSettlementSheet);
 
   /**
    * Submit once, or explain why not.
@@ -633,6 +656,7 @@ export function init(doc = document, win = window) {
     pendingExpenseId = null;
     savingExpense = false;
     closeExpenseSheet();
+    closeSettlementSheet();
     renderLedger();
 
     groupNameDisplay.textContent = name;
@@ -736,6 +760,7 @@ export function init(doc = document, win = window) {
   function showJoin({ code = '', error = '', resume = null } = {}) {
     closeJoinSocket();
     closeExpenseSheet();
+    closeSettlementSheet();
     hideNotice();
     group = null;
     resumeSession = resume;
@@ -764,6 +789,7 @@ export function init(doc = document, win = window) {
     closeJoinSocket();
     closeHostSocket();
     closeExpenseSheet();
+    closeSettlementSheet();
     hideNotice();
     group = null;
     resumeSession = null;
@@ -780,6 +806,7 @@ export function init(doc = document, win = window) {
 
   function showWaiting(code) {
     closeExpenseSheet();
+    closeSettlementSheet();
     createPanel.hidden = true;
     joinPanel.hidden = true;
     groupHeader.hidden = true;
@@ -1360,20 +1387,29 @@ export function init(doc = document, win = window) {
   }
 
   async function decryptRecord(key, record, groupIdValue) {
-    try {
-      const value = await open(key, record.blob, expenseAad(groupIdValue, record.id));
-      if (
-        value === null ||
-        typeof value !== 'object' ||
-        typeof value.description !== 'string' ||
-        !Number.isSafeInteger(value.amountPaise)
-      ) {
-        return null;
+    for (const aad of [expenseAad(groupIdValue, record.id), settlementAad(groupIdValue, record.id)]) {
+      try {
+        const value = await open(key, record.blob, aad);
+        if (value === null || typeof value !== 'object') continue;
+        if (value.kind === 'settlement') {
+          if (
+            typeof value.from === 'string' &&
+            typeof value.to === 'string' &&
+            Number.isSafeInteger(value.amountPaise) &&
+            value.amountPaise > 0
+          ) {
+            return value;
+          }
+          continue;
+        }
+        if (typeof value.description === 'string' && Number.isSafeInteger(value.amountPaise)) {
+          return value;
+        }
+      } catch {
+        /* try the other label */
       }
-      return value;
-    } catch {
-      return null;
     }
+    return null;
   }
 
   /** The people and the ledger, rebuilt from a state frame the viewer is allowed to see. */
@@ -1423,7 +1459,9 @@ export function init(doc = document, win = window) {
   }
 
   function renderLedger() {
-    const rows = [...ledger.values()].sort(
+    const rows = [...ledger.values()]
+      .filter((record) => record.pending || record.value?.kind !== 'settlement')
+      .sort(
       (left, right) => (left.at ?? 0) - (right.at ?? 0) || (left.id < right.id ? -1 : 1)
     );
 
@@ -1508,7 +1546,10 @@ export function init(doc = document, win = window) {
     }
 
     const expenses = [...ledger.values()]
-      .filter((record) => !record.pending && !record.deleted)
+      .filter(
+        (record) =>
+          !record.pending && !record.deleted && record.value?.kind !== 'settlement'
+      )
       .map((record) => ({
         id: record.id,
         amountPaise: record.value.amountPaise,
@@ -1516,13 +1557,22 @@ export function init(doc = document, win = window) {
         split: record.value.split
       }));
 
+    const settlements = [...ledger.values()]
+      .filter((record) => !record.pending && !record.deleted && record.value?.kind === 'settlement')
+      .map((record) => ({
+        from: record.value.from,
+        to: record.value.to,
+        amountPaise: record.value.amountPaise
+      }));
+
     const referenced = new Set(members.keys());
     for (const expense of expenses) {
       referenced.add(expense.paidBy);
       for (const id of Object.keys(expense.split)) referenced.add(id);
     }
-    const map = balances([...referenced], expenses);
+    const map = balances([...referenced], expenses, settlements);
     const proposal = settle(map);
+    lastBalances = map;
     const names = new Map(members);
 
     balanceList.textContent = '';
@@ -1551,10 +1601,45 @@ export function init(doc = document, win = window) {
     transferList.textContent = '';
     for (const transfer of proposal.transfers) {
       const row = doc.createElement('li');
-      row.textContent = `${names.get(transfer.from) || 'Someone'} pays ${
+      const label = doc.createElement('span');
+      label.textContent = `${names.get(transfer.from) || 'Someone'} pays ${
         names.get(transfer.to) || 'Someone'
       } ${formatPaise(transfer.amountPaise, groupCurrency)}`;
+      const pay = doc.createElement('button');
+      pay.type = 'button';
+      pay.className = 'secondary';
+      pay.textContent = 'Mark as paid';
+      pay.addEventListener('click', () => openSettlement(transfer));
+      row.append(label, pay);
       transferList.append(row);
+    }
+
+    paymentList.textContent = '';
+    const payments = [...ledger.values()]
+      .filter(
+        (record) => !record.pending && !record.deleted && record.value?.kind === 'settlement'
+      )
+      .sort((left, right) => (left.at ?? 0) - (right.at ?? 0));
+    if (payments.length === 0) {
+      const row = doc.createElement('li');
+      row.className = 'muted';
+      row.textContent = 'No payments recorded yet.';
+      paymentList.append(row);
+    } else {
+      for (const record of payments) {
+        const row = doc.createElement('li');
+        const label = doc.createElement('span');
+        label.textContent = `${names.get(record.value.from) || 'Someone'} paid ${
+          names.get(record.value.to) || 'Someone'
+        } ${formatPaise(record.value.amountPaise, groupCurrency)} · ${record.value.date}`;
+        const remove = doc.createElement('button');
+        remove.type = 'button';
+        remove.className = 'secondary';
+        remove.textContent = 'Delete';
+        remove.addEventListener('click', () => armDelete(record, remove));
+        row.append(label, remove);
+        paymentList.append(row);
+      }
     }
 
     const pending = [...ledger.values()].some((record) => record.pending);
@@ -1780,6 +1865,7 @@ export function init(doc = document, win = window) {
   function openExpenseSheet(record = null) {
     if (!group || record?.deleted) return;
 
+    closeSettlementSheet();
     expenseSheetOpen = true;
     editingExpense = record;
     customSeed = record ? new Map(Object.entries(record.value.split ?? {})) : null;
@@ -1832,6 +1918,136 @@ export function init(doc = document, win = window) {
     renderLedger();
   }
 
+  function settlementPeople() {
+    const ids = new Set([...members.keys(), ...Object.keys(lastBalances)]);
+    return [...ids]
+      .map((id) => ({ id, name: members.get(id) || 'Someone' }))
+      .sort((left, right) => left.name.localeCompare(right.name) || (left.id < right.id ? -1 : 1));
+  }
+
+  function fillPeople(select, people, selected) {
+    select.textContent = '';
+    for (const person of people) {
+      const option = doc.createElement('option');
+      option.value = person.id;
+      option.textContent = person.name;
+      select.append(option);
+    }
+    select.value = selected;
+  }
+
+  function settleFailure(message, field) {
+    settleError.textContent = message;
+    settleError.hidden = false;
+    field?.focus?.();
+  }
+
+  function openSettlement(transfer = null) {
+    if (!group) return;
+    closeExpenseSheet();
+    const people = settlementPeople();
+    if (people.length < 2) {
+      setStatus('A payment needs two people in the group.');
+      return;
+    }
+
+    settlementDraftId = randomSecret();
+    pendingSettlementId = null;
+    savingSettlement = false;
+    settleError.hidden = true;
+    settleError.textContent = '';
+    settleSave.disabled = false;
+    settleCancel.disabled = false;
+    settleSave.textContent = 'Record payment';
+    settleAmount.value = transfer ? (transfer.amountPaise / 100).toFixed(2) : '';
+    settleDate.value = todayDate();
+    settleTime.value = nowTime();
+    settleNoteInput.value = '';
+
+    const from = transfer?.from ?? selfId ?? people[0].id;
+    const to = transfer?.to ?? people.find((person) => person.id !== from)?.id ?? people[0].id;
+    fillPeople(settleFrom, people, from);
+    fillPeople(settleTo, people, to);
+
+    settlementPanel.hidden = false;
+    settleAmount.focus();
+  }
+
+  function closeSettlementSheet() {
+    settlementPanel.hidden = true;
+    settleError.hidden = true;
+    settleError.textContent = '';
+    pendingSettlementId = null;
+    savingSettlement = false;
+    settleSave.disabled = false;
+    settleCancel.disabled = false;
+    settleSave.textContent = 'Record payment';
+    settleAmount.value = '';
+    settleNoteInput.value = '';
+  }
+
+  async function saveSettlement(event) {
+    event.preventDefault();
+    if (!group || savingSettlement) return;
+
+    settleError.hidden = true;
+    const people = new Set(settlementPeople().map((person) => person.id));
+    if (!people.has(settleFrom.value) || !people.has(settleTo.value)) {
+      return settleFailure('Choose who paid and who received.', settleFrom);
+    }
+    if (settleFrom.value === settleTo.value) {
+      return settleFailure('A payment needs two different people.', settleTo);
+    }
+    const amount = parseAmount(settleAmount.value);
+    if (!amount.ok) return settleFailure(amount.message, settleAmount);
+    const date = validateDate(settleDate.value);
+    if (!date.ok) return settleFailure(date.message, settleDate);
+    const time = validateTime(settleTime.value);
+    if (!time.ok) return settleFailure(time.message, settleTime);
+    const note = validateNote(settleNoteInput.value);
+    if (!note.ok) return settleFailure(note.message, settleNoteInput);
+
+    const socket = activeSocket();
+    if (!socket) return settleFailure('The group is not connected. Try again.', settleSave);
+
+    savingSettlement = true;
+    settleSave.disabled = true;
+    settleCancel.disabled = true;
+    settleSave.textContent = 'Recording…';
+
+    try {
+      const key = await groupKeyPromise;
+      const groupIdValue = await groupIdPromise;
+      const value = {
+        kind: 'settlement',
+        from: settleFrom.value,
+        to: settleTo.value,
+        amountPaise: amount.paise,
+        date: date.value,
+        time: time.value,
+        note: note.value
+      };
+      const blob = await seal(key, value, settlementAad(groupIdValue, settlementDraftId));
+      pendingSettlementId = settlementDraftId;
+      socket.send(
+        {
+          t: 'put',
+          id: settlementDraftId,
+          base: 0,
+          blob,
+          deleted: false
+        },
+        { id: settlementDraftId }
+      );
+    } catch {
+      savingSettlement = false;
+      settleSave.disabled = false;
+      settleCancel.disabled = false;
+      settleSave.textContent = 'Record payment';
+      settleFailure('The payment could not be sealed. Try again.', settleSave);
+    }
+  }
+
   async function saveExpense(event) {
     event.preventDefault();
     if (!group || savingExpense) return;
@@ -1871,6 +2087,7 @@ export function init(doc = document, win = window) {
       const key = await groupKeyPromise;
       const groupIdValue = await groupIdPromise;
       const value = {
+        kind: 'expense',
         description: description.value,
         amountPaise: amount.paise,
         paidBy: expensePayer.value,
@@ -1963,11 +2180,12 @@ export function init(doc = document, win = window) {
     groupSocket()?.ack(frame.id);
 
     if (frame.deleted) {
+      const wasSettlement = ledger.get(frame.id)?.value?.kind === 'settlement';
       ledger.delete(frame.id);
       renderLedger();
       if (frame.id === pendingDeleteId) {
         pendingDeleteId = null;
-        setStatus('Expense deleted.');
+        setStatus(wasSettlement ? 'Payment deleted.' : 'Expense deleted.');
       }
       if (editingExpense?.id === frame.id) {
         closeExpenseSheet();
@@ -1989,9 +2207,30 @@ export function init(doc = document, win = window) {
       closeExpenseSheet();
       setStatus(wasEditing ? 'Expense saved.' : 'Expense added.');
     }
+    if (frame.id === pendingSettlementId) {
+      pendingSettlementId = null;
+      savingSettlement = false;
+      closeSettlementSheet();
+      setStatus('Payment recorded.');
+    }
   }
 
   function handleExpenseRefusal(frame) {
+    if (frame.id === pendingSettlementId) {
+      savingSettlement = false;
+      pendingSettlementId = null;
+      settleSave.disabled = false;
+      settleCancel.disabled = false;
+      settleSave.textContent = 'Record payment';
+      settleFailure(
+        frame.code === 'unapproved'
+          ? 'You are not approved to record payments.'
+          : 'The payment could not be recorded. Try again.',
+        settleSave
+      );
+      return true;
+    }
+
     if (ledger.get(frame.id)?.pending) {
       groupSocket()?.ack(frame.id);
       ledger.delete(frame.id);
@@ -2037,6 +2276,18 @@ export function init(doc = document, win = window) {
   }
 
   function handleExpenseConflict(frame) {
+    const settling = frame.id === pendingSettlementId;
+    if (settling) {
+      savingSettlement = false;
+      pendingSettlementId = null;
+      settleSave.disabled = false;
+      settleCancel.disabled = false;
+      settleSave.textContent = 'Record payment';
+      if (frame.current) void applyCurrentRecord(frame.current);
+      settleFailure('This record changed elsewhere. Try again.', settleSave);
+      return true;
+    }
+
     if (ledger.get(frame.id)?.pending) {
       groupSocket()?.ack(frame.id);
       void settlePendingConflict(frame);

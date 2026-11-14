@@ -16,6 +16,7 @@ import {
   formatPaise,
   parseAmount,
   parseCustomAmount,
+  settlementAad,
   splitFor,
   validateDate,
   validateDescription,
@@ -154,4 +155,19 @@ test('expense: a custom amount may be blank or zero, and no amount leaves the sh
   assert.equal(parseCustomAmount('1.234').ok, false);
   assert.equal(parseCustomAmount('-1').ok, false);
   assert.equal(parseCustomAmount('1,00,00,000.01').ok, false);
+});
+
+
+test('expense: a settlement cannot be opened as an expense', async () => {
+  const code = 'ABCDEFGHJKMNPQRS';
+  const groupId = 'a'.repeat(64);
+  const id = 'record1';
+  const { deriveGroupKey, open, seal } = await import('../public/crypto.js');
+  const key = await deriveGroupKey(code);
+  const value = { kind: 'settlement', from: 'a', to: 'b', amountPaise: 500 };
+  const sealed = await seal(key, value, settlementAad(groupId, id));
+
+  assert.deepEqual(await open(key, sealed, settlementAad(groupId, id)), value);
+  await assert.rejects(open(key, sealed, expenseAad(groupId, id)), /sealed under this key/);
+  assert.notEqual(settlementAad(groupId, id), expenseAad(groupId, id));
 });

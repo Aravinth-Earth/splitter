@@ -167,6 +167,11 @@
       <h3 class="eyebrow">Settle up</h3>
       <ul id="transfer-list" class="transfer-list"></ul>
       <p id="settle-note" class="muted"></p>
+      <p class="balance-actions">
+        <button id="record-payment" class="secondary" type="button">Record a payment</button>
+      </p>
+      <h3 class="eyebrow">Payments recorded</h3>
+      <ul id="payment-list" class="payment-list"></ul>
     </section>
 
     <section id="expense-panel" class="panel sheet" aria-labelledby="expense-title" hidden>
@@ -225,6 +230,50 @@
         <div class="sheet-actions">
           <button id="expense-save" class="primary" type="submit">Save expense</button>
           <button id="expense-cancel" class="secondary" type="button">Cancel</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="settlement-panel" class="panel sheet" aria-labelledby="settlement-title" hidden>
+      <h2 id="settlement-title">Record a payment</h2>
+      <form id="settlement-form" novalidate>
+        <div class="field-row">
+          <div class="field">
+            <label for="settle-from">From</label>
+            <select id="settle-from"></select>
+          </div>
+          <div class="field">
+            <label for="settle-to">To</label>
+            <select id="settle-to"></select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="settle-amount">Amount</label>
+          <input id="settle-amount" type="text" inputmode="decimal" autocomplete="off" placeholder="0.00" />
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="settle-date">Date</label>
+            <input id="settle-date" type="date" />
+          </div>
+          <div class="field">
+            <label for="settle-time">Time</label>
+            <input id="settle-time" type="time" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="settle-note">Note <span class="muted">(optional)</span></label>
+          <textarea id="settle-note" rows="2"></textarea>
+        </div>
+
+        <p id="settle-error" class="form-error" role="alert" hidden></p>
+
+        <div class="sheet-actions">
+          <button id="settle-save" class="primary" type="submit">Record payment</button>
+          <button id="settle-cancel" class="secondary" type="button">Cancel</button>
         </div>
       </form>
     </section>

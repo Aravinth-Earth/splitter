@@ -174,3 +174,22 @@ test('balance: the exact search is never worse than greedy on two hundred vector
     assert.ok(allZero(apply(map, exactSettle(map, { timeLimitMs: 1_000 }).transfers)));
   }
 });
+
+
+test('balance: a recorded payment clears the leg it corresponds to, deleting it restores it', () => {
+  const members = ['a', 'b'];
+  const expenses = [{ id: 'e1', amountPaise: 100, paidBy: 'a', split: { a: 50, b: 50 } }];
+
+  const before = balances(members, expenses);
+  const proposal = settle(before);
+  assert.deepEqual(proposal.transfers, [{ from: 'b', to: 'a', amountPaise: 50 }]);
+
+  const after = balances(members, expenses, [
+    { from: 'b', to: 'a', amountPaise: 50 }
+  ]);
+  assert.deepEqual(after, { a: 0, b: 0 });
+  assert.deepEqual(settle(after).transfers, []);
+
+  const restored = balances(members, expenses, []);
+  assert.deepEqual(settle(restored).transfers, proposal.transfers);
+});
