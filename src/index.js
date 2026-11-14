@@ -193,10 +193,13 @@ async function createGroup(request, env) {
     return json({ error: 'body' }, 400);
   }
 
-  const { groupId, hostId, nameBlob, metaBlob } = input;
+  const { groupId, hostId, nameBlob, hostNameBlob, metaBlob } = input;
   if (!isId(groupId)) return json({ error: 'groupId' }, 400);
   if (!isId(hostId)) return json({ error: 'hostId' }, 400);
   if (!isSealed(nameBlob)) return json({ error: 'blob' }, 400);
+  if (hostNameBlob !== undefined && hostNameBlob !== null && !isSealed(hostNameBlob)) {
+    return json({ error: 'blob' }, 400);
+  }
   if (metaBlob !== undefined && metaBlob !== null && !isSealed(metaBlob)) {
     return json({ error: 'blob' }, 400);
   }
@@ -212,6 +215,7 @@ async function createGroup(request, env) {
     initialised = await callDurable(group, 'https://group/init', {
       hostId,
       nameBlob,
+      hostNameBlob: hostNameBlob ?? null,
       metaBlob: metaBlob ?? null
     });
   } catch {
