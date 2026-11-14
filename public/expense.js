@@ -5,7 +5,7 @@
  * amounts are integer paise; the rupee text is parsed once, here, and never with a float.
  */
 
-import { allocate, equal, percent, subset } from './calc.js';
+import { allocate, custom, equal, percent, shares, subset } from './calc.js';
 
 export const MAX_PAISE = 1_000_000_000; /* ₹1,00,00,000 */
 export const DESCRIPTION_MAX = 120;
@@ -39,6 +39,26 @@ export function parseAmount(input) {
   }
   if (paise > MAX_PAISE) {
     return { ok: false, message: 'The amount can be at most ₹1,00,00,000.' };
+  }
+  return { ok: true, paise };
+}
+
+/**
+ * An amount inside an exact split. Empty and zero mean "not part of this split", so this reader
+ * allows them; every other rule is the same as the expense amount.
+ */
+export function parseCustomAmount(input) {
+  if (typeof input !== 'string' || input.trim() === '') return { ok: true, paise: 0 };
+
+  const clean = input.replace(/,/g, '').trim();
+  const match = clean.match(/^(\d+)(?:\.(\d{0,2}))?$/);
+  if (!match) {
+    return { ok: false, message: 'Enter each amount in rupees, with at most two decimals.' };
+  }
+
+  const paise = Number(match[1]) * 100 + Number((match[2] ?? '').padEnd(2, '0'));
+  if (!Number.isSafeInteger(paise) || paise > MAX_PAISE) {
+    return { ok: false, message: 'Each amount must be at most ₹1,00,00,000.' };
   }
   return { ok: true, paise };
 }
@@ -100,6 +120,11 @@ export function validateTime(input) {
  * The default keeps the sheet usable when someone switches to percentages: the sum is always
  * 100.0, so the preview is always a split rather than a refusal.
  */
+/** One share each: the sheet's starting point for the shares mode. */
+export function defaultShares(memberIds) {
+  return Object.fromEntries(memberIds.map((id) => [id, 1]));
+}
+
 export function defaultPercentages(memberIds) {
   const tenths = allocate(
     1_000,
@@ -115,7 +140,15 @@ export function defaultPercentages(memberIds) {
  *
  * @returns {{ok: true, shares: Record<string, number>} | {ok: false, message: string}}
  */
-export function splitFor({ mode, amountPaise, memberIds = [], chosenIds = [], percentages = {} }) {
+export function splitFor({
+  mode,
+  amountPaise,
+  memberIds = [],
+  chosenIds = [],
+  percentages = {},
+  shareWeights = {},
+  amounts = {}
+}) {
   try {
     if (mode === 'equal') {
       return { ok: true, shares: equal(amountPaise, memberIds) };
@@ -137,6 +170,35 @@ export function splitFor({ mode, amountPaise, memberIds = [], chosenIds = [], pe
               ? 'Percentages must total 100 %.'
               : 'The percentages could not be used. Check them and try again.'
         };
+      }
+    }
+    if (mode === 'shares') {
+      try {
+        return { ok: true, shares: shares(amountPaise, shareWeights) };
+      } catch {
+        return { ok: false, message: 'At least one person needs a share above zero.' };
+      }
+    }
+    if (mode === 'custom') {
+      const entries = Object.values(amounts);
+      if (entries.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+        return { ok: false, message: 'Enter an amount for each person, or leave it empty.' };
+      }
+      const sum = entries.reduce((total, value) => total + value, 0);
+      if (sum !== amountPaise) {
+        const delta = sum - amountPaise;
+        return {
+          ok: false,
+          message:
+            delta < 0
+              ? `Short by ${formatPaise(-delta)}`
+              : `Over by ${formatPaise(delta)}`
+        };
+      }
+      try {
+        return { ok: true, shares: custom(amountPaise, amounts) };
+      } catch {
+        return { ok: false, message: 'The amounts could not be used. Check them and try again.' };
       }
     }
     return { ok: false, message: 'Choose how to split this expense.' };

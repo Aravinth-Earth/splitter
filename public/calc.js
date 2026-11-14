@@ -129,3 +129,48 @@ export function percent(totalPaise, percentages) {
 
   return allocate(totalPaise, percentages);
 }
+
+/** Integer shares: ten shares gets ten times what one share gets, under the same remainder rule. */
+export function shares(totalPaise, weights) {
+  if (weights === null || typeof weights !== 'object' || Array.isArray(weights)) {
+    throw new Error('splitter: shares must be an object of member id to a whole number');
+  }
+
+  for (const [id, value] of Object.entries(weights)) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`splitter: the shares for ${id} must be a non-negative whole number`);
+    }
+  }
+
+  return allocate(totalPaise, weights);
+}
+
+/**
+ * Exact amounts, which must already total the expense.
+ *
+ * A zero amount is a member who is not part of the split and is left out; a total that differs by
+ * even one paisa is refused, because the caller is the one who named the amounts.
+ */
+export function custom(totalPaise, amounts) {
+  if (amounts === null || typeof amounts !== 'object' || Array.isArray(amounts)) {
+    throw new Error('splitter: custom amounts must be an object of member id to paise');
+  }
+
+  let sum = 0;
+  for (const [id, value] of Object.entries(amounts)) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`splitter: the amount for ${id} must be a non-negative whole number of paise`);
+    }
+    sum += value;
+  }
+
+  if (sum !== totalPaise) {
+    throw new Error('splitter: custom amounts must total the expense');
+  }
+
+  const result = {};
+  for (const [id, value] of Object.entries(amounts)) {
+    if (value > 0) result[id] = value;
+  }
+  return result;
+}

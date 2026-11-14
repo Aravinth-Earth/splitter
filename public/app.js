@@ -43,9 +43,11 @@ import {
 } from './store.js';
 import {
   defaultPercentages,
+  defaultShares,
   expenseAad,
   formatPaise,
   parseAmount,
+  parseCustomAmount,
   splitFor,
   validateDate,
   validateDescription,
@@ -1523,7 +1525,7 @@ export function init(doc = document, win = window) {
         label.append(text, box);
         splitInputs.append(label);
       }
-    } else {
+    } else if (mode === 'percent') {
       const defaults = defaultPercentages(entries.map(([id]) => id));
       splitNote.textContent = 'The percentages must total 100.';
       for (const [id, name] of entries) {
@@ -1537,6 +1539,39 @@ export function init(doc = document, win = window) {
         input.step = '0.1';
         input.value = String(defaults[id] ?? 0);
         input.dataset.memberId = id;
+        input.dataset.percent = '1';
+        label.append(text, input);
+        splitInputs.append(label);
+      }
+    } else if (mode === 'shares') {
+      splitNote.textContent = 'Shares are counted; ten shares gets ten times what one share gets.';
+      const defaults = defaultShares(entries.map(([id]) => id));
+      for (const [id, name] of entries) {
+        const label = doc.createElement('label');
+        const text = doc.createElement('span');
+        text.textContent = name;
+        const input = doc.createElement('input');
+        input.type = 'number';
+        input.min = '0';
+        input.step = '1';
+        input.value = String(defaults[id] ?? 1);
+        input.dataset.memberId = id;
+        input.dataset.shares = '1';
+        label.append(text, input);
+        splitInputs.append(label);
+      }
+    } else {
+      splitNote.textContent = 'Enter what each person owes; the total must match the amount.';
+      for (const [id, name] of entries) {
+        const label = doc.createElement('label');
+        const text = doc.createElement('span');
+        text.textContent = name;
+        const input = doc.createElement('input');
+        input.type = 'text';
+        input.inputMode = 'decimal';
+        input.placeholder = '0.00';
+        input.dataset.memberId = id;
+        input.dataset.amount = '1';
         label.append(text, input);
         splitInputs.append(label);
       }
@@ -1567,8 +1602,27 @@ export function init(doc = document, win = window) {
       return splitFor({ mode, amountPaise: amount.paise, chosenIds });
     }
 
+    if (mode === 'shares') {
+      const shareWeights = {};
+      for (const input of splitInputs.querySelectorAll('input[data-shares]')) {
+        const value = Number(input.value);
+        shareWeights[input.dataset.memberId] =
+          Number.isInteger(value) && value >= 0 ? value : Number.NaN;
+      }
+      return splitFor({ mode, amountPaise: amount.paise, shareWeights });
+    }
+    if (mode === 'custom') {
+      const amounts = {};
+      for (const input of splitInputs.querySelectorAll('input[data-amount]')) {
+        const parsed = parseCustomAmount(input.value);
+        if (!parsed.ok) return { ok: false, message: parsed.message };
+        amounts[input.dataset.memberId] = parsed.paise;
+      }
+      return splitFor({ mode, amountPaise: amount.paise, amounts });
+    }
+
     const percentages = {};
-    for (const input of splitInputs.querySelectorAll('input[type="number"]')) {
+    for (const input of splitInputs.querySelectorAll('input[data-percent]')) {
       percentages[input.dataset.memberId] = Number(input.value);
     }
     return splitFor({ mode, amountPaise: amount.paise, percentages });
