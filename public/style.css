@@ -581,3 +581,27 @@ button {
   align-items: flex-start;
   gap: 0.4rem;
 }
+
+.payer-rows {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.payer-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.payer-row select {
+  flex: 1 1 8rem;
+}
+
+.payer-row input {
+  width: 6rem;
+}
+
+.payer-row button {
+  padding: 0.2rem 0.45rem;
+  font-size: 0.85rem;
+}

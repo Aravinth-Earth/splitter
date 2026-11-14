@@ -189,10 +189,19 @@
           <p class="hint">At most 1,00,00,000, with two decimals.</p>
         </div>
 
-        <div class="field">
+        <div class="field" id="payer-single">
           <label for="expense-payer">Paid by</label>
           <select id="expense-payer"></select>
         </div>
+
+        <p class="payer-expand">
+          <button id="add-payer" class="link-button" type="button">More than one person paid</button>
+        </p>
+        <div id="payer-rows" class="payer-rows" hidden></div>
+        <p id="payer-total" class="muted" hidden></p>
+        <p id="add-another-wrap" hidden>
+          <button id="add-another-payer" class="link-button" type="button">Add another payer</button>
+        </p>
 
         <div class="field-row">
           <div class="field">

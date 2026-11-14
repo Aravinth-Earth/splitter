@@ -355,6 +355,12 @@ export function init(doc = document, win = window) {
   const expenseDescription = doc.getElementById('expense-description');
   const expenseAmount = doc.getElementById('expense-amount');
   const expensePayer = doc.getElementById('expense-payer');
+  const payerSingle = doc.getElementById('payer-single');
+  const addPayerButton = doc.getElementById('add-payer');
+  const payerRows = doc.getElementById('payer-rows');
+  const payerTotal = doc.getElementById('payer-total');
+  const addAnotherWrap = doc.getElementById('add-another-wrap');
+  const addAnotherPayerButton = doc.getElementById('add-another-payer');
   const expenseDate = doc.getElementById('expense-date');
   const expenseTime = doc.getElementById('expense-time');
   const expenseNote = doc.getElementById('expense-note');
@@ -430,6 +436,7 @@ export function init(doc = document, win = window) {
   let editingExpense = null;
   let customSeed = null;
   let lastBalances = {};
+  let multiPayer = false;
   let settlementDraftId = null;
   let pendingSettlementId = null;
   let savingSettlement = false;
@@ -483,7 +490,13 @@ export function init(doc = document, win = window) {
   splitModes.forEach((radio) => radio.addEventListener('change', renderSplit));
   splitInputs.addEventListener('input', updatePreview);
   splitInputs.addEventListener('change', updatePreview);
-  expenseAmount.addEventListener('input', updatePreview);
+  expenseAmount.addEventListener('input', () => {
+    updatePreview();
+    updatePayerTotal();
+  });
+  addPayerButton.addEventListener('click', expandPayers);
+  addAnotherPayerButton.addEventListener('click', () => addPayerRow());
+  payerRows.addEventListener('input', updatePayerTotal);
   recordPaymentButton.addEventListener('click', () => openSettlement(null));
   settlementForm.addEventListener('submit', (event) => {
     void saveSettlement(event);
@@ -1500,12 +1513,22 @@ export function init(doc = document, win = window) {
         continue;
       }
 
-      const payer = members.get(value.paidBy) || 'Someone';
+      const payers = Array.isArray(value.paidBy)
+        ? value.paidBy
+        : [{ memberId: value.paidBy, amountPaise: value.amountPaise }];
+      const payer = payers
+        .map((entry) => members.get(entry.memberId) || 'Someone')
+        .join(' + ');
+      const detail =
+        payers.length > 1
+          ? ` (${payers.map((entry) => formatPaise(entry.amountPaise, groupCurrency)).join(' + ')})`
+          : '';
       const creator = record.creator ?? record.author;
       const edited = creator && creator !== record.author;
       const editor = members.get(record.author) || 'Someone';
       meta.textContent =
-        `Paid by ${payer} · ${value.date} ${value.time}` + (edited ? ` · edited by ${editor}` : '');
+        `Paid by ${payer}${detail} · ${value.date} ${value.time}` +
+        (edited ? ` · edited by ${editor}` : '');
       left.append(title, meta);
 
       const side = doc.createElement('div');
@@ -1568,7 +1591,10 @@ export function init(doc = document, win = window) {
 
     const referenced = new Set(members.keys());
     for (const expense of expenses) {
-      referenced.add(expense.paidBy);
+      const payers = Array.isArray(expense.paidBy)
+        ? expense.paidBy
+        : [{ memberId: expense.paidBy }];
+      for (const payer of payers) referenced.add(payer.memberId);
       for (const id of Object.keys(expense.split)) referenced.add(id);
     }
     for (const payment of settlements) {
@@ -1736,20 +1762,121 @@ export function init(doc = document, win = window) {
     );
   }
 
-  function renderPayerOptions() {
-    const current = expensePayer.value;
-    expensePayer.textContent = '';
-
+  function fillMemberSelect(select, selected) {
+    select.textContent = '';
     for (const [id, name] of splitMembers()) {
       const option = doc.createElement('option');
       option.value = id;
       option.textContent = name;
-      expensePayer.append(option);
+      select.append(option);
+    }
+    if (selected && members.has(selected)) select.value = selected;
+    else if (select.options.length > 0) select.selectedIndex = 0;
+  }
+
+  function renderPayerOptions() {
+    const current = expensePayer.value;
+    fillMemberSelect(expensePayer, current || selfId);
+
+    for (const row of payerRows.querySelectorAll('.payer-row')) {
+      const select = row.querySelector('select');
+      fillMemberSelect(select, select.value);
+    }
+    updatePayerTotal();
+  }
+
+  function addPayerRow(memberId = null, amountPaise = 0) {
+    const used = new Set(
+      [...payerRows.querySelectorAll('.payer-row select')].map((select) => select.value)
+    );
+    const fallback = splitMembers().find(([id]) => !used.has(id))?.[0] ?? splitMembers()[0]?.[0] ?? null;
+    const chosen = memberId ?? fallback;
+
+    const row = doc.createElement('div');
+    row.className = 'payer-row';
+    const select = doc.createElement('select');
+    fillMemberSelect(select, chosen);
+    const input = doc.createElement('input');
+    input.type = 'text';
+    input.inputMode = 'decimal';
+    input.placeholder = '0.00';
+    if (Number.isSafeInteger(amountPaise) && amountPaise > 0) {
+      input.value = (amountPaise / 100).toFixed(2);
+    }
+    const remove = doc.createElement('button');
+    remove.type = 'button';
+    remove.className = 'secondary';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => {
+      row.remove();
+      if (payerRows.querySelectorAll('.payer-row').length <= 1) collapsePayers();
+      else updatePayerTotal();
+    });
+
+    row.append(select, input, remove);
+    payerRows.append(row);
+    updatePayerTotal();
+  }
+
+  function expandPayers() {
+    if (multiPayer) return;
+    multiPayer = true;
+    payerSingle.hidden = true;
+    addPayerButton.parentElement.hidden = true;
+    payerRows.hidden = false;
+    payerTotal.hidden = false;
+    addAnotherWrap.hidden = false;
+    payerRows.textContent = '';
+
+    const amount = parseAmount(expenseAmount.value);
+    addPayerRow(expensePayer.value, amount.ok ? amount.paise : 0);
+    addPayerRow();
+  }
+
+  function collapsePayers() {
+    const remaining = payerRows.querySelector('.payer-row select');
+    const payer = remaining?.value;
+    multiPayer = false;
+    payerRows.textContent = '';
+    payerRows.hidden = true;
+    payerTotal.hidden = true;
+    addAnotherWrap.hidden = true;
+    payerSingle.hidden = false;
+    addPayerButton.parentElement.hidden = false;
+    if (payer) fillMemberSelect(expensePayer, payer);
+  }
+
+  function updatePayerTotal() {
+    if (!multiPayer) {
+      payerTotal.hidden = true;
+      return;
+    }
+    payerTotal.hidden = false;
+
+    const amount = parseAmount(expenseAmount.value);
+    if (!amount.ok) {
+      payerTotal.textContent = 'Enter the amount first.';
+      return;
     }
 
-    if (current && members.has(current)) expensePayer.value = current;
-    else if (selfId && members.has(selfId)) expensePayer.value = selfId;
-    else if (expensePayer.options.length > 0) expensePayer.selectedIndex = 0;
+    let sum = 0;
+    for (const row of payerRows.querySelectorAll('.payer-row')) {
+      const parsed = parseCustomAmount(row.querySelector('input').value);
+      if (!parsed.ok) {
+        payerTotal.textContent = parsed.message;
+        return;
+      }
+      if (parsed.paise <= 0) {
+        payerTotal.textContent = 'Every payer needs an amount above zero.';
+        return;
+      }
+      sum += parsed.paise;
+    }
+
+    const delta = sum - amount.paise;
+    if (delta === 0) payerTotal.textContent = `Paid in full: ${formatPaise(sum, groupCurrency)}.`;
+    else if (delta < 0) payerTotal.textContent = `Short by ${formatPaise(-delta, groupCurrency)}.`;
+    else payerTotal.textContent = `Over by ${formatPaise(delta, groupCurrency)}.`;
   }
 
   function renderSplit() {
@@ -1922,6 +2049,15 @@ export function init(doc = document, win = window) {
     expenseError.textContent = '';
 
     const value = record?.value ?? null;
+    const payerList = Array.isArray(value?.paidBy) ? value.paidBy : null;
+    multiPayer = Boolean(payerList && payerList.length > 1);
+    payerRows.textContent = '';
+    payerRows.hidden = !multiPayer;
+    payerTotal.hidden = !multiPayer;
+    addAnotherWrap.hidden = !multiPayer;
+    payerSingle.hidden = multiPayer;
+    addPayerButton.parentElement.hidden = multiPayer;
+
     expenseDescription.value = value?.description ?? '';
     expenseAmount.value = value ? (value.amountPaise / 100).toFixed(2) : '';
     expenseNote.value = value?.note ?? '';
@@ -1937,7 +2073,14 @@ export function init(doc = document, win = window) {
     });
 
     renderPayerOptions();
-    if (value?.paidBy && members.has(value.paidBy)) expensePayer.value = value.paidBy;
+    const singlePayer = payerList?.[0]?.memberId ?? value?.paidBy;
+    if (!multiPayer && singlePayer && members.has(singlePayer)) {
+      fillMemberSelect(expensePayer, singlePayer);
+    }
+    if (multiPayer) {
+      for (const payer of payerList) addPayerRow(payer.memberId, payer.amountPaise);
+      updatePayerTotal();
+    }
     renderSplit();
     expensePanel.hidden = false;
     expenseDescription.focus();
@@ -1959,6 +2102,14 @@ export function init(doc = document, win = window) {
     splitInputs.textContent = '';
     splitPreview.textContent = '';
     splitNote.textContent = '';
+    multiPayer = false;
+    payerRows.textContent = '';
+    payerRows.hidden = true;
+    payerTotal.hidden = true;
+    payerTotal.textContent = '';
+    addAnotherWrap.hidden = true;
+    payerSingle.hidden = false;
+    addPayerButton.parentElement.hidden = false;
     renderLedger();
   }
 
@@ -2107,8 +2258,43 @@ export function init(doc = document, win = window) {
     if (!time.ok) return expenseFailure(time.message, expenseTime);
     const note = validateNote(expenseNote.value);
     if (!note.ok) return expenseFailure(note.message, expenseNote);
-    if (!members.has(expensePayer.value)) {
-      return expenseFailure('Choose who paid.', expensePayer);
+    let payers;
+    if (multiPayer) {
+      const rows = [...payerRows.querySelectorAll('.payer-row')];
+      if (rows.length === 0) return expenseFailure('Add who paid.', addPayerButton);
+      payers = [];
+      const seen = new Set();
+      let paid = 0;
+      for (const row of rows) {
+        const select = row.querySelector('select');
+        const input = row.querySelector('input');
+        if (!members.has(select.value)) return expenseFailure('Choose who paid.', select);
+        if (seen.has(select.value)) {
+          return expenseFailure('Each payer can appear only once.', select);
+        }
+        seen.add(select.value);
+        const parsed = parseCustomAmount(input.value);
+        if (!parsed.ok) return expenseFailure(parsed.message, input);
+        if (parsed.paise <= 0) {
+          return expenseFailure('Every payer needs an amount above zero.', input);
+        }
+        payers.push({ memberId: select.value, amountPaise: parsed.paise });
+        paid += parsed.paise;
+      }
+      if (paid !== amount.paise) {
+        const delta = paid - amount.paise;
+        return expenseFailure(
+          delta < 0
+            ? `Short by ${formatPaise(-delta, groupCurrency)}.`
+            : `Over by ${formatPaise(delta, groupCurrency)}.`,
+          payerRows
+        );
+      }
+    } else {
+      if (!members.has(expensePayer.value)) {
+        return expenseFailure('Choose who paid.', expensePayer);
+      }
+      payers = [{ memberId: expensePayer.value, amountPaise: amount.paise }];
     }
 
     const split = currentSplit();
@@ -2134,7 +2320,7 @@ export function init(doc = document, win = window) {
         kind: 'expense',
         description: description.value,
         amountPaise: amount.paise,
-        paidBy: expensePayer.value,
+        paidBy: payers,
         split: split.shares,
         date: date.value,
         time: time.value,

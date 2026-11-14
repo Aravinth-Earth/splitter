@@ -51,11 +51,30 @@ export function balances(members, expenses = [], settlements = []) {
     if (!Number.isSafeInteger(expense.amountPaise) || expense.amountPaise <= 0) {
       throw new Error('splitter: an expense must be a positive whole number of paise');
     }
-    if (typeof expense.paidBy !== 'string' || expense.paidBy === '') {
-      throw new Error('splitter: an expense needs a payer');
+    const payers = Array.isArray(expense.paidBy)
+      ? expense.paidBy
+      : [{ memberId: expense.paidBy, amountPaise: expense.amountPaise }];
+    if (payers.length === 0) throw new Error('splitter: an expense needs a payer');
+    const seenPayers = new Set();
+    let paid = 0;
+    for (const payer of payers) {
+      if (typeof payer?.memberId !== 'string' || payer.memberId === '') {
+        throw new Error('splitter: every payer needs a member id');
+      }
+      if (!Number.isSafeInteger(payer.amountPaise) || payer.amountPaise <= 0) {
+        throw new Error('splitter: every payer amount must be a positive whole number of paise');
+      }
+      if (seenPayers.has(payer.memberId)) {
+        throw new Error('splitter: a payer appears twice in one expense');
+      }
+      seenPayers.add(payer.memberId);
+      add(payer.memberId, payer.amountPaise);
+      paid += payer.amountPaise;
+    }
+    if (paid !== expense.amountPaise) {
+      throw new Error('splitter: payer amounts must total the expense');
     }
 
-    add(expense.paidBy, expense.amountPaise);
     let shared = 0;
     for (const [id, paise] of Object.entries(expense.split ?? {})) {
       if (!Number.isSafeInteger(paise) || paise < 0) {
