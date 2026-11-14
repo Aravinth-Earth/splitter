@@ -503,3 +503,36 @@ button {
   .panel { padding: 1.5rem 1.25rem; }
   h1 { font-size: 2.25rem; }
 }
+
+
+/* ------------------------------------------------------------- balances */
+
+.balance-list,
+.transfer-list {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  list-style: none;
+}
+
+.balance-list li,
+.transfer-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px dashed var(--border);
+}
+
+.balance-list .owes {
+  color: var(--danger);
+}
+
+.balance-list .owed {
+  color: var(--accent);
+}
+
+.transfer-list li {
+  font-weight: 600;
+}
