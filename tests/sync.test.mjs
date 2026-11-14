@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GroupSocket, MAX_DELAY_MS, MIN_DELAY_MS, backoffDelay } from '../public/sync.js';
+import { GroupSocket, MAX_DELAY_MS, MIN_DELAY_MS, RevGuard, backoffDelay } from '../public/sync.js';
 
 class FakeSocket {
   static instances = [];
@@ -177,4 +177,32 @@ test('sync: a refusal close is final, not a reconnect loop', () => {
   assert.ok(statuses.includes('closed'));
   assert.equal(win.pending(), 0, 'no retry is scheduled after a refusal');
   assert.equal(socket.isOpen, false);
+});
+
+
+test('sync: a record never goes back to an older revision', () => {
+  const guard = new RevGuard();
+  assert.equal(guard.accept({ id: 'record', rev: 5 }), true);
+  assert.equal(guard.accept({ id: 'record', rev: 7, deleted: true }), true);
+  assert.equal(guard.accept({ id: 'record', rev: 6 }), false, 'an older broadcast is dropped');
+  assert.equal(guard.accept({ id: 'record', rev: 5 }), false, 'a replayed old frame is dropped');
+  assert.equal(guard.accept({ id: 'record', rev: 7 }), true, 'the same revision is safe again');
+  assert.equal(guard.highest('record'), 7);
+  assert.deepEqual(guard.snapshot(), { record: 7 });
+
+  assert.equal(guard.accept({ id: 'fresh', rev: 0 }), true);
+  assert.equal(guard.accept({ id: 'fresh', rev: -1 }), false);
+  assert.equal(guard.accept({ id: '', rev: 1 }), false);
+  assert.equal(guard.accept(null), false);
+});
+
+test('sync: a reloaded guard keeps the stored revision and never lowers it', () => {
+  const guard = new RevGuard({ record: 9, bad: -1, other: 2 });
+  assert.equal(guard.highest('record'), 9);
+  assert.equal(guard.highest('bad'), undefined);
+  assert.equal(guard.highest('other'), 2);
+
+  guard.hydrate({ record: 4, third: 1 });
+  assert.equal(guard.highest('record'), 9, 'hydration cannot lower a known revision');
+  assert.equal(guard.highest('third'), 1);
 });

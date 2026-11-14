@@ -22,6 +22,55 @@ export function backoffDelay(attempt, random = Math.random) {
   return Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, Math.round(jittered)));
 }
 
+/**
+ * The highest revision seen for each record id.
+ *
+ * A state snapshot and a broadcast can cross: a roster change lists the records, a write lands,
+ * both frames reach one socket, and the older snapshot must not put a deleted row back or undo a
+ * newer value. A frame below the highest revision is dropped; an equal one is safe to apply again.
+ */
+export class RevGuard {
+  constructor(seen = {}) {
+    this.seen = new Map();
+    this.hydrate(seen);
+  }
+
+  /** Take persisted revisions without lowering any already seen in this session. */
+  hydrate(seen = {}) {
+    for (const [id, rev] of Object.entries(seen)) {
+      if (typeof id !== 'string' || !Number.isSafeInteger(rev) || rev < 0) continue;
+      const known = this.seen.get(id);
+      if (known === undefined || rev > known) this.seen.set(id, rev);
+    }
+  }
+
+  /** True when this record is not older than the highest revision already seen. */
+  accept(record) {
+    if (
+      !record ||
+      typeof record.id !== 'string' ||
+      record.id === '' ||
+      !Number.isSafeInteger(record.rev) ||
+      record.rev < 0
+    ) {
+      return false;
+    }
+    const known = this.seen.get(record.id);
+    if (known !== undefined && record.rev < known) return false;
+    if (known === undefined || record.rev > known) this.seen.set(record.id, record.rev);
+    return true;
+  }
+
+  highest(id) {
+    return this.seen.get(id);
+  }
+
+  /** A plain object for storage; only the highest revision per id. */
+  snapshot() {
+    return Object.fromEntries(this.seen);
+  }
+}
+
 export class GroupSocket {
   /**
    * @param {{url: string, auth: object, win?: object, Ctor?: Function,
