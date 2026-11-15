@@ -31,6 +31,17 @@ const put = (id = ID, base = 0) => ({
   frame: { t: 'put', id, base, blob: BLOB, deleted: false }
 });
 
+const state = (records = []) => ({
+  nameBlob: BLOB,
+  metaBlob: null,
+  hostId: ID,
+  memberId: ID,
+  role: 'host',
+  joinMode: 'approval',
+  roster: [{ id: ID, status: 'approved', nameBlob: BLOB }],
+  records
+});
+
 test('cache: an outbox round-trips in local order, separately per group', () => {
   const local = fakeStorage();
   assert.equal(saveOutbox(local, GROUP, [put(ID), put(OTHER_ID)]), true);
@@ -73,20 +84,22 @@ test('cache: three hundred sealed records round-trip with schema and time', () =
     creator: ID,
     at: 1_700_000_000_000 + index
   }));
-  assert.equal(saveCache(local, GROUP, records, 1_700_000_123_456), true);
+  assert.equal(saveCache(local, GROUP, state(records), 1_700_000_123_456), true);
   const cached = cacheFor(local, GROUP);
   assert.equal(cached.schema, CACHE_SCHEMA);
   assert.equal(cached.savedAt, 1_700_000_123_456);
   assert.equal(cached.records.length, 300);
   assert.deepEqual(cached.records[0], records[0]);
+  assert.equal(cached.role, 'host');
+  assert.equal(cached.roster.length, 1);
 });
 
 test('cache: tombstones stay sealed-less and bad records are dropped', () => {
   const local = fakeStorage();
-  saveCache(local, GROUP, [
+  saveCache(local, GROUP, state([
     { id: ID, rev: 2, blob: null, deleted: true, author: ID, creator: ID, at: 1 },
     { id: 'bad', rev: 1, blob: BLOB, deleted: false, author: ID, creator: ID, at: 1 }
-  ]);
+  ]));
   const cached = cacheFor(local, GROUP);
   assert.equal(cached.records.length, 1);
   assert.equal(cached.records[0].deleted, true);
@@ -104,6 +117,7 @@ test('cache: corrupt JSON and a full storage read as empty and refuse saves', ()
     }
   };
   assert.equal(saveOutbox(full, GROUP, [put()]), false);
-  assert.equal(saveCache(full, GROUP, []), false);
+  assert.equal(saveCache(full, GROUP, state([])), false);
   assert.deepEqual(outboxFor(full, GROUP), []);
+  assert.equal(saveCache(fakeStorage(), GROUP, { ...state([]), nameBlob: null }), false);
 });
