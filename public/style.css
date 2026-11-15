@@ -651,3 +651,9 @@ button {
     break-inside: avoid;
   }
 }
+
+.export-warning {
+  padding: 0.55rem 0.75rem;
+  border-left: 3px solid var(--accent);
+  background: var(--bg);
+}

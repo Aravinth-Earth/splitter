@@ -47,6 +47,7 @@ import { GroupSocket, RevGuard } from './sync.js';
 import { attribute, balances, ledgerContributions, settle } from './balance.js';
 import { renderChart, totals as chartTotals } from './charts.js';
 import { mergeDiff } from './merge.js';
+import { exportFileName, exportGroup } from './export.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -343,6 +344,9 @@ export function init(doc = document, win = window) {
   const chartsPanel = doc.getElementById('charts');
   const chartHost = doc.getElementById('chart-host');
   const chartModes = [...doc.querySelectorAll('input[name="chart-view"]')];
+  const exportPanel = doc.getElementById('export-panel');
+  const exportButton = doc.getElementById('export-json');
+  const exportStatus = doc.getElementById('export-status');
   const paymentList = doc.getElementById('payment-list');
   const recordPaymentButton = doc.getElementById('record-payment');
   const settlementPanel = doc.getElementById('settlement-panel');
@@ -512,6 +516,7 @@ export function init(doc = document, win = window) {
     updatePayerTotal();
   });
   chartModes.forEach((radio) => radio.addEventListener('change', renderCharts));
+  exportButton.addEventListener('click', downloadExport);
   addPayerButton.addEventListener('click', expandPayers);
   addAnotherPayerButton.addEventListener('click', () => addPayerRow());
   payerRows.addEventListener('input', updatePayerTotal);
@@ -667,7 +672,7 @@ export function init(doc = document, win = window) {
 
   /** Replace the form with the group, in place: no modal, no confirmation, no second screen. */
   function showGroup({ code, name, displayName, role = 'organizer', memberId = null, currency = DEFAULT_CURRENCY }) {
-    group = { code };
+    group = { code, name };
     resumeSession = null;
     hideNotice();
 
@@ -695,6 +700,8 @@ export function init(doc = document, win = window) {
     closeExpenseSheet();
     closeSettlementSheet();
     renderLedger();
+    exportPanel.hidden = false;
+    exportStatus.textContent = '';
 
     groupNameDisplay.textContent = name;
     groupCode.textContent = formatCode(code);
@@ -804,6 +811,7 @@ export function init(doc = document, win = window) {
     ledgerPanel.hidden = true;
     balancesPanel.hidden = true;
     chartsPanel.hidden = true;
+    exportPanel.hidden = true;
     createPanel.hidden = true;
     groupHeader.hidden = true;
     emptyLedger.hidden = true;
@@ -834,6 +842,7 @@ export function init(doc = document, win = window) {
     ledgerPanel.hidden = true;
     balancesPanel.hidden = true;
     chartsPanel.hidden = true;
+    exportPanel.hidden = true;
     joinPanel.hidden = true;
     waitingPanel.hidden = true;
     groupHeader.hidden = true;
@@ -853,6 +862,7 @@ export function init(doc = document, win = window) {
     ledgerPanel.hidden = true;
     balancesPanel.hidden = true;
     chartsPanel.hidden = true;
+    exportPanel.hidden = true;
     waitingPanel.hidden = false;
     waitingCode.textContent = formatCode(code);
     waitingTitle.textContent = 'Waiting for the organizer';
@@ -2783,6 +2793,41 @@ export function init(doc = document, win = window) {
       copyStatus.classList.remove('toast');
       statusTimer = null;
     }, 4000);
+  }
+
+  /** Build the readable copy and hand it to the browser's download flow. */
+  function downloadExport() {
+    if (!group) return;
+    try {
+      const exportedAt = new Date();
+      const file = exportGroup({
+        name: group.name,
+        currency: groupCurrency,
+        members: [...members].map(([id, name]) => ({ id, name })),
+        records: [...ledger.values()],
+        exportedAt
+      });
+      const text = `${JSON.stringify(file, null, 2)}\n`;
+      const blob = new win.Blob([text], { type: 'application/json' });
+      const url = win.URL.createObjectURL(blob);
+      const link = doc.createElement('a');
+      link.href = url;
+      link.download = exportFileName(exportedAt);
+      link.rel = 'noopener';
+      doc.body.append(link);
+      link.click();
+      link.remove();
+      win.setTimeout(() => win.URL.revokeObjectURL(url), 0);
+
+      const count = (value, one, many) => `${value} ${value === 1 ? one : many}`;
+      exportStatus.textContent = `Exported ${count(
+        file.expenses.length,
+        'expense',
+        'expenses'
+      )} and ${count(file.settlements.length, 'payment', 'payments')}.`;
+    } catch {
+      exportStatus.textContent = 'The file could not be made. Try again.';
+    }
   }
 
   function hideFallback() {
