@@ -48,7 +48,7 @@ import { attribute, balances, ledgerContributions, settle } from './balance.js';
 import { renderChart, totals as chartTotals } from './charts.js';
 import { mergeDiff } from './merge.js';
 import { exportFileName, exportGroup, importGroup } from './export.js';
-import { outboxFor, saveOutbox } from './cache.js';
+import { cacheFor, outboxFor, saveCache, saveOutbox } from './cache.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -77,6 +77,8 @@ export const DISPLAY_NAME_MAX = 30;
    says only "try later" leaves the person guessing whether it is their connection. */
 export const SLOT_LIMIT_MESSAGE = 'All 25 group slots are in use.';
 export const OFFLINE_MESSAGE = 'Creating needs a connection.';
+export const OFFLINE_FIRST_MESSAGE =
+  'Open this group once with a connection; after that it works offline.';
 export const RETRY_MESSAGE = 'The group was not created. Try again.';
 
 /* The app is the whole of its origin, so a relative path is the API on this origin and nothing
@@ -329,6 +331,9 @@ export function init(doc = document, win = window) {
   const joinModeLine = doc.getElementById('join-mode');
   const connection = doc.getElementById('connection');
   const pendingCount = doc.getElementById('pending-count');
+  const offlineBanner = doc.getElementById('offline-banner');
+  const offlineText = doc.getElementById('offline-text');
+  const offlineRetry = doc.getElementById('offline-retry');
   const toggleModeButton = doc.getElementById('toggle-mode');
   const roster = doc.getElementById('roster');
   const rosterPending = doc.getElementById('roster-pending');
@@ -464,6 +469,11 @@ export function init(doc = document, win = window) {
   let mergeRetryId = null;
   let pendingImport = null;
   let importJob = null;
+  let cachedBase = null;
+  let cachedRecords = new Map();
+  let cacheTimer = null;
+  let cachedSavedAt = 0;
+  let connectionStatus = 'offline';
   let pendingDeleteId = null;
   let editingExpense = null;
   let customSeed = null;
@@ -531,6 +541,12 @@ export function init(doc = document, win = window) {
   });
   chartModes.forEach((radio) => radio.addEventListener('change', renderCharts));
   exportButton.addEventListener('click', downloadExport);
+  offlineRetry.addEventListener('click', () => {
+    const socket = groupSocket();
+    if (!socket) return;
+    offlineRetry.disabled = true;
+    socket.connect();
+  });
   importButton.addEventListener('click', () => {
     if (importJob) return;
     importFile.value = '';
@@ -686,6 +702,33 @@ export function init(doc = document, win = window) {
     pendingCount.hidden = count === 0;
     pendingCount.textContent =
       count === 0 ? '' : `${count} ${count === 1 ? 'change' : 'changes'} waiting`;
+    if (!offlineBanner.hidden) renderOfflineBanner(connectionStatus);
+  }
+
+  /**
+   * The cached ledger stays on screen while the socket is down, with its age and the queue size.
+   * Retry starts the same reconnect loop without a reload.
+   */
+  function renderOfflineBanner(status) {
+    connectionStatus = status;
+    if (
+      !cachedBase ||
+      groupHeader.hidden ||
+      status === 'open' ||
+      status === 'closed' ||
+      (status === 'connecting' && win.navigator?.onLine !== false)
+    ) {
+      offlineBanner.hidden = true;
+      offlineRetry.disabled = false;
+      return;
+    }
+    const count = groupSocket()?.queueEntries().length ?? 0;
+    const when = cachedSavedAt ? new Date(cachedSavedAt).toLocaleString() : 'the last sync';
+    offlineText.textContent =
+      `Offline. Showing the ledger as of ${when}; changes you make will be sent when you are back.` +
+      (count > 0 ? ` ${count} ${count === 1 ? 'change' : 'changes'} waiting.` : '');
+    offlineBanner.hidden = false;
+    offlineRetry.disabled = status === 'connecting';
   }
 
   function persistOutbox(entries) {
@@ -699,6 +742,8 @@ export function init(doc = document, win = window) {
   }
 
   function setConnection(status) {
+    connectionStatus = status;
+    if (cachedBase) renderOfflineBanner(status);
     if (!connection) return;
     if (status === 'open' || status === 'closed') {
       connection.hidden = true;
@@ -759,6 +804,12 @@ export function init(doc = document, win = window) {
     exportStatus.textContent = '';
     pendingCount.hidden = true;
     pendingCount.textContent = '';
+    offlineBanner.hidden = true;
+    cachedSavedAt = 0;
+    if (cacheTimer !== null) win.clearTimeout(cacheTimer);
+    cacheTimer = null;
+    cachedBase = null;
+    cachedRecords = new Map();
     importButton.hidden = role !== 'organizer';
     resetImport();
 
@@ -871,6 +922,7 @@ export function init(doc = document, win = window) {
     balancesPanel.hidden = true;
     chartsPanel.hidden = true;
     exportPanel.hidden = true;
+    offlineBanner.hidden = true;
     resetImport();
     createPanel.hidden = true;
     groupHeader.hidden = true;
@@ -903,6 +955,7 @@ export function init(doc = document, win = window) {
     balancesPanel.hidden = true;
     chartsPanel.hidden = true;
     exportPanel.hidden = true;
+    offlineBanner.hidden = true;
     resetImport();
     joinPanel.hidden = true;
     waitingPanel.hidden = true;
@@ -924,6 +977,7 @@ export function init(doc = document, win = window) {
     balancesPanel.hidden = true;
     chartsPanel.hidden = true;
     exportPanel.hidden = true;
+    offlineBanner.hidden = true;
     resetImport();
     waitingPanel.hidden = false;
     waitingCode.textContent = formatCode(code);
@@ -1037,6 +1091,80 @@ export function init(doc = document, win = window) {
    * handshake with no reason a browser can read. A missing room forgets the seat and says the group
    * has ended; a refused or removed member forgets it too, with the sentence the server chose.
    */
+  /** Draw the last state from disk, with the socket still down or about to try. */
+  async function showCachedGroup(session, code, groupIdValue, cached) {
+    const key = await deriveGroupKey(code);
+    let name = 'Your group';
+    try {
+      const opened = await open(key, cached.nameBlob);
+      if (typeof opened?.name === 'string') name = opened.name;
+    } catch {
+      /* the neutral label is the honest one */
+    }
+    let currency = DEFAULT_CURRENCY;
+    if (cached.metaBlob) {
+      try {
+        const meta = await open(key, cached.metaBlob);
+        if (meta?.currency) currency = normalizeCurrency(meta.currency);
+      } catch {
+        /* the fallback currency stays */
+      }
+    }
+
+    showGroup({
+      code,
+      name,
+      displayName: session.displayName,
+      role: cached.role === 'host' ? 'organizer' : 'member',
+      memberId: cached.memberId || session.memberId,
+      currency
+    });
+
+    applyMode(cached.joinMode, cached.role === 'host' ? 'host' : 'member');
+    recordGuard = new RevGuard(revsFor(local, groupIdValue));
+    guardGroupId = groupIdValue;
+
+    const nextMembers = new Map();
+    const nextRemoved = new Set();
+    for (const member of cached.roster) {
+      if (member.status === 'removed') nextRemoved.add(member.id);
+      if (member.status !== 'approved' && member.status !== 'removed') continue;
+      nextMembers.set(member.id, await nameOf(key, member.nameBlob));
+    }
+    if (cached.memberId && !nextMembers.has(cached.memberId)) {
+      nextMembers.set(cached.memberId, session.displayName);
+    }
+    members = nextMembers;
+    removedMembers = nextRemoved;
+
+    for (const record of cached.records) {
+      if (!recordGuard.accept(record)) continue;
+      if (record.deleted) {
+        ledger.delete(record.id);
+        continue;
+      }
+      const value = await decryptRecord(key, record, groupIdValue);
+      if (value) ledger.set(record.id, { ...record, value });
+    }
+    saveRevs(local, groupIdValue, recordGuard.snapshot());
+
+    cachedBase = {
+      nameBlob: cached.nameBlob,
+      metaBlob: cached.metaBlob,
+      hostId: cached.hostId,
+      memberId: cached.memberId,
+      role: cached.role,
+      joinMode: cached.joinMode,
+      roster: cached.roster
+    };
+    cachedRecords = new Map(cached.records.map((record) => [record.id, { ...record }]));
+    cachedSavedAt = cached.savedAt;
+
+    await restorePending(outboxFor(local, groupIdValue));
+    renderLedger();
+    if (win.navigator?.onLine === false) renderOfflineBanner('offline');
+  }
+
   async function resumeStored(session, code) {
     hideNotice();
     closeJoinSocket();
@@ -1049,29 +1177,39 @@ export function init(doc = document, win = window) {
       return;
     }
 
-    const reachable = await probeRoom(groupIdValue);
-    if (reachable === 'missing') {
-      forget(groupIdValue);
-      showCreate();
-      showNotice('This group has ended.');
-      return;
-    }
-    if (reachable === 'offline') {
-      showJoin({ code, error: OFFLINE_MESSAGE, resume: session });
-      return;
-    }
+    const cached = cacheFor(local, groupIdValue);
+    let shown = false;
+    if (cached) {
+      await showCachedGroup(session, code, groupIdValue, cached);
+      shown = true;
+    } else {
+      if (win.navigator?.onLine === false) {
+        showJoin({ code, error: OFFLINE_FIRST_MESSAGE, resume: session });
+        return;
+      }
+      const reachable = await probeRoom(groupIdValue);
+      if (reachable === 'missing') {
+        forget(groupIdValue);
+        showCreate();
+        showNotice('This group has ended.');
+        return;
+      }
+      if (reachable === 'offline') {
+        showJoin({ code, error: OFFLINE_MESSAGE, resume: session });
+        return;
+      }
 
-    showWaiting(code);
-    waitingTitle.textContent = 'Reopening your group';
-    waitingCopy.textContent = 'Bringing back your seat…';
-    waitingBack.hidden = true;
+      showWaiting(code);
+      waitingTitle.textContent = 'Reopening your group';
+      waitingCopy.textContent = 'Bringing back your seat…';
+      waitingBack.hidden = true;
+    }
 
     const url = new URL('api/ws', win.location.href);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
     url.searchParams.set('room', groupIdValue);
 
     const groupKey = deriveGroupKey(code);
-    let shown = false;
     let socket;
     const stored = outboxFor(local, groupIdValue);
     socket = new GroupSocket({
@@ -1116,9 +1254,9 @@ export function init(doc = document, win = window) {
           }
 
           if (frame.role === 'host') {
+            hostSocket = socket;
             if (!shown) {
               joinSocket = null;
-              hostSocket = socket;
               showGroup({
                 code,
                 name,
@@ -1132,6 +1270,7 @@ export function init(doc = document, win = window) {
             await applyGroupState(frame, Promise.resolve(key));
             await restorePending(socket.queueEntries());
           } else {
+            joinSocket = socket;
             if (!shown) {
               showGroup({
                 code,
@@ -1571,6 +1710,26 @@ export function init(doc = document, win = window) {
     return null;
   }
 
+  function cachePayload() {
+    if (!cachedBase) return null;
+    return { ...cachedBase, records: [...cachedRecords.values()] };
+  }
+
+  function writeCacheNow(groupIdValue) {
+    const payload = cachePayload();
+    if (groupIdValue && payload && saveCache(local, groupIdValue, payload)) {
+      cachedSavedAt = Date.now();
+    }
+  }
+
+  function scheduleCacheWrite(groupIdValue) {
+    if (cacheTimer !== null) return;
+    cacheTimer = win.setTimeout(() => {
+      cacheTimer = null;
+      writeCacheNow(groupIdValue);
+    }, 250);
+  }
+
   /** The people and the ledger, rebuilt from a state frame the viewer is allowed to see. */
   async function applyGroupState(frame, keyPromise) {
     const key = await keyPromise;
@@ -1620,6 +1779,18 @@ export function init(doc = document, win = window) {
       if (value) ledger.set(record.id, { ...record, value });
     }
     if (learned) saveRevs(local, groupIdValue, recordGuard.snapshot());
+
+    cachedBase = {
+      nameBlob: frame.nameBlob,
+      metaBlob: frame.metaBlob ?? null,
+      hostId: frame.hostId,
+      memberId: frame.memberId,
+      role: frame.role,
+      joinMode: frame.joinMode === 'open' ? 'open' : 'approval',
+      roster: frame.roster ?? []
+    };
+    cachedRecords = new Map((frame.records ?? []).map((record) => [record.id, { ...record }]));
+    writeCacheNow(groupIdValue);
 
     const active = groupSocket();
     if (active) {
@@ -2663,6 +2834,16 @@ export function init(doc = document, win = window) {
     if (frame.deleted) {
       const previous = ledger.get(frame.id)?.value;
       ledger.delete(frame.id);
+      cachedRecords.set(frame.id, {
+        id: frame.id,
+        rev: frame.rev,
+        blob: null,
+        deleted: true,
+        author: frame.author,
+        creator: frame.creator,
+        at: frame.at
+      });
+      scheduleCacheWrite(groupIdValue);
       renderLedger();
       if (frame.id === pendingDeleteId) pendingDeleteId = null;
       if (editingExpense?.id === frame.id) closeExpenseSheet();
@@ -2676,6 +2857,16 @@ export function init(doc = document, win = window) {
       return;
     }
     ledger.set(frame.id, { ...frame, value });
+    cachedRecords.set(frame.id, {
+      id: frame.id,
+      rev: frame.rev,
+      blob: frame.blob,
+      deleted: false,
+      author: frame.author,
+      creator: frame.creator,
+      at: frame.at
+    });
+    scheduleCacheWrite(groupIdValue);
     renderLedger();
     noteImportedRecord(frame.id);
 
@@ -3304,7 +3495,10 @@ export function init(doc = document, win = window) {
         await resumeStored(stored, invited.code);
         return;
       }
-      showJoin({ code: invited.code });
+      showJoin({
+        code: invited.code,
+        error: win.navigator?.onLine === false ? OFFLINE_FIRST_MESSAGE : ''
+      });
       return;
     }
 
@@ -3317,7 +3511,10 @@ export function init(doc = document, win = window) {
 
     const groupId = lastGroup(local);
     const stored = groupId ? sessionFor(local, groupId) : null;
-    if (!stored) return;
+    if (!stored) {
+      if (win.navigator?.onLine === false) showNotice(OFFLINE_FIRST_MESSAGE);
+      return;
+    }
 
     const code = codeFor(tab, groupId);
     if (code) {
@@ -3325,6 +3522,12 @@ export function init(doc = document, win = window) {
       return;
     }
     showJoin({ resume: stored });
+  }
+
+  if ('serviceWorker' in (win.navigator ?? {})) {
+    win.navigator.serviceWorker.register('sw.js').catch(() => {
+      /* an unsupported or blocked worker leaves the online app unchanged */
+    });
   }
 
   doc.documentElement.dataset.splitter = 'ready';

@@ -106,24 +106,92 @@ export function saveOutbox(storage, groupId, entries) {
   });
 }
 
-/** The last state seen for a group: sealed records only. */
+function isRosterEntry(member) {
+  return (
+    member !== null &&
+    typeof member === 'object' &&
+    typeof member.id === 'string' &&
+    ID.test(member.id) &&
+    (member.status === 'pending' || member.status === 'approved' || member.status === 'removed') &&
+    isSealed(member.nameBlob)
+  );
+}
+
+/**
+ * The last state seen for a group: sealed metadata, roster and records only.
+ *
+ * Nothing here can draw a decrypted row until the group code is present, which lives in
+ * sessionStorage and therefore only for this tab.
+ */
 export function cacheFor(storage, groupId) {
   if (!GROUP_ID.test(groupId)) return null;
   const all = read(storage, STATE_KEY);
   const row = all[groupId];
-  if (!row || row.schema !== CACHE_SCHEMA || !Array.isArray(row.records)) return null;
+  if (
+    !row ||
+    row.schema !== CACHE_SCHEMA ||
+    !isSealed(row.nameBlob) ||
+    (row.metaBlob !== null && !isSealed(row.metaBlob)) ||
+    typeof row.hostId !== 'string' ||
+    !ID.test(row.hostId) ||
+    typeof row.memberId !== 'string' ||
+    !ID.test(row.memberId) ||
+    (row.role !== 'host' && row.role !== 'member') ||
+    (row.joinMode !== 'open' && row.joinMode !== 'approval') ||
+    !Array.isArray(row.roster) ||
+    !Array.isArray(row.records)
+  ) {
+    return null;
+  }
   return {
     schema: row.schema,
     savedAt: Number.isSafeInteger(row.savedAt) ? row.savedAt : 0,
+    nameBlob: row.nameBlob,
+    metaBlob: row.metaBlob,
+    hostId: row.hostId,
+    memberId: row.memberId,
+    role: row.role,
+    joinMode: row.joinMode,
+    roster: row.roster.filter(isRosterEntry).map((member) => ({
+      ...member,
+      participant: member.participant === true
+    })),
     records: row.records.filter(isRecord).map((record) => ({ ...record }))
   };
 }
 
-export function saveCache(storage, groupId, records, savedAt = Date.now()) {
-  if (!GROUP_ID.test(groupId) || !Array.isArray(records)) return false;
-  const clean = records.filter(isRecord).map((record) => ({ ...record }));
-  return write(storage, STATE_KEY, {
-    ...read(storage, STATE_KEY),
-    [groupId]: { schema: CACHE_SCHEMA, savedAt, records: clean }
-  });
+export function saveCache(storage, groupId, state, savedAt = Date.now()) {
+  if (
+    !GROUP_ID.test(groupId) ||
+    !state ||
+    typeof state !== 'object' ||
+    !isSealed(state.nameBlob) ||
+    (state.metaBlob !== null && state.metaBlob !== undefined && !isSealed(state.metaBlob)) ||
+    typeof state.hostId !== 'string' ||
+    !ID.test(state.hostId) ||
+    typeof state.memberId !== 'string' ||
+    !ID.test(state.memberId) ||
+    (state.role !== 'host' && state.role !== 'member') ||
+    (state.joinMode !== 'open' && state.joinMode !== 'approval') ||
+    !Array.isArray(state.roster) ||
+    !Array.isArray(state.records)
+  ) {
+    return false;
+  }
+  const row = {
+    schema: CACHE_SCHEMA,
+    savedAt,
+    nameBlob: state.nameBlob,
+    metaBlob: state.metaBlob ?? null,
+    hostId: state.hostId,
+    memberId: state.memberId,
+    role: state.role,
+    joinMode: state.joinMode,
+    roster: state.roster.filter(isRosterEntry).map((member) => ({
+      ...member,
+      participant: member.participant === true
+    })),
+    records: state.records.filter(isRecord).map((record) => ({ ...record }))
+  };
+  return write(storage, STATE_KEY, { ...read(storage, STATE_KEY), [groupId]: row });
 }

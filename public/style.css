@@ -657,3 +657,8 @@ button {
   border-left: 3px solid var(--accent);
   background: var(--bg);
 }
+
+.banner {
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+}
