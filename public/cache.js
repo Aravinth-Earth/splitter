@@ -90,7 +90,11 @@ export function outboxFor(storage, groupId) {
   return row.items
     .filter((entry) => entry && typeof entry === 'object' && isFrame(entry.frame) && entry.frame.id === entry.id)
     .slice(0, MAX_QUEUE)
-    .map((entry) => ({ id: entry.id, frame: entry.frame }));
+    .map((entry) => ({
+      id: entry.id,
+      frame: entry.frame,
+      baseBlob: isSealed(entry.baseBlob) ? entry.baseBlob : null
+    }));
 }
 
 /** Replace a group's outbox. False means this storage cannot keep it; the caller stays online. */
@@ -99,7 +103,11 @@ export function saveOutbox(storage, groupId, entries) {
   const items = entries
     .filter((entry) => entry && typeof entry === 'object' && isFrame(entry.frame) && entry.frame.id === entry.id)
     .slice(0, MAX_QUEUE)
-    .map((entry) => ({ id: entry.id, frame: entry.frame }));
+    .map((entry) => ({
+      id: entry.id,
+      frame: entry.frame,
+      baseBlob: isSealed(entry.baseBlob) ? entry.baseBlob : null
+    }));
   return write(storage, OUTBOX_KEY, {
     ...read(storage, OUTBOX_KEY),
     [groupId]: { schema: CACHE_SCHEMA, savedAt: Date.now(), items }

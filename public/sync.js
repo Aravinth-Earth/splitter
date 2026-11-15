@@ -144,6 +144,22 @@ export class GroupSocket {
     if (this.queue.length !== before) this.notifyQueue();
   }
 
+  /** Replace a queued frame in place, keeping its position and id, and send it if open. */
+  replace(id, frame) {
+    const index = this.queue.findIndex((entry) => entry.id === id);
+    if (index < 0) return false;
+    this.queue[index] = { id, frame };
+    this.notifyQueue();
+    if (this.isOpen) {
+      try {
+        this.socket.send(JSON.stringify(frame));
+      } catch {
+        /* the close event will schedule the retry */
+      }
+    }
+    return true;
+  }
+
   /** Take the durable outbox back after a reload. The order is the order it was stored. */
   restore(entries = []) {
     this.queue = entries
