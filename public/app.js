@@ -47,7 +47,7 @@ import { GroupSocket, RevGuard } from './sync.js';
 import { attribute, balances, ledgerContributions, settle } from './balance.js';
 import { renderChart, totals as chartTotals } from './charts.js';
 import { mergeDiff } from './merge.js';
-import { exportFileName, exportGroup } from './export.js';
+import { exportFileName, exportGroup, importGroup } from './export.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -347,6 +347,13 @@ export function init(doc = document, win = window) {
   const exportPanel = doc.getElementById('export-panel');
   const exportButton = doc.getElementById('export-json');
   const exportStatus = doc.getElementById('export-status');
+  const importButton = doc.getElementById('import-json');
+  const importFile = doc.getElementById('import-file');
+  const importConfirm = doc.getElementById('import-confirm');
+  const importConfirmText = doc.getElementById('import-confirm-text');
+  const importConfirmButton = doc.getElementById('import-confirm-button');
+  const importCancelButton = doc.getElementById('import-cancel-button');
+  const importStatus = doc.getElementById('import-status');
   const paymentList = doc.getElementById('payment-list');
   const recordPaymentButton = doc.getElementById('record-payment');
   const settlementPanel = doc.getElementById('settlement-panel');
@@ -436,6 +443,7 @@ export function init(doc = document, win = window) {
   let groupKeyPromise = null;
   let selfId = null;
   let selfName = '';
+  let groupRole = 'organizer';
   let groupCurrency = DEFAULT_CURRENCY;
   let members = new Map();
   let ledger = new Map();
@@ -450,6 +458,8 @@ export function init(doc = document, win = window) {
   let mergeNotice = null;
   let mergeNoticeFields = [];
   let mergeRetryId = null;
+  let pendingImport = null;
+  let importJob = null;
   let pendingDeleteId = null;
   let editingExpense = null;
   let customSeed = null;
@@ -517,6 +527,25 @@ export function init(doc = document, win = window) {
   });
   chartModes.forEach((radio) => radio.addEventListener('change', renderCharts));
   exportButton.addEventListener('click', downloadExport);
+  importButton.addEventListener('click', () => {
+    if (importJob) return;
+    importFile.value = '';
+    importFile.click();
+  });
+  importFile.addEventListener('change', () => {
+    void chooseImportFile();
+  });
+  importConfirmButton.addEventListener('click', () => {
+    const chosen = pendingImport;
+    pendingImport = null;
+    importConfirm.hidden = true;
+    if (chosen) void beginImport(chosen);
+  });
+  importCancelButton.addEventListener('click', () => {
+    pendingImport = null;
+    importConfirm.hidden = true;
+    importStatus.textContent = 'Import cancelled.';
+  });
   addPayerButton.addEventListener('click', expandPayers);
   addAnotherPayerButton.addEventListener('click', () => addPayerRow());
   payerRows.addEventListener('input', updatePayerTotal);
@@ -690,6 +719,7 @@ export function init(doc = document, win = window) {
     groupKeyPromise = deriveGroupKey(code);
     selfId = memberId;
     selfName = displayName || 'You';
+    groupRole = role;
     groupCurrency = normalizeCurrency(currency);
     members = new Map();
     if (memberId) members.set(memberId, selfName);
@@ -702,6 +732,8 @@ export function init(doc = document, win = window) {
     renderLedger();
     exportPanel.hidden = false;
     exportStatus.textContent = '';
+    importButton.hidden = role !== 'organizer';
+    resetImport();
 
     groupNameDisplay.textContent = name;
     groupCode.textContent = formatCode(code);
@@ -812,6 +844,7 @@ export function init(doc = document, win = window) {
     balancesPanel.hidden = true;
     chartsPanel.hidden = true;
     exportPanel.hidden = true;
+    resetImport();
     createPanel.hidden = true;
     groupHeader.hidden = true;
     emptyLedger.hidden = true;
@@ -843,6 +876,7 @@ export function init(doc = document, win = window) {
     balancesPanel.hidden = true;
     chartsPanel.hidden = true;
     exportPanel.hidden = true;
+    resetImport();
     joinPanel.hidden = true;
     waitingPanel.hidden = true;
     groupHeader.hidden = true;
@@ -863,6 +897,7 @@ export function init(doc = document, win = window) {
     balancesPanel.hidden = true;
     chartsPanel.hidden = true;
     exportPanel.hidden = true;
+    resetImport();
     waitingPanel.hidden = false;
     waitingCode.textContent = formatCode(code);
     waitingTitle.textContent = 'Waiting for the organizer';
@@ -1255,11 +1290,16 @@ export function init(doc = document, win = window) {
           void handleRecordFrame(frame);
           return;
         }
+        if (frame.t === 'import-members-ok') {
+          handleImportMembersOk(frame);
+          return;
+        }
         if (frame.t === 'conflict') {
           handleExpenseConflict(frame);
           return;
         }
         if (frame.t === 'refused') {
+          if (handleImportRefusal(frame)) return;
           if (handleExpenseRefusal(frame)) return;
           rosterEmpty.textContent = 'That request could not be completed.';
           rosterEmpty.hidden = false;
@@ -1390,7 +1430,14 @@ export function init(doc = document, win = window) {
         if (hostSocket) hostSocket.send({ t: 'remove', memberId: member.id });
       });
 
-      chip.append(label, remove);
+      if (member.participant) {
+        const imported = doc.createElement('span');
+        imported.className = 'muted';
+        imported.textContent = 'imported';
+        chip.append(label, imported, remove);
+      } else {
+        chip.append(label, remove);
+      }
       rosterApproved.append(chip);
     }
   }
@@ -2504,7 +2551,10 @@ export function init(doc = document, win = window) {
     if (!groupKeyPromise) return;
     const key = await groupKeyPromise;
     const groupIdValue = await groupIdPromise;
-    if (!recordGuard.accept(frame)) return;
+    if (!recordGuard.accept(frame)) {
+      noteImportFailure(frame.id);
+      return;
+    }
     if (groupIdValue) saveRevs(local, groupIdValue, recordGuard.snapshot());
     groupSocket()?.ack(frame.id);
 
@@ -2519,9 +2569,13 @@ export function init(doc = document, win = window) {
     }
 
     const value = await decryptRecord(key, frame, groupIdValue);
-    if (!value) return;
+    if (!value) {
+      noteImportFailure(frame.id);
+      return;
+    }
     ledger.set(frame.id, { ...frame, value });
     renderLedger();
+    noteImportedRecord(frame.id);
 
     if (frame.id === pendingExpenseId && (!selfId || frame.author === selfId)) {
       const wasEditing = pendingExpenseEdit;
@@ -2830,6 +2884,247 @@ export function init(doc = document, win = window) {
     } catch {
       exportStatus.textContent = 'The file could not be made. Try again.';
     }
+  }
+
+
+  function resetImport() {
+    if (importJob?.timer) win.clearTimeout(importJob.timer);
+    pendingImport = null;
+    importJob = null;
+    importConfirm.hidden = true;
+    importConfirmText.textContent = '';
+    importStatus.textContent = '';
+    importButton.disabled = false;
+    importFile.value = '';
+  }
+
+  function liveRecordCount() {
+    return [...ledger.values()].filter((record) => !record.deleted).length;
+  }
+
+  const countLabel = (value, one, many) => `${value} ${value === 1 ? one : many}`;
+
+  /** Validate the chosen file before anything is written, then ask if the group is not empty. */
+  async function chooseImportFile() {
+    const chosen = importFile.files?.[0];
+    importFile.value = '';
+    if (!chosen || importJob) return;
+
+    importStatus.textContent = '';
+    importConfirm.hidden = true;
+    pendingImport = null;
+
+    if (groupRole !== 'organizer') {
+      importStatus.textContent = 'Only the organizer can import.';
+      return;
+    }
+
+    let text;
+    try {
+      text = await chosen.text();
+    } catch {
+      importStatus.textContent = 'That file could not be read.';
+      return;
+    }
+
+    const parsed = importGroup(text);
+    if (!parsed.ok) {
+      importStatus.textContent = parsed.message;
+      return;
+    }
+    if (parsed.group.currency !== groupCurrency) {
+      importStatus.textContent = `This file is in ${parsed.group.currency}; this group uses ${groupCurrency}.`;
+      return;
+    }
+
+    const existing = liveRecordCount();
+    if (existing > 0) {
+      pendingImport = parsed;
+      importConfirmText.textContent =
+        `This group already has ${countLabel(existing, 'record', 'records')}. ` +
+        `Importing adds ${countLabel(parsed.members.length, 'person', 'people')}, ` +
+        `${countLabel(parsed.expenses.length, 'expense', 'expenses')} and ` +
+        `${countLabel(parsed.settlements.length, 'payment', 'payments')}.`;
+      importConfirm.hidden = false;
+      return;
+    }
+
+    await beginImport(parsed);
+  }
+
+  /** Re-seal the file under this group's key, add its people, then write every record. */
+  async function beginImport(parsed) {
+    if (importJob) return;
+    const socket = groupSocket();
+    if (!socket || !socket.isOpen) {
+      importStatus.textContent = 'Importing needs a connection.';
+      return;
+    }
+
+    try {
+      const key = await groupKeyPromise;
+      const groupIdValue = await groupIdPromise;
+      const usedNames = new Set(members.values());
+      const takeName = (name) => {
+        let label = name;
+        let suffix = 2;
+        while (usedNames.has(label)) {
+          label = `${name} (${suffix})`;
+          suffix += 1;
+        }
+        usedNames.add(label);
+        return label;
+      };
+
+      const ids = new Map();
+      const memberFrames = [];
+      for (const member of parsed.members) {
+        const memberId = randomSecret();
+        ids.set(member.name, memberId);
+        memberFrames.push({ memberId, nameBlob: await seal(key, { name: takeName(member.name) }) });
+      }
+
+      const recordFrames = [];
+      for (const expense of parsed.expenses) {
+        const id = randomSecret();
+        const value = {
+          kind: 'expense',
+          description: expense.description,
+          amountPaise: expense.amountPaise,
+          paidBy: expense.paidBy.map((row) => ({
+            memberId: ids.get(row.name),
+            amountPaise: row.amountPaise
+          })),
+          split: Object.fromEntries(
+            expense.split.map((row) => [ids.get(row.name), row.amountPaise])
+          ),
+          date: expense.date,
+          time: expense.time,
+          note: expense.note
+        };
+        const blob = await seal(key, value, expenseAad(groupIdValue, id));
+        recordFrames.push({ id, frame: { t: 'put', id, base: 0, blob, deleted: false } });
+      }
+      for (const payment of parsed.settlements) {
+        const id = randomSecret();
+        const value = {
+          kind: 'settlement',
+          from: ids.get(payment.from),
+          to: ids.get(payment.to),
+          amountPaise: payment.amountPaise,
+          date: payment.date,
+          time: payment.time,
+          note: payment.note
+        };
+        const blob = await seal(key, value, settlementAad(groupIdValue, id));
+        recordFrames.push({ id, frame: { t: 'put', id, base: 0, blob, deleted: false } });
+      }
+
+      importJob = {
+        phase: 'members',
+        timer: win.setTimeout(() => {
+          if (importJob === null) return;
+          importStatus.textContent = 'The import is still waiting for the connection.';
+          importJob = null;
+          importButton.disabled = false;
+        }, 15_000),
+        memberIds: new Set(memberFrames.map((member) => member.memberId)),
+        recordIds: new Set(recordFrames.map((record) => record.id)),
+        recordFrames,
+        totalRecords: recordFrames.length,
+        done: 0,
+        failures: 0,
+        people: parsed.members.length,
+        expenses: parsed.expenses.length,
+        settlements: parsed.settlements.length
+      };
+      importButton.disabled = true;
+      importStatus.textContent =
+        `Importing ${countLabel(recordFrames.length, 'record', 'records')} for ` +
+        `${countLabel(parsed.members.length, 'person', 'people')}…`;
+      socket.send({ t: 'import-members', members: memberFrames });
+    } catch {
+      importJob = null;
+      importButton.disabled = false;
+      importStatus.textContent = 'The import could not be prepared. Try again.';
+    }
+  }
+
+  function handleImportMembersOk(frame) {
+    if (!importJob || importJob.phase !== 'members') return;
+    if (
+      !Array.isArray(frame.memberIds) ||
+      frame.memberIds.length !== importJob.memberIds.size ||
+      frame.memberIds.some((id) => !importJob.memberIds.has(id))
+    ) {
+      importStatus.textContent = 'The import could not confirm the people. Try again.';
+      importJob = null;
+      importButton.disabled = false;
+      return;
+    }
+    const socket = groupSocket();
+    if (!socket || !socket.isOpen) {
+      importStatus.textContent = 'The connection dropped; the import did not continue.';
+      importJob = null;
+      importButton.disabled = false;
+      return;
+    }
+
+    importJob.phase = 'records';
+    for (const record of importJob.recordFrames) {
+      socket.send(record.frame, { id: record.id });
+    }
+    if (importJob.totalRecords === 0) finishImport();
+  }
+
+  function handleImportRefusal(frame) {
+    if (!importJob) return false;
+
+    if (importJob.phase === 'members') {
+      if (importJob.timer) win.clearTimeout(importJob.timer);
+      importStatus.textContent =
+        frame.code === 'group_full'
+          ? 'The group has no room for the imported people.'
+          : frame.code === 'exists'
+            ? 'An imported person conflicts with an existing member.'
+            : 'The import could not add the people.';
+      importJob = null;
+      pendingImport = null;
+      importButton.disabled = false;
+      return true;
+    }
+
+    return noteImportFailure(frame.id);
+  }
+
+  function noteImportFailure(id) {
+    if (!importJob || importJob.phase !== 'records' || !importJob.recordIds.has(id)) return false;
+    importJob.failures += 1;
+    if (importJob.done + importJob.failures >= importJob.totalRecords) finishImport();
+    return true;
+  }
+
+  function noteImportedRecord(id) {
+    if (!importJob || importJob.phase !== 'records' || !importJob.recordIds.has(id)) return;
+    importJob.done += 1;
+    if (importJob.done + importJob.failures >= importJob.totalRecords) finishImport();
+  }
+
+  function finishImport() {
+    const job = importJob;
+    if (job?.timer) win.clearTimeout(job.timer);
+    importJob = null;
+    pendingImport = null;
+    importButton.disabled = false;
+    if (!job) return;
+    if (job.failures > 0) {
+      importStatus.textContent = `Imported ${job.done} of ${job.totalRecords} records; ${job.failures} failed.`;
+      return;
+    }
+    importStatus.textContent =
+      `Imported ${countLabel(job.expenses, 'expense', 'expenses')} and ` +
+      `${countLabel(job.settlements, 'payment', 'payments')} for ` +
+      `${countLabel(job.people, 'person', 'people')}.`;
   }
 
   function hideFallback() {

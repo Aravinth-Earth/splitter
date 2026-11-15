@@ -261,10 +261,20 @@
       <p class="export-warning" role="note">
         <strong>Anyone who opens this file can read every name and amount.</strong>
       </p>
-      <p class="balance-actions">
+      <div class="code-actions">
         <button id="export-json" class="secondary" type="button">Export JSON</button>
-      </p>
+        <button id="import-json" class="secondary" type="button" hidden>Import JSON</button>
+        <input id="import-file" type="file" accept="application/json,.json" hidden />
+      </div>
+      <div id="import-confirm" class="hint-card" role="note" hidden>
+        <p id="import-confirm-text"></p>
+        <p class="code-actions">
+          <button id="import-confirm-button" class="primary" type="button">Import</button>
+          <button id="import-cancel-button" class="link-button" type="button">Cancel</button>
+        </p>
+      </div>
       <p id="export-status" class="muted" role="status" aria-live="polite"></p>
+      <p id="import-status" class="muted" role="status" aria-live="polite"></p>
     </section>
 
     <section id="settlement-panel" class="panel sheet" aria-labelledby="settlement-title" hidden>
@@ -337,7 +347,8 @@
     </noscript>
 
     <p class="status">
-      In development — this page creates a group; the expense sheet and joining are still being built.
+      In development — groups, the ledger, balances, settlements, edits, delete, charts and export are live;
+      import is new.
       <a href="https://www.332321.xyz/">The rest of the site is here.</a>
     </p>
   </main>

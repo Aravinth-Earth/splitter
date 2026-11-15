@@ -413,6 +413,103 @@ test('a member cannot approve anyone', async (t) => {
   await host.silence(500);
 });
 
+test('the host imports participants as roster entries with no seats', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const oneId = randomSecret();
+  const twoId = randomSecret();
+  const oneBlob = await seal(group.key, { name: 'Imported One' });
+  const twoBlob = await seal(group.key, { name: 'Imported Two' });
+
+  host.send({
+    t: 'import-members',
+    members: [
+      { memberId: oneId, nameBlob: oneBlob },
+      { memberId: twoId, nameBlob: twoBlob }
+    ]
+  });
+
+  const state = await host.next();
+  assert.equal(state.t, 'state');
+  const one = state.roster.find((member) => member.id === oneId);
+  const two = state.roster.find((member) => member.id === twoId);
+  assert.equal(one.status, 'approved');
+  assert.equal(one.participant, true);
+  assert.equal(typeof one.nameBlob.ct, 'string');
+  assert.equal(two.status, 'approved');
+
+  const ok = await host.next();
+  assert.equal(ok.t, 'import-members-ok');
+  assert.deepEqual(ok.memberIds.sort(), [oneId, twoId].sort());
+});
+
+test('an import that would exceed the roster cap writes nobody', async (t) => {
+  const worker = await startWorker({ vars: { MAX_MEMBERS: '2' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const firstId = randomSecret();
+  const secondId = randomSecret();
+  host.send({
+    t: 'import-members',
+    members: [
+      { memberId: firstId, nameBlob: await seal(group.key, { name: 'One' }) },
+      { memberId: secondId, nameBlob: await seal(group.key, { name: 'Two' }) }
+    ]
+  });
+
+  assert.deepEqual(await host.next(), { t: 'refused', code: 'group_full' });
+  await host.silence(300);
+});
+
+test('a member cannot import participants', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+  const member = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => member.close());
+  member.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Member' })
+  });
+  assert.equal((await member.next()).t, 'waiting');
+  await host.next();
+  host.send({ t: 'approve', memberId });
+  assert.equal((await member.next()).t, 'state');
+
+  member.send({
+    t: 'import-members',
+    members: [
+      { memberId: randomSecret(), nameBlob: await seal(group.key, { name: 'Sneaky' }) }
+    ]
+  });
+  assert.deepEqual(await member.next(), { t: 'refused', code: 'not_host' });
+  assert.equal((await member.waitClosed()).code, 1008);
+});
+
 test('an approved member can be removed, and cannot return with the same secret', async (t) => {
   const worker = await startWorker();
   t.after(() => worker.stop());
