@@ -2489,6 +2489,17 @@ export function init(doc = document, win = window) {
     setStatus('That expense was not saved.');
   }
 
+  /** Say who removed the row, and what it was when the value is still in hand. */
+  function deletionStatus(record, value = null) {
+    const name = members.get(record?.author) || 'Someone';
+    if (value?.kind === 'settlement') return `Payment deleted by ${name}.`;
+    const what =
+      typeof value?.description === 'string' && value.description !== ''
+        ? `Expense “${value.description}”`
+        : 'Expense';
+    return `${what} deleted by ${name}.`;
+  }
+
   async function handleRecordFrame(frame) {
     if (!groupKeyPromise) return;
     const key = await groupKeyPromise;
@@ -2498,17 +2509,12 @@ export function init(doc = document, win = window) {
     groupSocket()?.ack(frame.id);
 
     if (frame.deleted) {
-      const wasSettlement = ledger.get(frame.id)?.value?.kind === 'settlement';
+      const previous = ledger.get(frame.id)?.value;
       ledger.delete(frame.id);
       renderLedger();
-      if (frame.id === pendingDeleteId) {
-        pendingDeleteId = null;
-        setStatus(wasSettlement ? 'Payment deleted.' : 'Expense deleted.');
-      }
-      if (editingExpense?.id === frame.id) {
-        closeExpenseSheet();
-        setStatus('Someone deleted this expense.');
-      }
+      if (frame.id === pendingDeleteId) pendingDeleteId = null;
+      if (editingExpense?.id === frame.id) closeExpenseSheet();
+      setStatus(deletionStatus(frame, previous));
       return;
     }
 
@@ -2618,16 +2624,12 @@ export function init(doc = document, win = window) {
     if (!editing && !deleting) return false;
 
     if (frame.current?.deleted) {
+      const previous = ledger.get(frame.id)?.value;
       ledger.delete(frame.id);
       renderLedger();
-      if (editing) {
-        closeExpenseSheet();
-        setStatus('Someone deleted this expense.');
-      }
-      if (deleting) {
-        pendingDeleteId = null;
-        setStatus('Someone deleted this expense.');
-      }
+      if (editing) closeExpenseSheet();
+      if (deleting) pendingDeleteId = null;
+      setStatus(deletionStatus(frame.current, previous));
       return true;
     }
 
