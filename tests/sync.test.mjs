@@ -81,6 +81,50 @@ function fakeWindow() {
   };
 }
 
+function clockWindow() {
+  let next = 0;
+  let now = 0;
+  const timers = new Map();
+  return {
+    WebSocket: FakeSocket,
+    setTimeout(fn, delay = 0) {
+      const id = ++next;
+      timers.set(id, { fn, at: now + delay });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+    setInterval(fn, delay = 0) {
+      const id = ++next;
+      timers.set(id, { fn, at: now + delay, every: delay });
+      return id;
+    },
+    clearInterval(id) {
+      timers.delete(id);
+    },
+    advance(ms) {
+      const target = now + ms;
+      for (;;) {
+        let due = null;
+        for (const [id, timer] of timers) {
+          if (timer.at <= target && (due === null || timer.at < due.timer.at || (timer.at === due.timer.at && id < due.id))) {
+            due = { id, timer };
+          }
+        }
+        if (!due) break;
+        now = due.timer.at;
+        if (due.timer.every !== undefined) due.timer.at = now + due.timer.every;
+        else timers.delete(due.id);
+        due.timer.fn();
+      }
+      now = target;
+    },
+    addEventListener() {},
+    removeEventListener() {}
+  };
+}
+
 test('sync: backoff grows from half a second to a ten-second ceiling with jitter', () => {
   assert.equal(backoffDelay(0, () => 0), MIN_DELAY_MS);
   assert.equal(backoffDelay(0, () => 1), MIN_DELAY_MS * 1.2);
@@ -205,4 +249,56 @@ test('sync: a reloaded guard keeps the stored revision and never lowers it', () 
   guard.hydrate({ record: 4, third: 1 });
   assert.equal(guard.highest('record'), 9, 'hydration cannot lower a known revision');
   assert.equal(guard.highest('third'), 1);
+});
+
+
+test('sync: a long queue flushes in order under the configured gap', () => {
+  FakeSocket.instances = [];
+  const win = clockWindow();
+  const socket = new GroupSocket({
+    url: 'ws://test/api/ws',
+    auth: { t: 'auth', id: 'member' },
+    win,
+    flushGapMs: 500,
+    onFrame: () => {}
+  });
+  for (let index = 0; index < 50; index += 1) {
+    socket.send({ t: 'put', id: `q${index}` }, { id: `q${index}` });
+  }
+  socket.connect();
+  const ws = FakeSocket.instances.at(-1);
+  ws.emit('open');
+  assert.deepEqual(ws.sent.slice(1).map((frame) => frame.id), ['q0']);
+
+  win.advance(499);
+  assert.equal(ws.sent.length, 2, 'only auth plus the first queued frame');
+  win.advance(1);
+  assert.equal(ws.sent.length, 3);
+  win.advance(24_000);
+  assert.deepEqual(
+    ws.sent.slice(1).map((frame) => frame.id),
+    Array.from({ length: 50 }, (_, index) => `q${index}`),
+    'all fifty left in local order'
+  );
+  socket.close();
+});
+
+test('sync: queue changes are reported for durable storage', () => {
+  FakeSocket.instances = [];
+  const win = fakeWindow();
+  const seen = [];
+  const socket = new GroupSocket({
+    url: 'ws://test/api/ws',
+    auth: { t: 'auth', id: 'member' },
+    win,
+    onFrame: () => {},
+    onQueueChange: (entries) => seen.push(entries.map((entry) => entry.id))
+  });
+
+  socket.send({ t: 'put', id: 'one' }, { id: 'one' });
+  socket.send({ t: 'put', id: 'two' }, { id: 'two' });
+  socket.ack('one');
+  socket.restore([{ id: 'three', frame: { t: 'put', id: 'three' } }]);
+  assert.deepEqual(seen, [['one'], ['one', 'two'], ['two'], ['three']]);
+  assert.deepEqual(socket.queueEntries().map((entry) => entry.id), ['three']);
 });
