@@ -249,6 +249,10 @@ export class Group {
       this.sendFrame(socket, { t: 'pong' });
       return;
     }
+    if (frame.t === 'import-members') {
+      await this.importMembers(socket, frame);
+      return;
+    }
     if (frame.t !== 'approve' && frame.t !== 'reject' && frame.t !== 'remove' && frame.t !== 'mode') {
       return;
     }
@@ -307,6 +311,69 @@ export class Group {
       frame.t === 'approve' ? 'approved' : 'declined'
     );
     await this.notifyState(meta, handled);
+  }
+
+  /**
+   * The host adds participants that came from an export.
+   *
+   * They are approved roster entries with a sealed name and no secret, so every device can resolve
+   * the names in imported expenses and nobody can sign in as them. The whole batch is checked
+   * before any entry is written: a capacity refusal leaves the roster exactly as it was.
+   */
+  async importMembers(socket, frame) {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta) return this.refuse(socket, 'unknown_group');
+
+    const identity = this.identities.get(socket);
+    if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
+
+    if (!Array.isArray(frame.members) || frame.members.length === 0) {
+      this.sendRefusal(socket, 'bad_request');
+      return;
+    }
+
+    const seen = new Set();
+    const entries = [];
+    let active = 1 + [...(await this.members()).values()].filter(
+      (member) => member.status !== 'removed'
+    ).length;
+
+    for (const member of frame.members) {
+      if (!member || !isId(member.memberId) || !isSealed(member.nameBlob)) {
+        this.sendRefusal(socket, 'bad_request');
+        return;
+      }
+      if (seen.has(member.memberId)) {
+        this.sendRefusal(socket, 'bad_request');
+        return;
+      }
+      seen.add(member.memberId);
+
+      const existing = await this.ctx.storage.get(memberKey(member.memberId));
+      if (existing && !existing.participant) {
+        this.sendRefusal(socket, 'exists');
+        return;
+      }
+      if (!existing || existing.status !== 'approved') active += 1;
+      entries.push({
+        key: memberKey(member.memberId),
+        value: {
+          status: 'approved',
+          nameBlob: member.nameBlob,
+          joinedAt: existing?.joinedAt ?? Date.now(),
+          participant: true
+        }
+      });
+    }
+
+    if (active > this.maxMembers()) {
+      this.sendRefusal(socket, 'group_full');
+      return;
+    }
+
+    for (const entry of entries) await this.ctx.storage.put(entry.key, entry.value);
+    await this.notifyState(meta);
+    this.sendFrame(socket, { t: 'import-members-ok', memberIds: [...seen] });
   }
 
   /** A decision reaches the person waiting, if they still have a socket. */
@@ -563,7 +630,12 @@ export class Group {
       if (entry.status === 'removed') continue;
       const id = key.slice(MEMBER_PREFIX.length);
       if (role === 'host' || entry.status === 'approved') {
-        roster.push({ id, status: entry.status, nameBlob: entry.nameBlob });
+        roster.push({
+          id,
+          status: entry.status,
+          nameBlob: entry.nameBlob,
+          participant: entry.participant === true
+        });
       }
     }
     const records = [];

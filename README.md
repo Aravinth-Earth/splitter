@@ -7,8 +7,8 @@ The code **is** the key. The browser stretches it into an AES-256-GCM key, seals
 before anything leaves the page, and the Worker only ever sees ciphertext plus the ids, revisions and timestamps
 it needs to route and order it. No accounts, no email, no analytics, no third-party script.
 
-**Live:** <https://expense-splitter.332321.xyz/> · **Status:** in development — the app creates a group;
-joining, the expense sheet and live sync are still being built. The introduction to the product lives at
+**Live:** <https://expense-splitter.332321.xyz/> · **Status:** in development — groups, the ledger, balances,
+settlements, edits, delete, charts, export and import are live. The introduction to the product lives at
 <https://www.332321.xyz/w/expense-splitter/>.
 
 ## What the server knows, and what it cannot do
@@ -36,6 +36,49 @@ Three consequences worth stating before you trust it:
 - **Money is integer paise** end to end; the remainder of a division goes to the largest share.
 - **Conflicts are per record**: a write names the revision it was based on, and a refused write is merged
   field-by-field rather than overwriting a peer.
+
+## Export and import
+
+**Export JSON** downloads one readable file. It is built in the browser from decrypted values, so anyone who
+opens it can read every name and amount; the page says so before the button. The filename is
+`splitter-YYYY-MM-DD-HHMM.json` in local time, never the group name.
+
+**Import JSON** is offered to the organizer. The whole file is validated before anything is written: a bad
+schema, a missing field, a non-integer amount or a split that does not total its expense changes nothing and
+names the first failing field. Importing into a group that already has records asks first and states the count.
+Imported people become approved roster participants with no login secret, so every device resolves their names
+but nobody can sign in as them. A name already in the group gets a suffix (`Name (2)`), never a silent merge.
+Every imported record is re-sealed under the current group key, so a file from another group cannot be read
+with its key. Importing does not rename the target group or change its currency; a file whose currency differs
+from the group's is refused.
+
+`splitter.group/1`:
+
+| Path | Meaning |
+| --- | --- |
+| `schema` | the literal `splitter.group/1` |
+| `group.name` | the group's display name |
+| `group.currency` | `INR`, `EUR`, `USD` or `GBP` |
+| `members[].name` | a participant's display name, unique in the file |
+| `members[].status` | `approved`, `pending` or `removed` |
+| `expenses[].description` | what was bought, at most 120 characters |
+| `expenses[].amountPaise` | the amount as an integer number of paise |
+| `expenses[].paidBy[].name` | a member name |
+| `expenses[].paidBy[].amountPaise` | that payer's integer paise; the list totals `amountPaise` |
+| `expenses[].split[].name` | a member name |
+| `expenses[].split[].amountPaise` | that member's integer paise; the list totals `amountPaise` |
+| `expenses[].date` | `YYYY-MM-DD` |
+| `expenses[].time` | `HH:MM` |
+| `expenses[].note` | free text, at most 500 characters |
+| `settlements[].from` | the payer's member name |
+| `settlements[].to` | the receiver's member name |
+| `settlements[].amountPaise` | the payment as integer paise |
+| `settlements[].date` | `YYYY-MM-DD` |
+| `settlements[].time` | `HH:MM` |
+| `settlements[].note` | free text, at most 500 characters |
+| `exportedAt` | ISO-8601 timestamp with the writer's offset |
+
+The file carries no group code, group id, member id, key, ciphertext, IV or room URL.
 
 ## Requirements and roadmap
 
