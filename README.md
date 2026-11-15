@@ -36,6 +36,8 @@ Three consequences worth stating before you trust it:
 - **Money is integer paise** end to end; the remainder of a division goes to the largest share.
 - **Conflicts are per record**: a write names the revision it was based on, and a refused write is merged
   field-by-field rather than overwriting a peer.
+- **Offline-first:** a service worker caches the shell; the last sealed state and the sealed outbox live in
+  this browser, so a reload paints the ledger and queued changes flush once the socket returns.
 
 ## Export and import
 

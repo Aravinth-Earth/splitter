@@ -474,6 +474,8 @@ export function init(doc = document, win = window) {
   let cacheTimer = null;
   let cachedSavedAt = 0;
   let connectionStatus = 'offline';
+  let queuedEditBases = new Map();
+  let queuedEditRetries = new Set();
   let pendingDeleteId = null;
   let editingExpense = null;
   let customSeed = null;
@@ -733,7 +735,18 @@ export function init(doc = document, win = window) {
 
   function persistOutbox(entries) {
     if (!groupId) return;
-    const saved = saveOutbox(local, groupId, entries);
+    const items = entries.map((entry) => ({
+      ...entry,
+      baseBlob: queuedEditBases.get(entry.id)?.baseBlob ?? null
+    }));
+    const live = new Set(entries.map((entry) => entry.id));
+    for (const id of [...queuedEditBases.keys()]) {
+      if (!live.has(id)) {
+        queuedEditBases.delete(id);
+        queuedEditRetries.delete(id);
+      }
+    }
+    const saved = saveOutbox(local, groupId, items);
     renderPendingCount();
     if (!saved && entries.length > 0 && !outboxWarningShown) {
       outboxWarningShown = true;
@@ -810,6 +823,8 @@ export function init(doc = document, win = window) {
     cacheTimer = null;
     cachedBase = null;
     cachedRecords = new Map();
+    queuedEditBases = new Map();
+    queuedEditRetries = new Set();
     importButton.hidden = role !== 'organizer';
     resetImport();
 
@@ -1160,7 +1175,9 @@ export function init(doc = document, win = window) {
     cachedRecords = new Map(cached.records.map((record) => [record.id, { ...record }]));
     cachedSavedAt = cached.savedAt;
 
-    await restorePending(outboxFor(local, groupIdValue));
+    const pending = outboxFor(local, groupIdValue);
+    prepareOutbox(pending);
+    await restorePending(pending);
     renderLedger();
     if (win.navigator?.onLine === false) renderOfflineBanner('offline');
   }
@@ -1212,6 +1229,7 @@ export function init(doc = document, win = window) {
     const groupKey = deriveGroupKey(code);
     let socket;
     const stored = outboxFor(local, groupIdValue);
+    prepareOutbox(stored);
     socket = new GroupSocket({
       url: url.toString(),
       auth: { t: 'auth', id: session.memberId, secret: session.memberSecret, mode: 'resume' },
@@ -1409,6 +1427,7 @@ export function init(doc = document, win = window) {
     });
 
     const stored = outboxFor(local, groupId);
+    prepareOutbox(stored);
     socket.restore(stored);
     void restorePending(stored);
 
@@ -1489,6 +1508,7 @@ export function init(doc = document, win = window) {
     });
 
     const stored = outboxFor(local, groupId);
+    prepareOutbox(stored);
     socket.restore(stored);
     void restorePending(stored);
 
@@ -1683,6 +1703,9 @@ export function init(doc = document, win = window) {
     if (joinSocket?.isOpen) return joinSocket;
     return null;
   }
+
+  /** The sealed copy of the revision an offline edit started from; never plaintext at rest. */
+  const baseAad = (groupIdValue, id) => expenseAad(groupIdValue, `${id}/base`);
 
   async function decryptRecord(key, record, groupIdValue) {
     for (const aad of [expenseAad(groupIdValue, record.id), settlementAad(groupIdValue, record.id)]) {
@@ -2674,10 +2697,6 @@ export function init(doc = document, win = window) {
 
     const socket = groupSocket();
     if (!socket) return expenseFailure('The group is not connected. Try again.', expenseSave);
-    if (!socket.isOpen && editingExpense) {
-      return expenseFailure('Editing needs a connection. Try again.', expenseSave);
-    }
-
     savingExpense = true;
     pendingExpenseEdit = Boolean(editingExpense);
     expenseSave.disabled = true;
@@ -2698,6 +2717,18 @@ export function init(doc = document, win = window) {
         note: note.value
       };
       const blob = await seal(key, value, expenseAad(groupIdValue, expenseDraftId));
+      const edited = editingExpense;
+      if (edited) {
+        const baseBlob = await seal(
+          key,
+          edited.value,
+          baseAad(groupIdValue, expenseDraftId)
+        );
+        queuedEditBases.set(expenseDraftId, { value: edited.value, baseBlob });
+        queuedEditRetries.delete(expenseDraftId);
+      } else {
+        queuedEditBases.delete(expenseDraftId);
+      }
       pendingExpenseValue = value;
       mergeNotice = null;
       mergeNoticeFields = [];
@@ -2714,15 +2745,16 @@ export function init(doc = document, win = window) {
       );
 
       if (!socket.isOpen) {
+        const previous = edited ? ledger.get(expenseDraftId) : null;
         ledger.set(expenseDraftId, {
           id: expenseDraftId,
-          rev: 0,
+          rev: edited ? edited.rev : 0,
           pending: true,
           blob,
           value,
-          at: Date.now(),
+          at: previous?.at ?? Date.now(),
           author: selfId,
-          creator: selfId
+          creator: edited?.creator ?? edited?.author ?? selfId
         });
         savingExpense = false;
         pendingExpenseId = null;
@@ -2752,22 +2784,33 @@ export function init(doc = document, win = window) {
     for (const entry of entries) {
       if (entry.frame.deleted) continue;
       const existing = ledger.get(entry.id);
-      if (existing && !existing.pending) continue;
+      if (existing && !existing.pending && entry.frame.base === 0) continue;
       const value = await decryptRecord(
         key,
         { id: entry.id, blob: entry.frame.blob, deleted: false },
         groupIdValue
       );
       if (!value) continue;
+      if (entry.frame.base > 0 && entry.baseBlob) {
+        try {
+          const base = await open(key, entry.baseBlob, baseAad(groupIdValue, entry.id));
+          if (base && typeof base === 'object') {
+            queuedEditBases.set(entry.id, { value: base, baseBlob: entry.baseBlob });
+          }
+        } catch {
+          /* the edit stays pending; a conflict will refuse rather than guess */
+        }
+      }
+      const at = existing?.at ?? Date.now();
       ledger.set(entry.id, {
         id: entry.id,
-        rev: 0,
+        rev: entry.frame.base,
         pending: true,
         blob: entry.frame.blob,
         value,
         author: selfId,
-        creator: selfId,
-        at: Date.now()
+        creator: existing?.creator ?? existing?.author ?? selfId,
+        at
       });
     }
     renderLedger();
@@ -2964,6 +3007,101 @@ export function init(doc = document, win = window) {
     return true;
   }
 
+  function dropQueuedEdit(id) {
+    queuedEditBases.delete(id);
+    queuedEditRetries.delete(id);
+    groupSocket()?.ack(id);
+  }
+
+  /**
+   * A queued edit reached a record that moved. Merge it field-by-field once, re-seal the merged
+   * value and replace the queued frame in place; a second conflict stops with the latest shown.
+   */
+  async function mergeQueuedEdit(frame) {
+    const id = frame.id;
+    const base = queuedEditBases.get(id);
+    const pending = ledger.get(id);
+
+    if (!base?.value || !pending) {
+      dropQueuedEdit(id);
+      setStatus('The edit could not be saved. Try again.');
+      return;
+    }
+    if (!frame.current) {
+      dropQueuedEdit(id);
+      setStatus('The expense could not be saved.');
+      return;
+    }
+    if (frame.current.deleted) {
+      dropQueuedEdit(id);
+      ledger.delete(id);
+      renderLedger();
+      setStatus(deletionStatus(frame.current, pending.value));
+      return;
+    }
+
+    const key = await groupKeyPromise;
+    const groupIdValue = await groupIdPromise;
+    const currentValue = await decryptRecord(key, frame.current, groupIdValue);
+    if (!currentValue) {
+      dropQueuedEdit(id);
+      setStatus('The edit could not be merged. Try again.');
+      return;
+    }
+
+    if (JSON.stringify(currentValue) === JSON.stringify(pending.value)) {
+      dropQueuedEdit(id);
+      ledger.set(id, { ...frame.current, value: currentValue });
+      renderLedger();
+      setStatus('Expense saved.');
+      return;
+    }
+
+    if (queuedEditRetries.has(id)) {
+      dropQueuedEdit(id);
+      ledger.set(id, { ...frame.current, value: currentValue });
+      renderLedger();
+      setStatus('This expense changed again. Your edit was not saved; the latest version is shown.');
+      return;
+    }
+
+    const merged = mergeDiff(base.value, pending.value, currentValue);
+    if (merged.broken) {
+      dropQueuedEdit(id);
+      ledger.set(id, { ...frame.current, value: currentValue });
+      renderLedger();
+      setStatus('Your edit and the latest version no longer add up. The latest version is shown.');
+      return;
+    }
+
+    try {
+      const blob = await seal(key, merged.value, expenseAad(groupIdValue, id));
+      const baseBlob = await seal(key, currentValue, baseAad(groupIdValue, id));
+      queuedEditBases.set(id, { value: currentValue, baseBlob });
+      queuedEditRetries.add(id);
+      ledger.set(id, {
+        ...frame.current,
+        pending: true,
+        blob,
+        value: merged.value,
+        author: selfId,
+        creator: frame.current.creator ?? frame.current.author ?? selfId
+      });
+      renderLedger();
+      groupSocket()?.replace(id, {
+        t: 'put',
+        id,
+        base: frame.current.rev,
+        blob,
+        deleted: false
+      });
+      setStatus(mergeMessage(merged, memberLabel(frame.current.author)));
+    } catch {
+      dropQueuedEdit(id);
+      setStatus('The edit could not be re-sealed. Check the latest version and try again.');
+    }
+  }
+
   function handleExpenseConflict(frame) {
     const settling = frame.id === pendingSettlementId;
     if (settling) {
@@ -2974,6 +3112,11 @@ export function init(doc = document, win = window) {
       settleSave.textContent = 'Record payment';
       if (frame.current) void applyCurrentRecord(frame.current);
       settleFailure('This record changed elsewhere. Try again.', settleSave);
+      return true;
+    }
+
+    if (queuedEditBases.has(frame.id) && frame.id !== pendingExpenseId) {
+      void mergeQueuedEdit(frame);
       return true;
     }
 
@@ -3119,6 +3262,8 @@ export function init(doc = document, win = window) {
 
     try {
       const blob = await seal(key, merged.value, expenseAad(groupIdValue, frame.id));
+      const baseBlob = await seal(key, currentValue, baseAad(groupIdValue, frame.id));
+      queuedEditBases.set(frame.id, { value: currentValue, baseBlob });
       groupSocket()?.send(
         { t: 'put', id: frame.id, base: frame.current.rev, blob, deleted: false },
         { id: frame.id }
@@ -3196,6 +3341,17 @@ export function init(doc = document, win = window) {
     }
   }
 
+
+  function prepareOutbox(entries) {
+    for (const entry of entries) {
+      if (entry.baseBlob) {
+        queuedEditBases.set(entry.id, {
+          baseBlob: entry.baseBlob,
+          value: queuedEditBases.get(entry.id)?.value ?? null
+        });
+      }
+    }
+  }
 
   function resetImport() {
     if (importJob?.timer) win.clearTimeout(importJob.timer);

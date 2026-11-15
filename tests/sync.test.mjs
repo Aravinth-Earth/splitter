@@ -302,3 +302,27 @@ test('sync: queue changes are reported for durable storage', () => {
   assert.deepEqual(seen, [['one'], ['one', 'two'], ['two'], ['three']]);
   assert.deepEqual(socket.queueEntries().map((entry) => entry.id), ['three']);
 });
+
+
+test('sync: a queued frame can be replaced in place for a merged retry', () => {
+  FakeSocket.instances = [];
+  const win = fakeWindow();
+  const seen = [];
+  const socket = new GroupSocket({
+    url: 'ws://test/api/ws',
+    auth: { t: 'auth', id: 'member' },
+    win,
+    onFrame: () => {},
+    onQueueChange: (entries) => seen.push(entries.map((entry) => [entry.id, entry.frame.base]))
+  });
+  socket.send({ t: 'put', id: 'one', base: 0 }, { id: 'one' });
+  socket.connect();
+  const ws = FakeSocket.instances.at(-1);
+  ws.emit('open');
+  assert.equal(socket.replace('one', { t: 'put', id: 'one', base: 4 }), true);
+  assert.equal(socket.queue[0].frame.base, 4);
+  assert.deepEqual(ws.sent.at(-1), { t: 'put', id: 'one', base: 4 });
+  assert.deepEqual(seen.at(-1), [['one', 4]]);
+  assert.equal(socket.replace('missing', { t: 'put', id: 'missing', base: 0 }), false);
+  socket.close();
+});
