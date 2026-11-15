@@ -302,7 +302,7 @@ export class Group {
     if (frame.t === 'approve') {
       await this.ctx.storage.put(key, { ...entry, status: 'approved' });
     } else {
-      await this.ctx.storage.put(key, { ...entry, status: 'removed' });
+      await this.ctx.storage.put(key, { ...entry, status: 'declined' });
     }
 
     const handled = await this.notifyMember(
@@ -335,7 +335,7 @@ export class Group {
     const seen = new Set();
     const entries = [];
     let active = 1 + [...(await this.members()).values()].filter(
-      (member) => member.status !== 'removed'
+      (member) => member.status !== 'removed' && member.status !== 'declined'
     ).length;
 
     for (const member of frame.members) {
@@ -459,7 +459,10 @@ export class Group {
     }
 
     const roster = await this.members();
-    const occupied = 1 + [...roster.values()].filter((member) => member.status !== 'removed').length;
+    const occupied =
+      1 +
+      [...roster.values()].filter((member) => member.status !== 'removed' && member.status !== 'declined')
+        .length;
     if (occupied >= this.maxMembers()) {
       await this.noteJoinFailure(ip);
       this.refuse(socket, 'group_full');
@@ -627,16 +630,18 @@ export class Group {
     }
     const members = await this.members();
     for (const [key, entry] of members) {
-      if (entry.status === 'removed') continue;
       const id = key.slice(MEMBER_PREFIX.length);
-      if (role === 'host' || entry.status === 'approved') {
-        roster.push({
-          id,
-          status: entry.status,
-          nameBlob: entry.nameBlob,
-          participant: entry.participant === true
-        });
-      }
+      /* A removed member's name blob and status still travel: their expenses remain in the
+         ledger, and a payer whose name no longer opens would render as nobody. Pending names
+         still go only to the host, who has to decide. */
+      if (entry.status === 'pending' && role !== 'host') continue;
+      if (entry.status === 'declined') continue;
+      roster.push({
+        id,
+        status: entry.status,
+        nameBlob: entry.nameBlob,
+        participant: entry.participant === true
+      });
     }
     const records = [];
     if (role === 'host' || role === 'member') {

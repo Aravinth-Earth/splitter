@@ -446,6 +446,7 @@ export function init(doc = document, win = window) {
   let groupRole = 'organizer';
   let groupCurrency = DEFAULT_CURRENCY;
   let members = new Map();
+  let removedMembers = new Set();
   let ledger = new Map();
   let recordGuard = new RevGuard();
   let guardGroupId = null;
@@ -722,6 +723,7 @@ export function init(doc = document, win = window) {
     groupRole = role;
     groupCurrency = normalizeCurrency(currency);
     members = new Map();
+    removedMembers = new Set();
     if (memberId) members.set(memberId, selfName);
     ledger = new Map();
     expenseDraftId = null;
@@ -1448,10 +1450,27 @@ export function init(doc = document, win = window) {
     return splitModes.find((radio) => radio.checked)?.value ?? 'equal';
   }
 
+  /** A name as the whole page should show it; a removed member keeps their name and gets a marker. */
+  function memberLabel(id) {
+    const name = members.get(id);
+    if (!name) return 'Someone';
+    return removedMembers.has(id) ? `${name} · removed` : name;
+  }
+
+  /** The people an expense sheet offers: removed members only when this edit already names them. */
   function splitMembers() {
-    return [...members.entries()].sort(
-      (left, right) => left[1].localeCompare(right[1]) || (left[0] < right[0] ? -1 : 1)
-    );
+    const required = new Set();
+    if (editingExpense?.value) {
+      const payers = Array.isArray(editingExpense.value.paidBy)
+        ? editingExpense.value.paidBy
+        : [{ memberId: editingExpense.value.paidBy }];
+      for (const payer of payers) required.add(payer.memberId);
+      for (const id of Object.keys(editingExpense.value.split ?? {})) required.add(id);
+    }
+    return [...members.entries()]
+      .filter(([id]) => !removedMembers.has(id) || required.has(id))
+      .map(([id]) => [id, memberLabel(id)])
+      .sort((left, right) => left[1].localeCompare(right[1]) || (left[0] < right[0] ? -1 : 1));
   }
 
   function expenseFailure(message, field) {
@@ -1533,12 +1552,15 @@ export function init(doc = document, win = window) {
 
     const previousMembers = [...members.keys()].join(',');
     const nextMembers = new Map();
+    const nextRemoved = new Set();
     for (const member of frame.roster ?? []) {
-      if (member.status !== 'approved') continue;
+      if (member.status === 'removed') nextRemoved.add(member.id);
+      if (member.status !== 'approved' && member.status !== 'removed') continue;
       nextMembers.set(member.id, await nameOf(key, member.nameBlob));
     }
     if (selfId && !nextMembers.has(selfId)) nextMembers.set(selfId, selfName || 'You');
     members = nextMembers;
+    removedMembers = nextRemoved;
 
     /* A state snapshot is merged into what is on screen, not swapped in: a broadcast that landed
        while the snapshot was being built is newer than the snapshot, and a dropped frame must not
@@ -1609,16 +1631,14 @@ export function init(doc = document, win = window) {
       const payers = Array.isArray(value.paidBy)
         ? value.paidBy
         : [{ memberId: value.paidBy, amountPaise: value.amountPaise }];
-      const payer = payers
-        .map((entry) => members.get(entry.memberId) || 'Someone')
-        .join(' + ');
+      const payer = payers.map((entry) => memberLabel(entry.memberId)).join(' + ');
       const detail =
         payers.length > 1
           ? ` (${payers.map((entry) => formatPaise(entry.amountPaise, groupCurrency)).join(' + ')})`
           : '';
       const creator = record.creator ?? record.author;
       const edited = creator && creator !== record.author;
-      const editor = members.get(record.author) || 'Someone';
+      const editor = memberLabel(record.author);
       meta.textContent =
         `Paid by ${payer}${detail} · ${value.date} ${value.time}` +
         (edited ? ` · edited by ${editor}` : '');
@@ -1717,14 +1737,14 @@ export function init(doc = document, win = window) {
       referenced.add(payment.to);
     }
     lastChartIds = [...referenced];
-    lastChartNames = new Map(members);
+    lastChartNames = new Map([...members.keys()].map((id) => [id, memberLabel(id)]));
     lastChartExpenses = expenses;
     const map = balances([...referenced], expenses, settlements);
     const proposal = settle(map);
     const contributions = ledgerContributions([...referenced], expenses, settlements);
     const transfers = attribute(proposal.transfers, contributions);
     lastBalances = map;
-    const names = new Map(members);
+    const names = new Map([...members.keys()].map((id) => [id, memberLabel(id)]));
 
     balanceList.textContent = '';
     const ordered = Object.entries(map).sort(
@@ -2245,7 +2265,7 @@ export function init(doc = document, win = window) {
   function settlementPeople() {
     const ids = new Set([...members.keys(), ...Object.keys(lastBalances)]);
     return [...ids]
-      .map((id) => ({ id, name: members.get(id) || 'Someone' }))
+      .map((id) => ({ id, name: memberLabel(id) }))
       .sort((left, right) => left.name.localeCompare(right.name) || (left.id < right.id ? -1 : 1));
   }
 
@@ -2538,7 +2558,7 @@ export function init(doc = document, win = window) {
 
   /** Say who removed the row, and what it was when the value is still in hand. */
   function deletionStatus(record, value = null) {
-    const name = members.get(record?.author) || 'Someone';
+    const name = memberLabel(record?.author);
     if (value?.kind === 'settlement') return `Payment deleted by ${name}.`;
     const what =
       typeof value?.description === 'string' && value.description !== ''
@@ -2792,7 +2812,7 @@ export function init(doc = document, win = window) {
     }
 
     const merged = mergeDiff(editingBaseValue, pendingExpenseValue, currentValue);
-    const peerName = members.get(frame.current.author) || 'Someone';
+    const peerName = memberLabel(frame.current.author);
 
     if (merged.broken) {
       openExpenseSheet({ ...frame.current, value: merged.value });

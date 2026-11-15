@@ -413,6 +413,38 @@ test('a member cannot approve anyone', async (t) => {
   await host.silence(500);
 });
 
+test('a sealed expense leaves no description or amount on the wire', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const id = randomSecret();
+  host.send({
+    t: 'put',
+    id,
+    base: 0,
+    blob: await seal(group.key, {
+      description: 'TOP-SECRET-DINNER',
+      amountPaise: 987_654,
+      paidBy: [group.hostId],
+      split: { [group.hostId]: 987_654 }
+    }),
+    deleted: false
+  });
+
+  const record = await host.next();
+  const wire = JSON.stringify(record);
+  assert.equal(wire.includes('TOP-SECRET-DINNER'), false, 'the description never reaches the wire');
+  assert.equal(wire.includes('987654'), false, 'the amount digits never reach the wire');
+  assert.equal(typeof record.blob.iv, 'string');
+  assert.equal(typeof record.blob.ct, 'string');
+});
+
 test('the host imports participants as roster entries with no seats', async (t) => {
   const worker = await startWorker();
   t.after(() => worker.stop());
@@ -536,8 +568,29 @@ test('an approved member can be removed, and cannot return with the same secret'
   await host.next();
 
   host.send({ t: 'approve', memberId });
-  assert.equal((await member.next()).t, 'state');
+  const admitted = await member.next();
+  const nameBlob = admitted.roster.find((entry) => entry.id === memberId).nameBlob;
   await host.next();
+
+  const recordId = randomSecret();
+  host.send({
+    t: 'put',
+    id: recordId,
+    base: 0,
+    blob: await seal(group.key, {
+      kind: 'expense',
+      description: 'Keep me',
+      amountPaise: 1_000,
+      paidBy: [{ memberId, amountPaise: 1_000 }],
+      split: { [memberId]: 1_000 },
+      date: '2026-11-15',
+      time: '10:00',
+      note: ''
+    }),
+    deleted: false
+  });
+  assert.equal((await host.next()).id, recordId);
+  assert.equal((await member.next()).id, recordId);
 
   host.send({ t: 'remove', memberId });
 
@@ -545,9 +598,13 @@ test('an approved member can be removed, and cannot return with the same secret'
   assert.equal((await member.waitClosed()).code, 1008);
 
   const after = await host.next();
+  const removed = after.roster.find((entry) => entry.id === memberId);
+  assert.ok(removed, 'a removed member still travels in state for attribution');
+  assert.equal(removed.status, 'removed');
+  assert.deepEqual(removed.nameBlob, nameBlob, 'the sealed name is kept byte-identical');
   assert.ok(
-    !after.roster.some((entry) => entry.id === memberId),
-    'a removed member is not on the roster'
+    after.records.some((record) => record.id === recordId),
+    'the removed member\'s expense stays in state'
   );
 
   const again = await connect(socketUrl(worker.baseUrl, group.groupId));
