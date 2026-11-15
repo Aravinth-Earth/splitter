@@ -48,6 +48,7 @@ import { attribute, balances, ledgerContributions, settle } from './balance.js';
 import { renderChart, totals as chartTotals } from './charts.js';
 import { mergeDiff } from './merge.js';
 import { exportFileName, exportGroup, importGroup } from './export.js';
+import { outboxFor, saveOutbox } from './cache.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -327,6 +328,7 @@ export function init(doc = document, win = window) {
   const roleLine = doc.getElementById('role-line');
   const joinModeLine = doc.getElementById('join-mode');
   const connection = doc.getElementById('connection');
+  const pendingCount = doc.getElementById('pending-count');
   const toggleModeButton = doc.getElementById('toggle-mode');
   const roster = doc.getElementById('roster');
   const rosterPending = doc.getElementById('roster-pending');
@@ -444,6 +446,7 @@ export function init(doc = document, win = window) {
   let selfId = null;
   let selfName = '';
   let groupRole = 'organizer';
+  let outboxWarningShown = false;
   let groupCurrency = DEFAULT_CURRENCY;
   let members = new Map();
   let removedMembers = new Set();
@@ -675,6 +678,26 @@ export function init(doc = document, win = window) {
   }
 
   /** The connection is a state a person can see, not a toast that disappears mid-drop. */
+  /** 120 queued writes a minute is the budget the flush paces itself to. */
+  const WRITE_GAP_MS = 500;
+
+  function renderPendingCount() {
+    const count = groupSocket()?.queueEntries().length ?? 0;
+    pendingCount.hidden = count === 0;
+    pendingCount.textContent =
+      count === 0 ? '' : `${count} ${count === 1 ? 'change' : 'changes'} waiting`;
+  }
+
+  function persistOutbox(entries) {
+    if (!groupId) return;
+    const saved = saveOutbox(local, groupId, entries);
+    renderPendingCount();
+    if (!saved && entries.length > 0 && !outboxWarningShown) {
+      outboxWarningShown = true;
+      setStatus('This browser cannot keep changes offline.');
+    }
+  }
+
   function setConnection(status) {
     if (!connection) return;
     if (status === 'open' || status === 'closed') {
@@ -734,6 +757,8 @@ export function init(doc = document, win = window) {
     renderLedger();
     exportPanel.hidden = false;
     exportStatus.textContent = '';
+    pendingCount.hidden = true;
+    pendingCount.textContent = '';
     importButton.hidden = role !== 'organizer';
     resetImport();
 
@@ -1048,13 +1073,17 @@ export function init(doc = document, win = window) {
     const groupKey = deriveGroupKey(code);
     let shown = false;
     let socket;
+    const stored = outboxFor(local, groupIdValue);
     socket = new GroupSocket({
       url: url.toString(),
       auth: { t: 'auth', id: session.memberId, secret: session.memberSecret, mode: 'resume' },
       win,
       Ctor: win.WebSocket,
+      flushGapMs: WRITE_GAP_MS,
+      onQueueChange: persistOutbox,
       onStatus: (status) => {
         setConnection(status);
+        renderPendingCount();
         if (status === 'closed' && !shown && !waitingPanel.hidden) {
           showJoin({
             code,
@@ -1101,6 +1130,7 @@ export function init(doc = document, win = window) {
             }
             await renderRoster(frame, Promise.resolve(key));
             await applyGroupState(frame, Promise.resolve(key));
+            await restorePending(socket.queueEntries());
           } else {
             if (!shown) {
               showGroup({
@@ -1114,6 +1144,7 @@ export function init(doc = document, win = window) {
             }
             applyMode(frame.joinMode, 'member');
             await applyGroupState(frame, Promise.resolve(key));
+            await restorePending(socket.queueEntries());
           }
 
           remember({
@@ -1155,6 +1186,7 @@ export function init(doc = document, win = window) {
       }
     });
 
+    socket.restore(stored);
     joinSocket = socket;
     socket.connect();
   }
@@ -1237,6 +1269,10 @@ export function init(doc = document, win = window) {
       }
     });
 
+    const stored = outboxFor(local, groupId);
+    socket.restore(stored);
+    void restorePending(stored);
+
     joinSocket = socket;
     socket.connect();
   }
@@ -1278,8 +1314,11 @@ export function init(doc = document, win = window) {
       auth: { t: 'auth', id: memberId, secret, mode: 'resume' },
       win,
       Ctor: win.WebSocket,
+      flushGapMs: WRITE_GAP_MS,
+      onQueueChange: persistOutbox,
       onStatus: (status) => {
         setConnection(status);
+        renderPendingCount();
         if (status === 'open') toggleModeButton.disabled = false;
       },
       onFrame: (frame) => {
@@ -1309,6 +1348,10 @@ export function init(doc = document, win = window) {
         }
       }
     });
+
+    const stored = outboxFor(local, groupId);
+    socket.restore(stored);
+    void restorePending(stored);
 
     hostSocket = socket;
     socket.connect();
@@ -1577,6 +1620,14 @@ export function init(doc = document, win = window) {
       if (value) ledger.set(record.id, { ...record, value });
     }
     if (learned) saveRevs(local, groupIdValue, recordGuard.snapshot());
+
+    const active = groupSocket();
+    if (active) {
+      const known = new Set((frame.records ?? []).map((record) => record.id));
+      for (const entry of active.queueEntries()) {
+        if (entry.frame.base === 0 && known.has(entry.id)) active.ack(entry.id);
+      }
+    }
 
     renderLedger();
     if (expenseSheetOpen) {
@@ -2521,6 +2572,37 @@ export function init(doc = document, win = window) {
     }
   }
 
+  /** Rebuild the rows the outbox is still carrying, in the order they were made. */
+  async function restorePending(entries) {
+    if (!entries || entries.length === 0 || !groupKeyPromise) return;
+    const key = await groupKeyPromise;
+    const groupIdValue = await groupIdPromise;
+    if (!groupIdValue) return;
+    for (const entry of entries) {
+      if (entry.frame.deleted) continue;
+      const existing = ledger.get(entry.id);
+      if (existing && !existing.pending) continue;
+      const value = await decryptRecord(
+        key,
+        { id: entry.id, blob: entry.frame.blob, deleted: false },
+        groupIdValue
+      );
+      if (!value) continue;
+      ledger.set(entry.id, {
+        id: entry.id,
+        rev: 0,
+        pending: true,
+        blob: entry.frame.blob,
+        value,
+        author: selfId,
+        creator: selfId,
+        at: Date.now()
+      });
+    }
+    renderLedger();
+    renderPendingCount();
+  }
+
   async function applyCurrentRecord(current) {
     if (!current || !groupKeyPromise) return;
     const key = await groupKeyPromise;
@@ -2634,7 +2716,24 @@ export function init(doc = document, win = window) {
       groupSocket()?.ack(frame.id);
       ledger.delete(frame.id);
       renderLedger();
-      setStatus('The expense could not be saved. Try again.');
+      setStatus(
+        frame.code === 'deleted'
+          ? 'Someone deleted this expense.'
+          : 'The expense could not be saved. Try again.'
+      );
+      return true;
+    }
+
+    /* A queued delete or edit outlives the sheet that made it; a permanent refusal retires it. */
+    if (frame.id && groupSocket()?.queueEntries().some((entry) => entry.id === frame.id)) {
+      groupSocket().ack(frame.id);
+      if (frame.code === 'deleted') {
+        ledger.delete(frame.id);
+        renderLedger();
+        setStatus('Someone deleted this expense.');
+      } else {
+        setStatus('The change could not be saved.');
+      }
       return true;
     }
 

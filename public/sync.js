@@ -76,15 +76,27 @@ export class GroupSocket {
    * @param {{url: string, auth: object, win?: object, Ctor?: Function,
    *   onFrame: (frame: object) => void, onStatus?: (status: string) => void}} options
    */
-  constructor({ url, auth, win = globalThis, Ctor, onFrame, onStatus = () => {} }) {
+  constructor({
+    url,
+    auth,
+    win = globalThis,
+    Ctor,
+    onFrame,
+    onStatus = () => {},
+    onQueueChange = () => {},
+    flushGapMs = 0
+  }) {
     this.url = url;
     this.auth = auth;
     this.win = win;
     this.Ctor = Ctor ?? win.WebSocket;
     this.onFrame = onFrame;
     this.onStatus = onStatus;
+    this.onQueueChange = onQueueChange;
+    this.flushGapMs = flushGapMs;
 
     this.queue = [];
+    this.flushTimers = [];
     this.socket = null;
     this.attempt = 0;
     this.closed = false;
@@ -114,7 +126,10 @@ export class GroupSocket {
   /** A frame without an id is a one-off action: sent when open, never replayed. A frame with an
    * id stays in the queue until `ack(id)`, so a reconnect can send it again. */
   send(frame, { id = null } = {}) {
-    if (id !== null) this.queue.push({ id, frame });
+    if (id !== null) {
+      this.queue.push({ id, frame });
+      this.notifyQueue();
+    }
     if (!this.isOpen) return;
     try {
       this.socket.send(JSON.stringify(frame));
@@ -124,11 +139,73 @@ export class GroupSocket {
   }
 
   ack(id) {
+    const before = this.queue.length;
     this.queue = this.queue.filter((entry) => entry.id !== id);
+    if (this.queue.length !== before) this.notifyQueue();
+  }
+
+  /** Take the durable outbox back after a reload. The order is the order it was stored. */
+  restore(entries = []) {
+    this.queue = entries
+      .filter(
+        (entry) =>
+          entry &&
+          typeof entry === 'object' &&
+          typeof entry.id === 'string' &&
+          entry.frame &&
+          typeof entry.frame === 'object'
+      )
+      .map((entry) => ({ id: entry.id, frame: entry.frame }));
+    this.notifyQueue();
+  }
+
+  /** A copy of the queue for storage; frames are already sealed. */
+  queueEntries() {
+    return this.queue.map((entry) => ({ id: entry.id, frame: entry.frame }));
+  }
+
+  notifyQueue() {
+    this.onQueueChange(this.queueEntries());
+  }
+
+  /**
+   * Send the queue in order. With a gap, the first frame goes now and each later one waits its
+   * turn, so a long offline queue stays under a write-per-minute budget. A frame already acked
+   * before its turn is skipped.
+   */
+  flushQueue(socket) {
+    this.clearFlushTimers();
+    const entries = [...this.queue];
+    entries.forEach((entry, index) => {
+      const send = () => {
+        if (this.socket !== socket || !this.isOpen) return;
+        if (!this.queue.some((queued) => queued.id === entry.id)) return;
+        try {
+          socket.send(JSON.stringify(entry.frame));
+        } catch {
+          /* the close event will schedule the retry */
+        }
+      };
+      if (index === 0 || this.flushGapMs <= 0) {
+        send();
+        return;
+      }
+      const timer = this.win.setTimeout(() => {
+        this.flushTimers = this.flushTimers.filter((id) => id !== timer);
+        send();
+      }, index * this.flushGapMs);
+      this.flushTimers.push(timer);
+    });
+  }
+
+  clearFlushTimers() {
+    for (const timer of this.flushTimers) this.win.clearTimeout(timer);
+    this.flushTimers = [];
   }
 
   close() {
     this.closed = true;
+    this.clearFlushTimers();
     this.stopTimers();
     this.win.removeEventListener?.('online', this.handleOnline);
     this.win.removeEventListener?.('offline', this.handleOffline);
@@ -164,14 +241,8 @@ export class GroupSocket {
         socket.close();
         return;
       }
-      for (const entry of this.queue) {
-        try {
-          socket.send(JSON.stringify(entry.frame));
-        } catch {
-          break;
-        }
-      }
       this.startHeartbeat();
+      this.flushQueue(socket);
     });
 
     socket.addEventListener('message', (event) => {
@@ -239,6 +310,7 @@ export class GroupSocket {
   }
 
   stopTimers() {
+    this.clearFlushTimers();
     if (this.reconnectTimer !== null) this.win.clearTimeout(this.reconnectTimer);
     if (this.pingTimer !== null) this.win.clearInterval(this.pingTimer);
     this.clearPong();
