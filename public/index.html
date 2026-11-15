@@ -252,6 +252,21 @@
       <div id="chart-host" class="chart-host"></div>
     </section>
 
+    <section id="export-panel" class="panel" aria-labelledby="export-title" hidden>
+      <h2 id="export-title">Take the data</h2>
+      <p class="muted">
+        One JSON file with the group name, members, expenses and payments. It opens in any text
+        editor, without this app or the server.
+      </p>
+      <p class="export-warning" role="note">
+        <strong>Anyone who opens this file can read every name and amount.</strong>
+      </p>
+      <p class="balance-actions">
+        <button id="export-json" class="secondary" type="button">Export JSON</button>
+      </p>
+      <p id="export-status" class="muted" role="status" aria-live="polite"></p>
+    </section>
+
     <section id="settlement-panel" class="panel sheet" aria-labelledby="settlement-title" hidden>
       <h2 id="settlement-title">Record a payment</h2>
       <form id="settlement-form" novalidate>
