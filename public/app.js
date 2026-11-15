@@ -36,12 +36,14 @@ import {
   forgetCode,
   forgetSession,
   lastGroup,
+  revsFor,
   saveCode,
+  saveRevs,
   saveSession,
   sessionFor,
   setLastGroup
 } from './store.js';
-import { GroupSocket } from './sync.js';
+import { GroupSocket, RevGuard } from './sync.js';
 import { attribute, balances, ledgerContributions, settle } from './balance.js';
 import { renderChart, totals as chartTotals } from './charts.js';
 import { mergeDiff } from './merge.js';
@@ -433,6 +435,8 @@ export function init(doc = document, win = window) {
   let groupCurrency = DEFAULT_CURRENCY;
   let members = new Map();
   let ledger = new Map();
+  let recordGuard = new RevGuard();
+  let guardGroupId = null;
   let expenseSheetOpen = false;
   let expenseDraftId = null;
   let pendingExpenseId = null;
@@ -669,8 +673,14 @@ export function init(doc = document, win = window) {
 
     groupId = null;
     groupIdPromise = groupIdFromCode(code);
+    recordGuard = new RevGuard();
+    guardGroupId = null;
     void groupIdPromise.then((value) => {
       groupId = value;
+      if (guardGroupId !== value) {
+        recordGuard.hydrate(revsFor(local, value));
+        guardGroupId = value;
+      }
     });
     groupKeyPromise = deriveGroupKey(code);
     selfId = memberId;
@@ -1459,6 +1469,11 @@ export function init(doc = document, win = window) {
       }
     }
 
+    if (guardGroupId !== groupIdValue) {
+      recordGuard.hydrate(revsFor(local, groupIdValue));
+      guardGroupId = groupIdValue;
+    }
+
     const previousMembers = [...members.keys()].join(',');
     const nextMembers = new Map();
     for (const member of frame.roster ?? []) {
@@ -1468,17 +1483,21 @@ export function init(doc = document, win = window) {
     if (selfId && !nextMembers.has(selfId)) nextMembers.set(selfId, selfName || 'You');
     members = nextMembers;
 
-    const pendingEntries = [...ledger.values()].filter((entry) => entry.pending);
-    const nextLedger = new Map();
+    /* A state snapshot is merged into what is on screen, not swapped in: a broadcast that landed
+       while the snapshot was being built is newer than the snapshot, and a dropped frame must not
+       bring a deleted row back. Tombstones remove their row and keep the revision. */
+    let learned = false;
     for (const record of frame.records ?? []) {
-      if (record.deleted) continue;
+      if (!recordGuard.accept(record)) continue;
+      learned = true;
+      if (record.deleted) {
+        ledger.delete(record.id);
+        continue;
+      }
       const value = await decryptRecord(key, record, groupIdValue);
-      if (value) nextLedger.set(record.id, { ...record, value });
+      if (value) ledger.set(record.id, { ...record, value });
     }
-    for (const entry of pendingEntries) {
-      if (!nextLedger.has(entry.id)) nextLedger.set(entry.id, entry);
-    }
-    ledger = nextLedger;
+    if (learned) saveRevs(local, groupIdValue, recordGuard.snapshot());
 
     renderLedger();
     if (expenseSheetOpen) {
@@ -2464,6 +2483,8 @@ export function init(doc = document, win = window) {
     if (!groupKeyPromise) return;
     const key = await groupKeyPromise;
     const groupIdValue = await groupIdPromise;
+    if (!recordGuard.accept(frame)) return;
+    if (groupIdValue) saveRevs(local, groupIdValue, recordGuard.snapshot());
     groupSocket()?.ack(frame.id);
 
     if (frame.deleted) {

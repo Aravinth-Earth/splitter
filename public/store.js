@@ -4,7 +4,9 @@
  * Two stores, on purpose:
  *
  * - `localStorage` holds the member's secret and the group id. The secret names the member but
- *   cannot open the group: the server only sees its hash, and the key comes from the code.
+ *   cannot open the group: the server only sees its hash, and the key comes from the code. It also
+ *   holds the highest revision seen per record — opaque ids and numbers, never a value — so a
+ *   stale frame cannot win after a reload.
  * - `sessionStorage` holds the group code, which is the key. It lasts as long as the tab, so a
  *   reload returns to the seat without putting the decryption key on disk indefinitely.
  *
@@ -15,6 +17,7 @@
 const SESSION_KEY = 'splitter:sessions';
 const CODE_KEY = 'splitter:codes';
 const LAST_KEY = 'splitter:last';
+const REV_KEY = 'splitter:revs';
 
 const GROUP_ID = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9_-]{22}$/;
@@ -128,4 +131,30 @@ export function forgetCode(storage, groupId) {
   const all = codes(storage);
   delete all[groupId];
   write(storage, CODE_KEY, all);
+}
+
+
+/** The highest revision seen for each record in a group, so a stale frame cannot win a reload. */
+export function revsFor(storage, groupId) {
+  if (!GROUP_ID.test(groupId)) return {};
+  const all = read(storage, REV_KEY);
+  const seen = all[groupId];
+  if (seen === null || typeof seen !== 'object' || Array.isArray(seen)) return {};
+  return Object.fromEntries(
+    Object.entries(seen).filter(
+      ([id, rev]) => ID.test(id) && Number.isSafeInteger(rev) && rev >= 0
+    )
+  );
+}
+
+export function saveRevs(storage, groupId, seen) {
+  if (!GROUP_ID.test(groupId) || seen === null || typeof seen !== 'object' || Array.isArray(seen)) {
+    return false;
+  }
+  const cleaned = Object.fromEntries(
+    Object.entries(seen).filter(
+      ([id, rev]) => ID.test(id) && Number.isSafeInteger(rev) && rev >= 0
+    )
+  );
+  return write(storage, REV_KEY, { ...read(storage, REV_KEY), [groupId]: cleaned });
 }

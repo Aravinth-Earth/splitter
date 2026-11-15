@@ -15,7 +15,9 @@ import {
   forgetCode,
   forgetSession,
   lastGroup,
+  revsFor,
   saveCode,
+  saveRevs,
   saveSession,
   sessionFor,
   sessions,
@@ -122,4 +124,19 @@ test('store: corrupt JSON and a storage that throws read as empty', () => {
   assert.equal(lastGroup(hostile), null);
   assert.equal(saveCode(hostile, GROUP, CODE), false);
   assert.deepEqual(sessions(null), {});
+});
+
+
+test('store: record revisions round-trip per group and drop bad ids', () => {
+  const local = fakeStorage();
+  assert.equal(saveRevs(local, GROUP, { [ID]: 7, bad: 2, other: -1 }), true);
+  assert.deepEqual(revsFor(local, GROUP), { [ID]: 7 });
+  assert.deepEqual(revsFor(local, OTHER), {});
+  assert.equal(saveRevs(local, OTHER, { [ID]: 3 }), true);
+  assert.deepEqual(revsFor(local, GROUP), { [ID]: 7 });
+  assert.deepEqual(revsFor(local, OTHER), { [ID]: 3 });
+
+  assert.deepEqual(revsFor(local, 'not-a-group'), {});
+  assert.equal(saveRevs(local, 'not-a-group', { [ID]: 1 }), false);
+  assert.equal(saveRevs(local, GROUP, []), false);
 });
