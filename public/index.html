@@ -138,6 +138,19 @@
         <button id="dismiss-hint" class="link-button" type="button">Got it</button>
       </div>
 
+      <p class="group-actions">
+        <button id="leave-group" class="secondary" type="button" hidden>Leave group…</button>
+        <button id="end-group" class="secondary" type="button" hidden>End group…</button>
+      </p>
+
+      <div id="lifecycle-confirm" class="hint-card" role="alertdialog" aria-labelledby="lifecycle-text" hidden>
+        <p id="lifecycle-text"></p>
+        <p class="code-actions">
+          <button id="lifecycle-cancel" class="secondary" type="button">Cancel</button>
+          <button id="lifecycle-confirm-button" class="primary" type="button"></button>
+        </p>
+      </div>
+
       <div id="roster" class="roster" hidden>
         <h3>Waiting to join</h3>
         <ul id="roster-pending" class="roster-list"></ul>

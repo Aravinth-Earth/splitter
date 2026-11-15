@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { CACHE_SCHEMA, cacheFor, outboxFor, saveCache, saveOutbox } from '../public/cache.js';
+import { CACHE_SCHEMA, cacheFor, forgetGroupCache, outboxFor, saveCache, saveOutbox } from '../public/cache.js';
 
 const GROUP = 'a'.repeat(64);
 const OTHER = 'b'.repeat(64);
@@ -120,4 +120,19 @@ test('cache: corrupt JSON and a full storage read as empty and refuse saves', ()
   assert.equal(saveCache(full, GROUP, state([])), false);
   assert.deepEqual(outboxFor(full, GROUP), []);
   assert.equal(saveCache(fakeStorage(), GROUP, { ...state([]), nameBlob: null }), false);
+});
+
+
+test('cache: leaving or ending drops both the outbox and the state for one group', () => {
+  const local = fakeStorage();
+  saveOutbox(local, GROUP, [put()]);
+  saveOutbox(local, OTHER, [put(OTHER_ID)]);
+  saveCache(local, GROUP, state([]));
+  saveCache(local, OTHER, state([]));
+
+  assert.equal(forgetGroupCache(local, GROUP), true);
+  assert.deepEqual(outboxFor(local, GROUP), []);
+  assert.equal(cacheFor(local, GROUP), null);
+  assert.deepEqual(outboxFor(local, OTHER).map((entry) => entry.id), [OTHER_ID]);
+  assert.equal(cacheFor(local, OTHER).schema, CACHE_SCHEMA);
 });

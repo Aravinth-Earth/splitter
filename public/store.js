@@ -158,3 +158,12 @@ export function saveRevs(storage, groupId, seen) {
   );
   return write(storage, REV_KEY, { ...read(storage, REV_KEY), [groupId]: cleaned });
 }
+
+
+/** Drop one group's revision map; leaving or ending leaves no routing residue behind. */
+export function forgetRevs(storage, groupId) {
+  if (!GROUP_ID.test(groupId)) return false;
+  const all = read(storage, REV_KEY);
+  delete all[groupId];
+  return write(storage, REV_KEY, all);
+}

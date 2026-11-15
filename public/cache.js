@@ -120,7 +120,10 @@ function isRosterEntry(member) {
     typeof member === 'object' &&
     typeof member.id === 'string' &&
     ID.test(member.id) &&
-    (member.status === 'pending' || member.status === 'approved' || member.status === 'removed') &&
+    (member.status === 'pending' ||
+      member.status === 'approved' ||
+      member.status === 'removed' ||
+      member.status === 'left') &&
     isSealed(member.nameBlob)
   );
 }
@@ -202,4 +205,17 @@ export function saveCache(storage, groupId, state, savedAt = Date.now()) {
     records: state.records.filter(isRecord).map((record) => ({ ...record }))
   };
   return write(storage, STATE_KEY, { ...read(storage, STATE_KEY), [groupId]: row });
+}
+
+
+/** Drop one group's outbox and state: leaving or ending must not leave a readable copy behind. */
+export function forgetGroupCache(storage, groupId) {
+  if (!GROUP_ID.test(groupId)) return false;
+  const outbox = read(storage, OUTBOX_KEY);
+  const cache = read(storage, STATE_KEY);
+  delete outbox[groupId];
+  delete cache[groupId];
+  const savedOutbox = write(storage, OUTBOX_KEY, outbox);
+  const savedCache = write(storage, STATE_KEY, cache);
+  return savedOutbox && savedCache;
 }

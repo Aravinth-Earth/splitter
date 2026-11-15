@@ -13,6 +13,7 @@ import {
   codeFor,
   codes,
   forgetCode,
+  forgetRevs,
   forgetSession,
   lastGroup,
   revsFor,
@@ -139,4 +140,14 @@ test('store: record revisions round-trip per group and drop bad ids', () => {
   assert.deepEqual(revsFor(local, 'not-a-group'), {});
   assert.equal(saveRevs(local, 'not-a-group', { [ID]: 1 }), false);
   assert.equal(saveRevs(local, GROUP, []), false);
+});
+
+
+test('store: forgetting a group drops only its revisions', () => {
+  const local = fakeStorage();
+  saveRevs(local, GROUP, { [ID]: 7 });
+  saveRevs(local, OTHER, { [ID]: 3 });
+  assert.equal(forgetRevs(local, GROUP), true);
+  assert.deepEqual(revsFor(local, GROUP), {});
+  assert.deepEqual(revsFor(local, OTHER), { [ID]: 3 });
 });

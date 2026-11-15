@@ -35,6 +35,7 @@ import {
   codeFor,
   forgetCode,
   forgetSession,
+  forgetRevs,
   lastGroup,
   revsFor,
   saveCode,
@@ -48,7 +49,7 @@ import { attribute, balances, ledgerContributions, settle } from './balance.js';
 import { renderChart, totals as chartTotals } from './charts.js';
 import { mergeDiff } from './merge.js';
 import { exportFileName, exportGroup, importGroup } from './export.js';
-import { cacheFor, outboxFor, saveCache, saveOutbox } from './cache.js';
+import { cacheFor, forgetGroupCache, outboxFor, saveCache, saveOutbox } from './cache.js';
 import {
   defaultPercentages,
   defaultShares,
@@ -334,6 +335,12 @@ export function init(doc = document, win = window) {
   const offlineBanner = doc.getElementById('offline-banner');
   const offlineText = doc.getElementById('offline-text');
   const offlineRetry = doc.getElementById('offline-retry');
+  const leaveGroupButton = doc.getElementById('leave-group');
+  const endGroupButton = doc.getElementById('end-group');
+  const lifecycleConfirm = doc.getElementById('lifecycle-confirm');
+  const lifecycleText = doc.getElementById('lifecycle-text');
+  const lifecycleCancel = doc.getElementById('lifecycle-cancel');
+  const lifecycleConfirmButton = doc.getElementById('lifecycle-confirm-button');
   const toggleModeButton = doc.getElementById('toggle-mode');
   const roster = doc.getElementById('roster');
   const rosterPending = doc.getElementById('roster-pending');
@@ -455,6 +462,7 @@ export function init(doc = document, win = window) {
   let groupCurrency = DEFAULT_CURRENCY;
   let members = new Map();
   let removedMembers = new Set();
+  let leftMembers = new Set();
   let ledger = new Map();
   let recordGuard = new RevGuard();
   let guardGroupId = null;
@@ -476,6 +484,8 @@ export function init(doc = document, win = window) {
   let connectionStatus = 'offline';
   let queuedEditBases = new Map();
   let queuedEditRetries = new Set();
+  let lifecycleAction = null;
+  let endedHandledFor = null;
   let pendingDeleteId = null;
   let editingExpense = null;
   let customSeed = null;
@@ -543,6 +553,10 @@ export function init(doc = document, win = window) {
   });
   chartModes.forEach((radio) => radio.addEventListener('change', renderCharts));
   exportButton.addEventListener('click', downloadExport);
+  leaveGroupButton.addEventListener('click', () => openLifecycle('leave'));
+  endGroupButton.addEventListener('click', () => openLifecycle('end'));
+  lifecycleCancel.addEventListener('click', closeLifecycle);
+  lifecycleConfirmButton.addEventListener('click', confirmLifecycle);
   offlineRetry.addEventListener('click', () => {
     const socket = groupSocket();
     if (!socket) return;
@@ -805,6 +819,7 @@ export function init(doc = document, win = window) {
     groupCurrency = normalizeCurrency(currency);
     members = new Map();
     removedMembers = new Set();
+    leftMembers = new Set();
     if (memberId) members.set(memberId, selfName);
     ledger = new Map();
     expenseDraftId = null;
@@ -826,6 +841,10 @@ export function init(doc = document, win = window) {
     queuedEditBases = new Map();
     queuedEditRetries = new Set();
     importButton.hidden = role !== 'organizer';
+    endGroupButton.hidden = role !== 'organizer';
+    leaveGroupButton.hidden = role === 'organizer';
+    closeLifecycle();
+    endedHandledFor = null;
     resetImport();
 
     groupNameDisplay.textContent = name;
@@ -1141,9 +1160,13 @@ export function init(doc = document, win = window) {
 
     const nextMembers = new Map();
     const nextRemoved = new Set();
+    const nextLeft = new Set();
     for (const member of cached.roster) {
       if (member.status === 'removed') nextRemoved.add(member.id);
-      if (member.status !== 'approved' && member.status !== 'removed') continue;
+      if (member.status === 'left') nextLeft.add(member.id);
+      if (member.status !== 'approved' && member.status !== 'removed' && member.status !== 'left') {
+        continue;
+      }
       nextMembers.set(member.id, await nameOf(key, member.nameBlob));
     }
     if (cached.memberId && !nextMembers.has(cached.memberId)) {
@@ -1151,6 +1174,7 @@ export function init(doc = document, win = window) {
     }
     members = nextMembers;
     removedMembers = nextRemoved;
+    leftMembers = nextLeft;
 
     for (const record of cached.records) {
       if (!recordGuard.accept(record)) continue;
@@ -1206,6 +1230,7 @@ export function init(doc = document, win = window) {
       }
       const reachable = await probeRoom(groupIdValue);
       if (reachable === 'missing') {
+        dropGroupCache(groupIdValue);
         forget(groupIdValue);
         showCreate();
         showNotice('This group has ended.');
@@ -1322,7 +1347,16 @@ export function init(doc = document, win = window) {
           handleExpenseConflict(frame);
           return;
         }
+        if (frame.t === 'ended') {
+          handleEnded();
+          return;
+        }
+        if (frame.t === 'left') {
+          handleLeft();
+          return;
+        }
         if (frame.t === 'removed') {
+          dropGroupCache(groupIdValue);
           forget(groupIdValue);
           socket.close();
           joinSocket = null;
@@ -1333,6 +1367,7 @@ export function init(doc = document, win = window) {
           if (handleExpenseRefusal(frame)) return;
           socket.close();
           joinSocket = null;
+          if (frame.code === 'unknown_group') dropGroupCache(groupIdValue);
           if (frame.code === 'rate_limited') {
             showJoin({ code, error: refusalMessage(frame.code), resume: session });
           } else {
@@ -1409,7 +1444,16 @@ export function init(doc = document, win = window) {
           handleExpenseConflict(frame);
           return;
         }
+        if (frame.t === 'ended') {
+          handleEnded();
+          return;
+        }
+        if (frame.t === 'left') {
+          handleLeft();
+          return;
+        }
         if (frame.t === 'removed') {
+          dropGroupCache(groupId);
           forget(groupId);
           socket.close();
           joinSocket = null;
@@ -1420,6 +1464,7 @@ export function init(doc = document, win = window) {
           if (handleExpenseRefusal(frame)) return;
           socket.close();
           joinSocket = null;
+          if (frame.code === 'unknown_group') dropGroupCache(groupId);
           forget(groupId);
           showJoin({ code, error: refusalMessage(frame.code) });
         }
@@ -1487,6 +1532,14 @@ export function init(doc = document, win = window) {
         }
         if (frame.t === 'record') {
           void handleRecordFrame(frame);
+          return;
+        }
+        if (frame.t === 'ended') {
+          handleEnded();
+          return;
+        }
+        if (frame.t === 'left') {
+          handleLeft();
           return;
         }
         if (frame.t === 'import-members-ok') {
@@ -1557,6 +1610,11 @@ export function init(doc = document, win = window) {
     const approved = frame.roster.filter(
       (member) => member.status === 'approved' && member.id !== frame.memberId
     );
+    const departed = frame.roster.filter(
+      (member) =>
+        (member.status === 'removed' || member.status === 'left') &&
+        member.id !== frame.memberId
+    );
 
     applyMode(frame.joinMode, 'host');
     disarm();
@@ -1605,6 +1663,20 @@ export function init(doc = document, win = window) {
 
       chip.append(label, allow, decline);
       rosterPending.append(chip);
+    }
+
+    for (const member of departed) {
+      const chip = doc.createElement('li');
+      chip.className = 'chip';
+
+      const label = doc.createElement('span');
+      label.textContent = await nameOf(key, member.nameBlob);
+
+      const state = doc.createElement('span');
+      state.className = 'muted';
+      state.textContent = member.status;
+      chip.append(label, state);
+      rosterApproved.append(chip);
     }
 
     for (const member of approved) {
@@ -1656,6 +1728,7 @@ export function init(doc = document, win = window) {
   function memberLabel(id) {
     const name = members.get(id);
     if (!name) return 'Someone';
+    if (leftMembers.has(id)) return `${name} · left`;
     return removedMembers.has(id) ? `${name} · removed` : name;
   }
 
@@ -1670,7 +1743,9 @@ export function init(doc = document, win = window) {
       for (const id of Object.keys(editingExpense.value.split ?? {})) required.add(id);
     }
     return [...members.entries()]
-      .filter(([id]) => !removedMembers.has(id) || required.has(id))
+      .filter(
+        ([id]) => (!removedMembers.has(id) && !leftMembers.has(id)) || required.has(id)
+      )
       .map(([id]) => [id, memberLabel(id)])
       .sort((left, right) => left[1].localeCompare(right[1]) || (left[0] < right[0] ? -1 : 1));
   }
@@ -1778,14 +1853,19 @@ export function init(doc = document, win = window) {
     const previousMembers = [...members.keys()].join(',');
     const nextMembers = new Map();
     const nextRemoved = new Set();
+    const nextLeft = new Set();
     for (const member of frame.roster ?? []) {
       if (member.status === 'removed') nextRemoved.add(member.id);
-      if (member.status !== 'approved' && member.status !== 'removed') continue;
+      if (member.status === 'left') nextLeft.add(member.id);
+      if (member.status !== 'approved' && member.status !== 'removed' && member.status !== 'left') {
+        continue;
+      }
       nextMembers.set(member.id, await nameOf(key, member.nameBlob));
     }
     if (selfId && !nextMembers.has(selfId)) nextMembers.set(selfId, selfName || 'You');
     members = nextMembers;
     removedMembers = nextRemoved;
+    leftMembers = nextLeft;
 
     /* A state snapshot is merged into what is on screen, not swapped in: a broadcast that landed
        while the snapshot was being built is newer than the snapshot, and a dropped frame must not
@@ -3304,6 +3384,82 @@ export function init(doc = document, win = window) {
       copyStatus.classList.remove('toast');
       statusTimer = null;
     }, 4000);
+  }
+
+  function closeLifecycle() {
+    lifecycleAction = null;
+    lifecycleConfirm.hidden = true;
+    lifecycleText.textContent = '';
+    lifecycleConfirmButton.textContent = '';
+  }
+
+  /** A deliberate second step; Cancel is focused so a stray Enter cannot end a trip. */
+  function openLifecycle(action) {
+    const socket = groupSocket();
+    if (!socket || !socket.isOpen) {
+      setStatus(action === 'end' ? 'Ending needs a connection.' : 'Leaving needs a connection.');
+      return;
+    }
+    lifecycleAction = action;
+    lifecycleText.textContent =
+      action === 'end'
+        ? 'Every expense, payment and name in this group will be deleted. Anyone with this group open will lose it. This cannot be undone.'
+        : 'Leave this group? Your expenses stay in the group and stay attributed. This device forgets the group. This cannot be undone.';
+    lifecycleConfirmButton.textContent = action === 'end' ? 'End group' : 'Leave group';
+    lifecycleConfirm.hidden = false;
+    lifecycleCancel.focus();
+  }
+
+  function confirmLifecycle() {
+    const action = lifecycleAction;
+    if (!action) return;
+    const socket = groupSocket();
+    if (!socket || !socket.isOpen) {
+      setStatus(action === 'end' ? 'Ending needs a connection.' : 'Leaving needs a connection.');
+      return;
+    }
+    closeLifecycle();
+    setStatus(action === 'end' ? 'Ending the group…' : 'Leaving the group…');
+    socket.send({ t: action === 'end' ? 'end' : 'leave' });
+  }
+
+  function dropGroupCache(groupIdValue) {
+    if (!groupIdValue) return;
+    forgetGroupCache(local, groupIdValue);
+    forgetRevs(local, groupIdValue);
+    cachedBase = null;
+    cachedRecords = new Map();
+    cachedSavedAt = 0;
+    queuedEditBases = new Map();
+    queuedEditRetries = new Set();
+    if (cacheTimer !== null) win.clearTimeout(cacheTimer);
+    cacheTimer = null;
+    pendingImport = null;
+    importJob = null;
+  }
+
+  /** The organizer ended the group: forget it before navigating, so no cache can resume it. */
+  function handleEnded() {
+    const current = groupId;
+    if (current && endedHandledFor === current) return;
+    endedHandledFor = current;
+    dropGroupCache(current);
+    if (current) forget(current);
+    closeHostSocket();
+    closeJoinSocket();
+    showCreate();
+    showNotice('This group has ended. It cannot be reopened.');
+  }
+
+  /** This device left: the group is forgotten here; its entries remain on every other screen. */
+  function handleLeft() {
+    const current = groupId;
+    dropGroupCache(current);
+    if (current) forget(current);
+    closeHostSocket();
+    closeJoinSocket();
+    showCreate();
+    showNotice('You left the group. Your expenses stay in the group.');
   }
 
   /** Build the readable copy and hand it to the browser's download flow. */
