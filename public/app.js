@@ -332,6 +332,7 @@ export function init(doc = document, win = window) {
   const joinModeLine = doc.getElementById('join-mode');
   const connection = doc.getElementById('connection');
   const pendingCount = doc.getElementById('pending-count');
+  const presence = doc.getElementById('presence');
   const offlineBanner = doc.getElementById('offline-banner');
   const offlineText = doc.getElementById('offline-text');
   const offlineRetry = doc.getElementById('offline-retry');
@@ -463,6 +464,8 @@ export function init(doc = document, win = window) {
   let members = new Map();
   let removedMembers = new Set();
   let leftMembers = new Set();
+  let presentIds = new Set();
+  let pendingPresence = null;
   let ledger = new Map();
   let recordGuard = new RevGuard();
   let guardGroupId = null;
@@ -770,6 +773,10 @@ export function init(doc = document, win = window) {
 
   function setConnection(status) {
     connectionStatus = status;
+    if (status !== 'open' && presentIds.size > 0) {
+      presentIds = new Set();
+      renderPresence();
+    }
     if (cachedBase) renderOfflineBanner(status);
     if (!connection) return;
     if (status === 'open' || status === 'closed') {
@@ -820,6 +827,9 @@ export function init(doc = document, win = window) {
     members = new Map();
     removedMembers = new Set();
     leftMembers = new Set();
+    presentIds = new Set();
+    presence.hidden = true;
+    presence.textContent = '';
     if (memberId) members.set(memberId, selfName);
     ledger = new Map();
     expenseDraftId = null;
@@ -957,6 +967,7 @@ export function init(doc = document, win = window) {
     chartsPanel.hidden = true;
     exportPanel.hidden = true;
     offlineBanner.hidden = true;
+    pendingPresence = null;
     resetImport();
     createPanel.hidden = true;
     groupHeader.hidden = true;
@@ -990,6 +1001,7 @@ export function init(doc = document, win = window) {
     chartsPanel.hidden = true;
     exportPanel.hidden = true;
     offlineBanner.hidden = true;
+    pendingPresence = null;
     resetImport();
     joinPanel.hidden = true;
     waitingPanel.hidden = true;
@@ -1012,6 +1024,7 @@ export function init(doc = document, win = window) {
     chartsPanel.hidden = true;
     exportPanel.hidden = true;
     offlineBanner.hidden = true;
+    pendingPresence = null;
     resetImport();
     waitingPanel.hidden = false;
     waitingCode.textContent = formatCode(code);
@@ -1339,6 +1352,10 @@ export function init(doc = document, win = window) {
           return;
         }
 
+        if (frame.t === 'presence') {
+          handlePresence(frame);
+          return;
+        }
         if (frame.t === 'record') {
           void handleRecordFrame(frame);
           return;
@@ -1436,6 +1453,10 @@ export function init(doc = document, win = window) {
           return;
         }
 
+        if (frame.t === 'presence') {
+          handlePresence(frame);
+          return;
+        }
         if (frame.t === 'record') {
           void handleRecordFrame(frame);
           return;
@@ -1528,6 +1549,10 @@ export function init(doc = document, win = window) {
         if (frame.t === 'state') {
           void renderRoster(frame, key);
           void applyGroupState(frame, key);
+          return;
+        }
+        if (frame.t === 'presence') {
+          handlePresence(frame);
           return;
         }
         if (frame.t === 'record') {
@@ -1725,6 +1750,33 @@ export function init(doc = document, win = window) {
   }
 
   /** A name as the whole page should show it; a removed member keeps their name and gets a marker. */
+  function renderPresence() {
+    if (presentIds.size === 0) {
+      presence.hidden = true;
+      presence.textContent = '';
+      return;
+    }
+    if (presentIds.size === 1 && selfId && presentIds.has(selfId)) {
+      presence.hidden = false;
+      presence.textContent = 'Just you here';
+      return;
+    }
+    presence.hidden = false;
+    presence.textContent = `${presentIds.size} here · ${[...presentIds]
+      .map((id) => memberLabel(id))
+      .join(', ')}`;
+  }
+
+  function handlePresence(frame) {
+    const ids = new Set((frame.here ?? []).filter((id) => typeof id === 'string'));
+    if (groupHeader.hidden) {
+      pendingPresence = ids;
+      return;
+    }
+    presentIds = ids;
+    renderPresence();
+  }
+
   function memberLabel(id) {
     const name = members.get(id);
     if (!name) return 'Someone';
@@ -1903,7 +1955,12 @@ export function init(doc = document, win = window) {
       }
     }
 
+    if (pendingPresence) {
+      presentIds = pendingPresence;
+      pendingPresence = null;
+    }
     renderLedger();
+    renderPresence();
     if (expenseSheetOpen) {
       renderPayerOptions();
       if ([...members.keys()].join(',') !== previousMembers) renderSplit();
