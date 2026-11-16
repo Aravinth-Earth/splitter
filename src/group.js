@@ -74,7 +74,7 @@ export class Group {
    *
    * @returns {Promise<{ok: true, created: boolean} | {ok: false, error: string}>}
    */
-  async init({ hostId, nameBlob, hostNameBlob = null, metaBlob = null } = {}) {
+  async init({ groupId = null, hostId, nameBlob, hostNameBlob = null, metaBlob = null } = {}) {
     if (!isId(hostId)) return { ok: false, error: 'hostId' };
     if (!isSealed(nameBlob)) return { ok: false, error: 'blob' };
     /* The host's own name is optional for a group created before it was sent; when present it is
@@ -92,6 +92,7 @@ export class Group {
     if (existing) return { ok: true, created: false };
 
     await this.ctx.storage.put(GROUP_KEY, {
+      groupId: isId(groupId) ? groupId : null,
       hostId,
       joinMode: 'approval',
       rev: 0,
@@ -253,6 +254,14 @@ export class Group {
       await this.importMembers(socket, frame);
       return;
     }
+    if (frame.t === 'leave') {
+      await this.leave(socket);
+      return;
+    }
+    if (frame.t === 'end') {
+      await this.end(socket);
+      return;
+    }
     if (frame.t !== 'approve' && frame.t !== 'reject' && frame.t !== 'remove' && frame.t !== 'mode') {
       return;
     }
@@ -335,7 +344,8 @@ export class Group {
     const seen = new Set();
     const entries = [];
     let active = 1 + [...(await this.members()).values()].filter(
-      (member) => member.status !== 'removed' && member.status !== 'declined'
+      (member) =>
+        member.status !== 'removed' && member.status !== 'declined' && member.status !== 'left'
     ).length;
 
     for (const member of frame.members) {
@@ -374,6 +384,64 @@ export class Group {
     for (const entry of entries) await this.ctx.storage.put(entry.key, entry.value);
     await this.notifyState(meta);
     this.sendFrame(socket, { t: 'import-members-ok', memberIds: [...seen] });
+  }
+
+  /**
+   * A member leaves. The row and records stay for attribution; the status changes to `left`, which
+   * frees the seat. The organizer has no leave path in v1, because there is no ownership transfer.
+   */
+  async leave(socket) {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta) return this.refuse(socket, 'unknown_group');
+
+    const identity = this.identities.get(socket);
+    if (!identity) return this.refuse(socket, 'unapproved');
+    if (identity.memberId === meta.hostId) {
+      this.sendRefusal(socket, 'host_must_end');
+      return;
+    }
+
+    const key = memberKey(identity.memberId);
+    const entry = await this.ctx.storage.get(key);
+    if (!entry || entry.status !== 'approved') {
+      this.sendRefusal(socket, 'not_member');
+      return;
+    }
+
+    await this.ctx.storage.put(key, { ...entry, status: 'left' });
+    this.sendFrame(socket, { t: 'left' });
+    await this.notifyState(meta, new Set([socket]));
+    try {
+      socket.close(1000, 'left');
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /**
+   * The host ends the group. Every socket is told once, then the storage and the Registry slot go.
+   * A device that never reconnects keeps its own copy; the client clears it on the next contact.
+   */
+  async end(socket) {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta) return this.refuse(socket, 'unknown_group');
+
+    const identity = this.identities.get(socket);
+    if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
+
+    for (const peer of this.sockets) {
+      this.sendFrame(peer, { t: 'ended' });
+      try {
+        peer.close(1000, 'ended');
+      } catch {
+        /* already gone */
+      }
+    }
+
+    await this.ctx.storage.deleteAll();
+    await this.callRegistry('/release', { groupId: meta.groupId ?? this.ctx.id.toString() }).catch(() => {
+      /* the slot is a reconciliation problem, not a reason to keep the group alive */
+    });
   }
 
   /** A decision reaches the person waiting, if they still have a socket. */
@@ -461,8 +529,10 @@ export class Group {
     const roster = await this.members();
     const occupied =
       1 +
-      [...roster.values()].filter((member) => member.status !== 'removed' && member.status !== 'declined')
-        .length;
+      [...roster.values()].filter(
+        (member) =>
+          member.status !== 'removed' && member.status !== 'declined' && member.status !== 'left'
+      ).length;
     if (occupied >= this.maxMembers()) {
       await this.noteJoinFailure(ip);
       this.refuse(socket, 'group_full');

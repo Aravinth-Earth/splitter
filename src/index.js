@@ -213,6 +213,7 @@ async function createGroup(request, env) {
   let initialised;
   try {
     initialised = await callDurable(group, 'https://group/init', {
+      groupId,
       hostId,
       nameBlob,
       hostNameBlob: hostNameBlob ?? null,

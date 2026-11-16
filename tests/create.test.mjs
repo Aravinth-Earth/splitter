@@ -364,6 +364,7 @@ test('create: a successful create reserves, initialises, and releases nothing', 
     'a create that succeeded must not release its slot'
   );
   assert.deepEqual(calls[1].body, {
+    groupId,
     hostId: body.hostId,
     nameBlob: body.nameBlob,
     hostNameBlob: null,

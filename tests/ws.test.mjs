@@ -614,6 +614,106 @@ test('an approved member can be removed, and cannot return with the same secret'
   assert.equal(again.frames.length, 0, 'a removed member gets no content on reconnection');
 });
 
+test('a member leaves and their entries stay, attributed', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+  const member = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => member.close());
+  member.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Leaver' })
+  });
+  assert.equal((await member.next()).t, 'waiting');
+  await host.next();
+  host.send({ t: 'approve', memberId });
+  const admitted = await member.next();
+  const nameBlob = admitted.roster.find((entry) => entry.id === memberId).nameBlob;
+  await host.next();
+
+  const recordId = randomSecret();
+  host.send({
+    t: 'put',
+    id: recordId,
+    base: 0,
+    blob: await seal(group.key, {
+      kind: 'expense',
+      description: 'Stays',
+      amountPaise: 500,
+      paidBy: [{ memberId, amountPaise: 500 }],
+      split: { [memberId]: 500 },
+      date: '2026-11-15',
+      time: '10:00',
+      note: ''
+    }),
+    deleted: false
+  });
+  assert.equal((await host.next()).id, recordId);
+  assert.equal((await member.next()).id, recordId);
+
+  member.send({ t: 'leave' });
+  assert.deepEqual(await member.next(), { t: 'left' });
+  assert.equal((await member.waitClosed()).code, 1000);
+
+  const after = await host.next();
+  const left = after.roster.find((entry) => entry.id === memberId);
+  assert.equal(left.status, 'left');
+  assert.deepEqual(left.nameBlob, nameBlob);
+  assert.ok(after.records.some((record) => record.id === recordId));
+
+  const again = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => again.close());
+  again.send({ t: 'auth', id: memberId, secret: memberSecret, mode: 'resume' });
+  assert.equal((await again.waitClosed()).code, 1008);
+  assert.equal(again.frames.length, 0);
+});
+
+test('the organizer cannot leave: the group must be ended', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  host.send({ t: 'leave' });
+  assert.deepEqual(await host.next(), { t: 'refused', code: 'host_must_end' });
+});
+
+test('ending wipes the group, tells every socket and frees the slot', async (t) => {
+  const worker = await startWorker({ vars: { MAX_GROUPS: '1' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  host.send({ t: 'end' });
+  assert.deepEqual(await host.next(), { t: 'ended' });
+  await host.silence(300);
+
+  const room = await fetch(`${worker.baseUrl}/api/room?room=${group.groupId}`);
+  assert.equal(room.status, 404);
+
+  const next = await createGroup(worker.baseUrl);
+  assert.notEqual(next.groupId, group.groupId);
+});
+
 test('the organizer cannot remove themselves, and only the host can remove', async (t) => {
   const worker = await startWorker();
   t.after(() => worker.stop());
