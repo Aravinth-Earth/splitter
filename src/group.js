@@ -188,11 +188,13 @@ export class Group {
       this.identities.delete(server);
       this.clientIps.delete(server);
       this.sockets.delete(server);
+      this.broadcastPresence();
     });
     server.addEventListener('error', () => {
       this.identities.delete(server);
       this.clientIps.delete(server);
       this.sockets.delete(server);
+      this.broadcastPresence();
     });
 
     /* A socket that never introduces itself is closed, not left open as an anonymous reader. The
@@ -299,6 +301,7 @@ export class Group {
       await this.ctx.storage.put(key, { ...entry, status: 'removed' });
       const handled = await this.notifyMember(meta, frame.memberId, 'removed');
       await this.notifyState(meta, handled);
+      this.broadcastPresence();
       return;
     }
 
@@ -320,6 +323,7 @@ export class Group {
       frame.t === 'approve' ? 'approved' : 'declined'
     );
     await this.notifyState(meta, handled);
+    this.broadcastPresence();
   }
 
   /**
@@ -411,6 +415,7 @@ export class Group {
     await this.ctx.storage.put(key, { ...entry, status: 'left' });
     this.sendFrame(socket, { t: 'left' });
     await this.notifyState(meta, new Set([socket]));
+    this.broadcastPresence();
     try {
       socket.close(1000, 'left');
     } catch {
@@ -442,6 +447,30 @@ export class Group {
     await this.callRegistry('/release', { groupId: meta.groupId ?? this.ctx.id.toString() }).catch(() => {
       /* the slot is a reconciliation problem, not a reason to keep the group alive */
     });
+  }
+
+  /** One frame per change: the member ids with an approved socket right now. Ids only. */
+  presenceFrame() {
+    const here = new Set();
+    for (const socket of this.sockets) {
+      const identity = this.identities.get(socket);
+      if (!identity) continue;
+      if (identity.role === 'host' || identity.role === 'member') here.add(identity.memberId);
+    }
+    return { t: 'presence', here: [...here] };
+  }
+
+  broadcastPresence() {
+    const frame = JSON.stringify(this.presenceFrame());
+    for (const socket of this.sockets) {
+      const identity = this.identities.get(socket);
+      if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
+      try {
+        socket.send(frame);
+      } catch {
+        /* a socket that is already gone is not a reason to stop telling the others */
+      }
+    }
   }
 
   /** A decision reaches the person waiting, if they still have a socket. */
@@ -487,6 +516,7 @@ export class Group {
     if (frame.id === meta.hostId) {
       this.identities.set(socket, { memberId: frame.id, role: 'host' });
       socket.send(JSON.stringify(await this.rosterFrame(meta, frame.id, 'host')));
+      this.broadcastPresence();
       return;
     }
 
@@ -495,6 +525,7 @@ export class Group {
       if (entry.status === 'approved') {
         this.identities.set(socket, { memberId: frame.id, role: 'member' });
         socket.send(JSON.stringify(await this.rosterFrame(meta, frame.id, 'member')));
+        this.broadcastPresence();
         return;
       }
       if (entry.status === 'pending') {
@@ -559,6 +590,7 @@ export class Group {
         })
       );
       await this.notifyState(meta, new Set([socket]));
+      this.broadcastPresence();
       return;
     }
 

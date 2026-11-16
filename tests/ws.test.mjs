@@ -75,25 +75,39 @@ function connect(url) {
           closed() {
             return closed;
           },
-          next(timeoutMs = 5_000) {
-            if (frames.length) return Promise.resolve(frames.shift());
-            return new Promise((done, fail) => {
-              const timer = setTimeout(() => fail(new Error(`no frame within ${timeoutMs} ms`)), timeoutMs);
-              waiters.push({
-                resolve(value) {
-                  clearTimeout(timer);
-                  done(value);
-                },
-                reject(error) {
-                  clearTimeout(timer);
-                  fail(error);
-                }
+          async next(timeoutMs = 5_000, includePresence = false) {
+            for (;;) {
+              if (frames.length) {
+                const frame = frames.shift();
+                if (!includePresence && frame.t === 'presence') continue;
+                return frame;
+              }
+              const frame = await new Promise((done, fail) => {
+                const timer = setTimeout(() => fail(new Error(`no frame within ${timeoutMs} ms`)), timeoutMs);
+                waiters.push({
+                  resolve(value) {
+                    clearTimeout(timer);
+                    done(value);
+                  },
+                  reject(error) {
+                    clearTimeout(timer);
+                    fail(error);
+                  }
+                });
               });
-            });
+              if (!includePresence && frame.t === 'presence') continue;
+              return frame;
+            }
           },
           async silence(ms = 400) {
+            const keep = frames.filter((frame) => frame.t !== 'presence');
+            frames.length = 0;
+            frames.push(...keep);
             if (frames.length) throw new Error(`unexpected frame: ${JSON.stringify(frames[0])}`);
             await new Promise((done) => setTimeout(done, ms));
+            const later = frames.filter((frame) => frame.t !== 'presence');
+            frames.length = 0;
+            frames.push(...later);
             if (frames.length) throw new Error(`unexpected frame: ${JSON.stringify(frames[0])}`);
           },
           async waitClosed(timeoutMs = 5_000) {
@@ -443,6 +457,71 @@ test('a sealed expense leaves no description or amount on the wire', async (t) =
   assert.equal(wire.includes('987654'), false, 'the amount digits never reach the wire');
   assert.equal(typeof record.blob.iv, 'string');
   assert.equal(typeof record.blob.ct, 'string');
+});
+
+test('presence carries approved ids once, ignores pending, and drops on close', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  assert.equal((await host.next()).t, 'state');
+  const alone = await host.next(5_000, true);
+  assert.equal(alone.t, 'presence');
+  assert.deepEqual(Object.keys(alone).sort(), ['here', 't'], 'presence carries ids only');
+  assert.deepEqual(alone.here, [group.hostId]);
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+  const member = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => member.close());
+  member.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Here' })
+  });
+  assert.equal((await member.next()).t, 'waiting');
+  await host.next();
+  await host.silence(300);
+
+  host.send({ t: 'approve', memberId });
+  assert.equal((await member.next()).t, 'state');
+  const memberPresence = await member.next(5_000, true);
+  assert.equal(memberPresence.t, 'presence');
+  assert.deepEqual([...memberPresence.here].sort(), [group.hostId, memberId].sort());
+  await host.next();
+  assert.equal((await host.next(5_000, true)).t, 'presence');
+
+  /* Two tabs of one member count once. */
+  const second = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => second.close());
+  second.send({ t: 'auth', id: memberId, secret: memberSecret, mode: 'resume' });
+  assert.equal((await second.next()).t, 'state');
+  const twoTabs = await second.next(5_000, true);
+  assert.equal(twoTabs.t, 'presence');
+  assert.equal(twoTabs.here.filter((id) => id === memberId).length, 1);
+  await host.next(5_000, true);
+
+  second.close();
+  const stillHere = await host.next(5_000, true);
+  assert.equal(stillHere.t, 'presence');
+  assert.ok(stillHere.here.includes(memberId), 'one tab closing does not remove the member');
+
+  member.close();
+  let gone = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const frame = await host.next(5_000, true);
+    if (!frame.here.includes(memberId)) {
+      gone = frame;
+      break;
+    }
+  }
+  assert.equal(gone.t, 'presence');
+  assert.deepEqual(gone.here, [group.hostId]);
 });
 
 test('the host imports participants as roster entries with no seats', async (t) => {
