@@ -31,18 +31,80 @@ function sealed(bytes = 96) {
   };
 }
 
-/** A Group over one Map, plus the map itself so a test can see whether anything was written. */
-function newGroup() {
+/**
+ * The key-value half of Durable Object storage, over one Map.
+ *
+ * `get`/`put` were the whole surface a group needed while it only ever wrote; a destroy reads the
+ * key set and removes each key, so `list` and `delete` are here with the shapes the real API has
+ * — `list` answers a Map, `delete` answers a boolean. `deleteAll` is provided because the host's
+ * `end` uses it; destroy itself deletes key by key, so one failure can be injected mid-wipe.
+ */
+function makeStorage() {
   const stored = new Map();
-  const ctx = {
-    storage: {
-      get: async (key) => stored.get(key),
-      put: async (key, value) => {
-        stored.set(key, value);
+  const api = {
+    get: async (key) => stored.get(key),
+    put: async (key, value) => {
+      stored.set(key, value);
+    },
+    list: async ({ prefix } = {}) => {
+      const found = new Map();
+      for (const [key, value] of stored) {
+        if (prefix === undefined || key.startsWith(prefix)) found.set(key, value);
       }
+      return found;
+    },
+    delete: async (key) => stored.delete(key),
+    deleteAll: async () => {
+      stored.clear();
     }
   };
-  return { group: new Group(ctx, {}), stored };
+  return { api, stored };
+}
+
+/**
+ * A Registry stand-in: it records every call and answers what the test says it should.
+ *
+ * The Group reaches it as `env.REGISTRY.get(env.REGISTRY.idFromName('registry'))`, so both methods
+ * are here; the recorded path and body are what the assertions read, because "released the slot"
+ * means this exact call happened, not that the answer looked right.
+ */
+function newRegistry(answer = () => ({ status: 200, body: { ok: true } })) {
+  const calls = [];
+  const env = {
+    REGISTRY: {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: async (url, init) => {
+          calls.push({ path: new URL(url).pathname, body: JSON.parse(init.body) });
+          const { status, body } = answer(calls.length);
+          return new Response(JSON.stringify(body), { status });
+        }
+      })
+    }
+  };
+  return { env, calls };
+}
+
+/** A Group over one Map, plus the map itself so a test can see whether anything was written. */
+function newGroup({ env = {}, storage = makeStorage() } = {}) {
+  const ctx = { storage: storage.api };
+  return { group: new Group(ctx, env), stored: storage.stored };
+}
+
+/** A socket as the Group holds one: it records the frames sent and the close it was given. */
+function newSocket() {
+  const frames = [];
+  const closes = [];
+  return {
+    frames,
+    closes,
+    send(text) {
+      frames.push(JSON.parse(text));
+    },
+    close(code, reason) {
+      closes.push({ code, reason });
+    }
+  };
 }
 
 /** A request the Worker itself would make: JSON, POST, to `path`. */

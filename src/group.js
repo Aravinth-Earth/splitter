@@ -14,6 +14,10 @@
  *
  * Storage is the key-value API on a SQLite-backed namespace: one key per record, so a later write
  * to a record cannot rewrite its neighbours, and the meta is written once.
+ *
+ * Destroy is the operator's one call out, and it runs in a fixed order: every socket, then every
+ * key with the meta last, then the Registry slot. The order is the guarantee — a wipe that dies
+ * part-way leaves a group that still exists, holding the slot the ledger still counts for it.
  */
 
 /* The shapes the edge also checks. Validating here again is not belt and braces: this is the write
@@ -131,9 +135,26 @@ export class Group {
       return json({ error: 'method' }, 405, { allow: 'POST' });
     }
 
+    /* Read only: this answers what the group holds, for the operator's listing. It takes no input,
+       so a POST with an empty body is a valid read, and a group that holds no meta is a 404 rather
+       than a group of zeroes. */
+    if (pathname === '/counters') {
+      const counters = await this.counters();
+      return counters === null ? json({ error: 'unknown_group' }, 404) : json({ ok: true, ...counters });
+    }
+
     /* The pathname is compared whole, never by suffix: a URL that merely ends in `/init` (say
        `/nope/init`) would otherwise initialise this group for a caller whose intent was some other
        route. Every internal call is written in this repo, so the set of paths is closed. */
+    /* A group's own removal, called by the Worker on the operator surface. The body is ignored:
+       the instance is the subject, so there is nothing to validate and nothing a caller could
+       point it at. A wipe that failed is a 500; a slot the Registry did not take back is a 502,
+       because the group is gone but the ledger still holds a row for it. */
+    if (pathname === '/destroy') {
+      const destroyed = await this.destroy();
+      return json(destroyed, destroyed.ok ? 200 : destroyed.destroyed ? 502 : 500);
+    }
+
     if (pathname !== '/init') return json({ error: 'not_found' }, 404);
 
     const body = await request.json().catch(() => null);
@@ -434,19 +455,107 @@ export class Group {
     const identity = this.identities.get(socket);
     if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
 
-    for (const peer of this.sockets) {
-      this.sendFrame(peer, { t: 'ended' });
-      try {
-        peer.close(1000, 'ended');
-      } catch {
-        /* already gone */
-      }
-    }
+    this.closeAll();
 
     await this.ctx.storage.deleteAll();
     await this.callRegistry('/release', { groupId: meta.groupId ?? this.ctx.id.toString() }).catch(() => {
       /* the slot is a reconciliation problem, not a reason to keep the group alive */
     });
+  }
+
+  /**
+   * Take this group off the air in one call: sockets, then storage, then the slot.
+   *
+   * The order is the release-critical part. The Registry is told the slot is free only after every
+   * key is gone, so a wipe that dies part-way leaves a group that still exists, holding the slot
+   * the ledger still believes it holds — a state a caller can see and a retry can finish. A release
+   * the Registry refuses is answered with `released: false` rather than a claim the slot is free,
+   * because the ledger's row is the only truth about it.
+   *
+   * There is no caller-side identity check: this route is reached by the Worker, not by a browser
+   * socket, and the Worker is the only thing that can name this instance.
+   *
+   * @returns {Promise<{ok: boolean, destroyed: boolean, released: boolean, closed: number, error?: string}>}
+   */
+  async destroy() {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    const closed = this.closeAll();
+
+    try {
+      await this.wipe();
+    } catch {
+      return { ok: false, destroyed: false, released: false, closed, error: 'storage' };
+    }
+
+    /* The id the slot was reserved under, then the DO's own name as the last resort: a group
+       written before `groupId` was stored still holds a slot under the name it was created with. */
+    const slot = meta?.groupId ?? this.ctx.id?.toString?.() ?? null;
+    if (typeof slot !== 'string' || slot === '') {
+      /* Nothing here ever held a slot, so there is none to give back. */
+      return { ok: true, destroyed: true, released: false, closed };
+    }
+    if (!(await this.releaseSlot(slot))) {
+      return { ok: false, destroyed: true, released: false, closed, error: 'release' };
+    }
+    return { ok: true, destroyed: true, released: true, closed };
+  }
+
+  /**
+   * Remove every key this group holds, the meta last, and drop any alarm.
+   *
+   * The meta is what makes the group exist, so it goes last: a wipe that fails between two keys
+   * leaves a group that is still there — and still holds its slot — instead of a half-group whose
+   * ledger entry has already been handed back. Deleting key by key rather than with `deleteAll` is
+   * what makes that ordering possible.
+   */
+  async wipe() {
+    const keys = [...(await this.ctx.storage.list()).keys()];
+    const ordered = keys.filter((key) => key !== GROUP_KEY);
+    if (keys.includes(GROUP_KEY)) ordered.push(GROUP_KEY);
+    for (const key of ordered) await this.ctx.storage.delete(key);
+    /* No alarm is set anywhere in this Worker today; the guard is what keeps this call true if one
+       is ever added, instead of an unconditional call that would throw on a storage without it. */
+    if (typeof this.ctx.storage.deleteAlarm === 'function') await this.ctx.storage.deleteAlarm();
+  }
+
+  /** Tell every attached socket the group is gone, close it, forget it; answer how many there were. */
+  closeAll() {
+    let closed = 0;
+    for (const socket of this.sockets) {
+      this.sendFrame(socket, { t: 'ended' });
+      try {
+        socket.close(1000, 'ended');
+      } catch {
+        /* already gone */
+      }
+      closed += 1;
+    }
+    this.sockets.clear();
+    this.identities.clear();
+    this.clientIps.clear();
+    return closed;
+  }
+
+  /**
+   * Ask the Registry to drop the slot, and say whether it actually did.
+   *
+   * `false` covers a refusal, a non-200 and an unreachable Registry alike: from here they are one
+   * answer — the slot is not known to be free — and reporting otherwise would tell the operator a
+   * slot came back that the ledger still holds.
+   */
+  async releaseSlot(groupId) {
+    try {
+      const response = await this.registryStub().fetch('https://registry/release', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ groupId })
+      });
+      if (!response.ok) return false;
+      const body = await response.json().catch(() => null);
+      return body?.ok === true;
+    } catch {
+      return false;
+    }
   }
 
   /** One frame per change: the member ids with an approved socket right now. Ids only. */
