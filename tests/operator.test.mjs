@@ -525,6 +525,23 @@ test('operator: a wrong method is refused with the method it allows', async () =
   assert.equal(listGet.status, 405, 'a listing needs a body for its cursor');
   assert.equal(listGet.headers.get('allow'), 'POST');
   assert.equal(calls.length, 0, 'a refused method must reach no Durable Object');
+
+  /* Every route, not just the two above: `/counters` and `/destroy` answer a 405 too, and a client
+     that reads it must be told which method those two take. `/stats` is the only GET. */
+  for (const route of ROUTES) {
+    for (const wrong of route.method === 'GET' ? ['POST', 'PUT'] : ['GET', 'PUT']) {
+      const result = await call(env, route.path, { method: wrong, token: TOKEN, body: {} });
+
+      assert.equal(result.status, 405, `${wrong} ${route.path} must be refused`);
+      assert.equal(
+        result.headers.get('allow'),
+        route.method,
+        `${wrong} ${route.path} must carry Allow: ${route.method}`
+      );
+      assert.deepEqual(result.body, { error: 'method' });
+    }
+  }
+  assert.equal(calls.length, 0, 'no wrong method may reach a Durable Object');
 });
 
 test('operator: a body that is not a JSON object is a bad request', async () => {

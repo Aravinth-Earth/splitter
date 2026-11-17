@@ -285,16 +285,36 @@ test('an unknown room, a bad origin and a non-upgrade request are refused before
     headers: { origin: 'https://evil.example' }
   });
   assert.equal(origin.status, 403);
+  assert.deepEqual(await origin.json(), { error: 'origin' }, 'the refusal names the origin, not a room');
 
   const upgrade = await fetch(`${worker.baseUrl}/api/ws?room=${group.groupId}`, {
     headers: { origin: worker.baseUrl }
   });
   assert.equal(upgrade.status, 426);
+  /* `Upgrade` is hop-by-hop and the HTTP client strips it, so the observable proof is the answer's
+     shape: a JSON refusal, not an attempted handshake. */
+  assert.match(
+    upgrade.headers.get('content-type') ?? '',
+    /^application\/json/,
+    'a refused upgrade is a JSON answer, not a socket'
+  );
+  assert.deepEqual(await upgrade.json(), { error: 'upgrade' });
 
   const room = await fetch(`${worker.baseUrl}/api/ws?room=not-a-group`, {
     headers: { origin: worker.baseUrl }
   });
   assert.equal(room.status, 400);
+  assert.deepEqual(await room.json(), { error: 'room' }, 'the refusal names the room, not the origin');
+
+  /* The socket route is a GET. A wrong method is answered before any handshake, with the method
+     the route takes — the same 405 contract the other routes keep. */
+  const wsMethod = await fetch(`${worker.baseUrl}/api/ws?room=${group.groupId}`, {
+    method: 'POST',
+    headers: { origin: worker.baseUrl }
+  });
+  assert.equal(wsMethod.status, 405, 'a socket is opened with GET');
+  assert.equal(wsMethod.headers.get('allow'), 'GET', 'a 405 must carry Allow: GET');
+  assert.deepEqual(await wsMethod.json(), { error: 'method' });
 
   const known = await fetch(`${worker.baseUrl}/api/room?room=${group.groupId}`);
   assert.equal(known.status, 200);

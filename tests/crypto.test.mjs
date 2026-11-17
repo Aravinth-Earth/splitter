@@ -7,6 +7,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync, readdirSync } from 'node:fs';
 
 import {
   ALPHABET,
@@ -29,7 +30,7 @@ import {
 } from '../public/crypto.js';
 /* The server's half of the same envelope. The iv was counted as 16 characters in one file and 12
    bytes in the other, so the cross-check below is the point of the import, not a detail. */
-import { IV_BASE64_CHARS } from '../src/wire.js';
+import { IV_BASE64_CHARS, isSealed } from '../src/wire.js';
 
 /* Crockford base32: 0-9, then A-H (no I), J, K, M, N, P-T (no U), V-Z. */
 const CODE_PATTERN = /^[0-9A-HJKMNP-TV-Z]{16}$/;
@@ -273,6 +274,50 @@ test('the server counts the iv in the same twelve bytes the client writes', asyn
   const frame = await seal(key, { amount: 1 });
   assert.equal(frame.iv.length, IV_BASE64_CHARS, 'a sealed iv is exactly what the server expects');
   assert.equal(Buffer.from(frame.iv, 'base64url').length, IV_BYTES, 'and those characters are 12 bytes');
+});
+
+test('the wire accepts a 16-character iv and refuses a 12-character one', async () => {
+  /* The server stores an envelope only if `isSealed` says so, so this is the check a real create
+     passes through. Both directions are asserted: a refusal alone could be a validator that
+     refuses everything, and an acceptance alone could be one that accepts anything. */
+  const key = await deriveGroupKey(generateCode());
+  const frame = await seal(key, { amount: 1 });
+
+  assert.equal(isSealed(frame), true, 'a frame the browser actually sealed must be storable');
+  assert.equal(isSealed({ iv: 'A'.repeat(16), ct: frame.ct }), true, '16 characters is the iv');
+
+  /* 12 characters is the byte count written in the wrong unit: it is what a constant that reads as
+     `IV_LENGTH = 12` would accept, and it is not an iv any frame carries. */
+  assert.equal(isSealed({ iv: 'A'.repeat(12), ct: frame.ct }), false, '12 characters is not an iv');
+  assert.equal(isSealed({ iv: frame.iv.slice(0, 15), ct: frame.ct }), false, 'nor is a short one');
+  assert.equal(isSealed({ iv: `${frame.iv}A`, ct: frame.ct }), false, 'nor a long one');
+
+  /* The number is the one the client's bytes produce, not a coincidence of the fixture. */
+  assert.equal(Buffer.from('A'.repeat(IV_BASE64_CHARS), 'base64url').length, IV_BYTES);
+});
+
+test('the server has one iv constant, and it is in the file both readers import', () => {
+  /* A second definition is how the two units drifted apart before: `IV_LENGTH = 16` in the Worker
+     read as bytes and disagreed with the browser's `IV_BYTES = 12`. The scan is over the server's
+     modules, so a stray definition anywhere in `src` — used or not — is the finding. */
+  const src = new URL('../src/', import.meta.url);
+  const files = readdirSync(src).filter((name) => name.endsWith('.js'));
+  assert.ok(files.includes('wire.js'), 'the scan found the module the constant lives in');
+  assert.ok(files.length >= 5, `the scan reads the server modules, found ${files.join(', ')}`);
+
+  const definitions = [];
+  for (const name of files) {
+    const text = readFileSync(new URL(name, src), 'utf8');
+    for (const match of text.matchAll(/\bIV_[A-Z0-9_]+\s*=/g)) {
+      definitions.push(`${name}: ${match[0].trim()}`);
+    }
+  }
+
+  assert.deepEqual(
+    definitions,
+    ['wire.js: IV_BASE64_CHARS ='],
+    'one iv constant, in the file both the edge and the Durable Object import'
+  );
 });
 
 test('the sealed bytes carry no plaintext', async () => {

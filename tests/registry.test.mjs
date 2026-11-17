@@ -148,6 +148,14 @@ test('registry: /reserve and /release are routed whole, so a suffix is not a rou
   assert.deepEqual(await unrouted.json(), { error: 'not_found' });
   assert.equal(rows.has(id(1)), true, 'an unrouted path must leave the ledger untouched');
 
+  /* The same shape on the other write route: `/nope/reserve` ends in `/reserve`, and a suffix match
+     took a slot for a caller that never asked for one. It is a 404, and no row is written. */
+  const unroutedReserve = await post(registry, { groupId: id(2) }, { path: '/nope/reserve' });
+  assert.equal(unroutedReserve.status, 404, 'POST /nope/reserve must not take a slot');
+  assert.deepEqual(await unroutedReserve.json(), { error: 'not_found' });
+  assert.equal(rows.has(id(2)), false, 'an unrouted path must reserve nothing');
+  assert.equal(rows.size, 1, 'the one slot held is still the only one');
+
   const released = await post(registry, { groupId: id(1) }, { path: '/release' });
   assert.equal(released.status, 200);
   assert.deepEqual(await released.json(), { ok: true, freed: 1 }, 'the answer counts the row it deleted');
@@ -185,6 +193,30 @@ test('registry: a method other than POST is refused and names the method it allo
   assert.equal(response.status, 405);
   assert.equal(response.headers.get('allow'), 'POST', 'a 405 must carry Allow: POST');
   assert.deepEqual(await response.json(), { error: 'method' });
+});
+
+test('registry: every route answers a wrong method with Allow: POST', async () => {
+  /* The whole set, not the two routes a create calls: the ledger takes no GET, PUT or DELETE on any
+     of them, and a 405 has to name the method it does take. */
+  const PATHS = ['/reserve', '/release', '/join-blocked', '/join-failure', '/stats', '/list'];
+
+  for (const path of PATHS) {
+    for (const method of ['GET', 'PUT', 'DELETE']) {
+      const { ctx, rows, joinRows } = fakeContext();
+      const registry = new Registry(ctx, { MAX_GROUPS: '2' });
+      const response = await post(registry, null, { path, method });
+
+      assert.equal(response.status, 405, `${method} ${path} must be refused`);
+      assert.equal(
+        response.headers.get('allow'),
+        'POST',
+        `${method} ${path} must carry Allow: POST`
+      );
+      assert.deepEqual(await response.json(), { error: 'method' });
+      assert.equal(rows.size, 0, 'a refused method must not take a slot');
+      assert.equal(joinRows.length, 0, 'nor count a join failure');
+    }
+  }
 });
 
 test('registry: a release without a group id is a bad request, not a no-op success', async () => {
