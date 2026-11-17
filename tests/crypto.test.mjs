@@ -55,9 +55,25 @@ test('the alphabet is Crockford base32 and the constants name the plan', () => {
 
 test('every derivation label carries the sp1: domain prefix', () => {
   assert.deepEqual(Object.keys(LABELS).sort(), ['group', 'key', 'member']);
-  for (const [name, label] of Object.entries(LABELS)) {
+
+  /* Distinctness is a property of the set, not of a member: checked once, outside the loop, it
+     names the failure once; inside the loop it could only repeat itself three times. */
+  const entries = Object.entries(LABELS);
+  assert.equal(new Set(Object.values(LABELS)).size, 3, 'each derivation gets its own label');
+
+  for (const [name, label] of entries) {
     assert.ok(label.startsWith(DOMAIN_PREFIX), `${name} label "${label}" leaves the domain`);
-    assert.equal(new Set(Object.values(LABELS)).size, 3, 'each derivation gets its own label');
+
+    /* Distinct labels are not enough. `sp1:group:` and `sp1:group:key:` differ, and the first
+       still reads as the opening of the second, so one derivation's hash input can be read as
+       another's — the collision the domain labels exist to make impossible. */
+    for (const [otherName, otherLabel] of entries) {
+      if (otherName === name) continue;
+      assert.ok(
+        !otherLabel.startsWith(label),
+        `${name} label "${label}" prefixes the ${otherName} label "${otherLabel}"`
+      );
+    }
   }
 });
 
@@ -133,9 +149,12 @@ test('the group id is 64 lowercase hex characters and does not carry the code', 
   assert.match(id, HEX_64);
   assert.equal(id.length, 64);
 
-  /* The code is upper case on the wire, so it cannot appear in a lowercase hex digest. */
-  assert.ok(!id.includes(normalizeCode(code)), 'the id must not carry the code');
-  assert.ok(!id.includes(code.toUpperCase()), 'nor the formatted reading');
+  /* The uppercase checks this replaces could not fail: an id that matches HEX_64 carries no
+     uppercase letter, so a code written upper case was never going to appear in it. The shape
+     that does pass every check above is the code's own bytes hex-encoded — 32 characters, so
+     twice over is 64 lowercase hex characters, deterministic, and different for every code. */
+  const codeHex = Buffer.from(normalizeCode(code), 'utf8').toString('hex');
+  assert.ok(!id.includes(codeHex), 'the id must not be the code hex-encoded, once or twice');
 
   /* Case, spacing and the formatted reading all name the same group. */
   assert.equal(await groupIdFromCode(code.toLowerCase()), id);
@@ -313,8 +332,25 @@ test('a member id is 22 base64url characters derived from a secret, not the code
   const id = await idFromSecret(secret);
   assert.match(id, BASE64URL_22);
   assert.equal(id.length, ID_LENGTH);
+
+  /* The equality of lengths is what makes `notEqual` the whole check: an id of the same 22
+     characters that contained the secret would *be* the secret, so `includes` could only ever
+     fail on the same run as the line above it. */
+  assert.equal(id.length, secret.length);
   assert.notEqual(id, secret, 'the id must not be the secret');
-  assert.ok(!id.includes(secret));
+
+  /* And the label has to be `member`, not `group`. Read alike, the id is the first 16 bytes of
+     the group derivation of the same input — same shape, same length, same uniqueness — and no
+     check above this line can see it. */
+  const decoded = Buffer.from(id, 'base64url');
+  const groupDerivation = Buffer.from(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${LABELS.group}${secret}`))
+  );
+  assert.notEqual(
+    decoded.toString('hex'),
+    groupDerivation.subarray(0, decoded.length).toString('hex'),
+    'a member id must not be the group derivation of the same secret'
+  );
 
   /* Derived, not random: the same secret names the same member every time. */
   assert.equal(await idFromSecret(secret), id);
