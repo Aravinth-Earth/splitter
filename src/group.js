@@ -29,9 +29,20 @@ import { isId, isSealed } from './wire.js';
 export const GROUP_KEY = 'meta';
 const MEMBER_PREFIX = 'member:';
 const RECORD_PREFIX = 'record:';
+/* The last accepted record write, kept in its own key rather than in the meta: a record write can
+   therefore stamp it with a blind put, and cannot clobber a join mode a host changed a moment
+   earlier between this write's read and its write of the meta. */
+const LAST_WRITE_KEY = 'last-write';
 const DEFAULT_MAX_MEMBERS = 20;
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
 const MAX_RECORD_BYTES = 64 * 1024;
+
+const encoder = new TextEncoder();
+
+/** The UTF-8 size of a stored value, which is what a listing reports as a record's bytes. */
+function storedBytes(value) {
+  return encoder.encode(JSON.stringify(value)).length;
+}
 
 function memberKey(id) {
   return `${MEMBER_PREFIX}${id}`;
@@ -100,6 +111,7 @@ export class Group {
       hostId,
       joinMode: 'approval',
       rev: 0,
+      createdAt: Date.now(),
       nameBlob,
       hostNameBlob: hostNameBlob ?? null,
       metaBlob: metaBlob ?? null
@@ -164,6 +176,33 @@ export class Group {
 
     const result = await this.init(body);
     return json(result, result.ok ? 200 : 400);
+  }
+
+  /**
+   * What this group holds, as counts: no name, no amount, no code.
+   *
+   * `records` is how many record keys are stored and `bytes` the UTF-8 size of their stored values,
+   * tombstones included — the same shape the write cap is measured on. Both times are `null` when
+   * this group predates them: a group created before they were stamped has no creation time to
+   * report, and a made-up one would be a claim the storage cannot support.
+   *
+   * @returns {Promise<null | {createdAt: number|null, lastWriteAt: number|null, records: number, bytes: number}>}
+   */
+  async counters() {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta) return null;
+
+    const lastWrite = await this.ctx.storage.get(LAST_WRITE_KEY);
+    const records = await this.ctx.storage.list({ prefix: RECORD_PREFIX });
+    let bytes = 0;
+    for (const [, record] of records) bytes += storedBytes(record);
+
+    return {
+      createdAt: Number.isSafeInteger(meta.createdAt) ? meta.createdAt : null,
+      lastWriteAt: Number.isSafeInteger(lastWrite?.at) ? lastWrite.at : null,
+      records: records.size,
+      bytes
+    };
   }
 
   /**
@@ -782,6 +821,10 @@ export class Group {
     };
 
     await this.ctx.storage.put(key, record);
+    /* A blind put of the time alone: nothing here read the meta, so nothing here can write one back
+       stale. A write rejected above never reaches this line, so the time is the last *accepted*
+       write. */
+    await this.ctx.storage.put(LAST_WRITE_KEY, { at: record.at });
     await this.broadcastRecord(record);
   }
 
@@ -807,9 +850,14 @@ export class Group {
     }
   }
 
+  /** The one Registry instance, however a caller here reaches it. */
+  registryStub() {
+    return this.env.REGISTRY.get(this.env.REGISTRY.idFromName('registry'));
+  }
+
   /** Ask the Registry, the one singleton that can count across groups. */
   async callRegistry(path, body) {
-    const registry = this.env.REGISTRY.get(this.env.REGISTRY.idFromName('registry'));
+    const registry = this.registryStub();
     const response = await registry.fetch(`https://registry${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
