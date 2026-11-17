@@ -82,6 +82,49 @@ export const OFFLINE_FIRST_MESSAGE =
   'Open this group once with a connection; after that it works offline.';
 export const RETRY_MESSAGE = 'The group was not created. Try again.';
 
+/* A wipe that stopped part-way is not an end, and it is not a whole group either: the keys are
+   deleted before the meta, so the records may already be gone while the group still exists. The copy
+   therefore claims only what the storage keeps — the group is still here, the delete failed, and
+   some or all of the data may be gone — and says what to do about it. */
+export const WIPE_FAILED_MESSAGE =
+  'The delete failed, so the group still exists. Some or all of its data may be gone. Try again.';
+
+/* A write that arrives while the group is being wiped is refused with the code `wiping`. The group
+   is still stored — the wipe may yet fail — so the page says what is happening and stays where it
+   is, rather than treating the refusal as the group's end. */
+export const WIPING_MESSAGE = 'This group is being deleted. Try again in a moment.';
+
+/**
+ * What a lifecycle frame means for this page.
+ *
+ * `ended` says the data is gone, so the page leaves the group. `wipe-failed` says the wipe stopped
+ * before the group was removed, so the page stays: the socket is still attached, and navigating away
+ * from it would tell the person their group ended while it did not. Every socket reads this one
+ * function, so the host, the member and the resume path cannot disagree about which frame means
+ * which. Anything else returns `null` and moves nothing.
+ *
+ * @returns {'leave'|'stay'|null}
+ */
+export function lifecycleFrameOutcome(frame) {
+  if (frame === null || typeof frame !== 'object') return null;
+  if (frame.t === 'ended') return 'leave';
+  if (frame.t === 'wipe-failed') return 'stay';
+  return null;
+}
+
+/**
+ * Whether a refusal says the group is being deleted, rather than that this one write was wrong.
+ *
+ * A wipe refuses every write while it runs, and the refusal arrives on the socket the page is
+ * already holding. Read as an end it would close that socket and forget a group that is still
+ * stored, so the code is named here and every socket reads it the same way. Each socket answers the
+ * refusals about a record first — those carry the `id` of the write — and this is the group-level
+ * reading that is left.
+ */
+export function isWipingRefusal(frame) {
+  return frame !== null && typeof frame === 'object' && frame.t === 'refused' && frame.code === 'wiping';
+}
+
 /* The app is the whole of its origin, so a relative path is the API on this origin and nothing
    else. */
 const CREATE_PATH = 'api/create';
@@ -1364,8 +1407,13 @@ export function init(doc = document, win = window) {
           handleExpenseConflict(frame);
           return;
         }
-        if (frame.t === 'ended') {
+        const lifecycle = lifecycleFrameOutcome(frame);
+        if (lifecycle === 'leave') {
           handleEnded();
+          return;
+        }
+        if (lifecycle === 'stay') {
+          handleWipeFailed();
           return;
         }
         if (frame.t === 'left') {
@@ -1382,6 +1430,12 @@ export function init(doc = document, win = window) {
         }
         if (frame.t === 'refused') {
           if (handleExpenseRefusal(frame)) return;
+          /* A wipe in progress is not an end: the group is still stored, and a wipe that fails
+             leaves a group this socket can talk to again. */
+          if (isWipingRefusal(frame)) {
+            handleWiping();
+            return;
+          }
           socket.close();
           joinSocket = null;
           if (frame.code === 'unknown_group') dropGroupCache(groupIdValue);
@@ -1465,8 +1519,13 @@ export function init(doc = document, win = window) {
           handleExpenseConflict(frame);
           return;
         }
-        if (frame.t === 'ended') {
+        const lifecycle = lifecycleFrameOutcome(frame);
+        if (lifecycle === 'leave') {
           handleEnded();
+          return;
+        }
+        if (lifecycle === 'stay') {
+          handleWipeFailed();
           return;
         }
         if (frame.t === 'left') {
@@ -1483,6 +1542,12 @@ export function init(doc = document, win = window) {
         }
         if (frame.t === 'refused') {
           if (handleExpenseRefusal(frame)) return;
+          /* The same reading as the resume path: a refused join during a wipe leaves a socket that
+             is still attached to a group that still exists. */
+          if (isWipingRefusal(frame)) {
+            handleWiping();
+            return;
+          }
           socket.close();
           joinSocket = null;
           if (frame.code === 'unknown_group') dropGroupCache(groupId);
@@ -1559,8 +1624,13 @@ export function init(doc = document, win = window) {
           void handleRecordFrame(frame);
           return;
         }
-        if (frame.t === 'ended') {
+        const lifecycle = lifecycleFrameOutcome(frame);
+        if (lifecycle === 'leave') {
           handleEnded();
+          return;
+        }
+        if (lifecycle === 'stay') {
+          handleWipeFailed();
           return;
         }
         if (frame.t === 'left') {
@@ -1578,6 +1648,13 @@ export function init(doc = document, win = window) {
         if (frame.t === 'refused') {
           if (handleImportRefusal(frame)) return;
           if (handleExpenseRefusal(frame)) return;
+          if (isWipingRefusal(frame)) {
+            handleWiping();
+            /* The toggle is disabled when it is clicked and re-armed by a state frame or by a
+               refusal; a wipe refuses its `mode` frame like any other write. */
+            toggleModeButton.disabled = false;
+            return;
+          }
           rosterEmpty.textContent = 'That request could not be completed.';
           rosterEmpty.hidden = false;
           toggleModeButton.disabled = false;
@@ -3506,6 +3583,28 @@ export function init(doc = document, win = window) {
     closeJoinSocket();
     showCreate();
     showNotice('This group has ended. It cannot be reopened.');
+  }
+
+  /**
+   * A wipe that stopped part-way: the group is still stored and still hosted, so this view stays —
+   * the same sockets, the same records on screen — and the status line says what happened. Nothing
+   * here closes a socket or navigates, because both would tell the person the group ended.
+   */
+  function handleWipeFailed() {
+    setStatus(WIPE_FAILED_MESSAGE);
+  }
+
+  /**
+   * A refusal that says the group is being deleted. The socket is not closed here and the group is
+   * not forgotten: the group is still stored, an `ended` frame is what ends the view, and the seat
+   * this device holds is what makes the next attempt land on the same group once the wipe has
+   * failed or is over.
+   */
+  function handleWiping() {
+    setStatus(WIPING_MESSAGE);
+    /* A refused auth arrives while the waiting panel is the one on screen, so the sentence goes
+       there as well: the status line is a four-second toast. */
+    waitingCopy.textContent = WIPING_MESSAGE;
   }
 
   /** This device left: the group is forgotten here; its entries remain on every other screen. */

@@ -15,9 +15,12 @@
  * Storage is the key-value API on a SQLite-backed namespace: one key per record, so a later write
  * to a record cannot rewrite its neighbours, and the meta is written once.
  *
- * Destroy is the operator's one call out, and it runs in a fixed order: every socket, then every
- * key with the meta last, then the Registry slot. The order is the guarantee — a wipe that dies
- * part-way leaves a group that still exists, holding the slot the ledger still counts for it.
+ * Destroy is the operator's one call out, and the host's end is the same act from a socket: both run
+ * in one fixed order — every key with the meta last, then every socket, then the Registry slot. The
+ * order is the guarantee: a wipe that dies part-way leaves a group that still exists, holding the
+ * slot the ledger still counts for it, and its sockets are told the wipe failed rather than that the
+ * group ended. The group is marked as wiping before the first key goes, so a write that arrives
+ * while the wipe is running is refused instead of being stored behind it.
  */
 
 /* The shapes the edge also checks. Validating here again is not belt and braces: this is the write
@@ -33,6 +36,10 @@ const RECORD_PREFIX = 'record:';
    therefore stamp it with a blind put, and cannot clobber a join mode a host changed a moment
    earlier between this write's read and its write of the meta. */
 const LAST_WRITE_KEY = 'last-write';
+/* The id the Registry slot was taken under, in its own key rather than in the meta. The meta is the
+   key a wipe removes last and the key that makes the group exist, so a destroy that wiped the group
+   and then failed to free the slot would otherwise lose the only record of which slot to retry. */
+const SLOT_KEY = 'slot';
 const DEFAULT_MAX_MEMBERS = 20;
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
 const MAX_RECORD_BYTES = 64 * 1024;
@@ -106,6 +113,10 @@ export class Group {
     const existing = await this.ctx.storage.get(GROUP_KEY);
     if (existing) return { ok: true, created: false };
 
+    /* The slot is written first and only once: a retried create finds the meta and returns above,
+       so the id the ledger was asked for cannot be rewritten by a second caller. */
+    if (isId(groupId)) await this.ctx.storage.put(SLOT_KEY, groupId);
+
     await this.ctx.storage.put(GROUP_KEY, {
       groupId: isId(groupId) ? groupId : null,
       hostId,
@@ -160,8 +171,9 @@ export class Group {
        route. Every internal call is written in this repo, so the set of paths is closed. */
     /* A group's own removal, called by the Worker on the operator surface. The body is ignored:
        the instance is the subject, so there is nothing to validate and nothing a caller could
-       point it at. A wipe that failed is a 500; a slot the Registry did not take back is a 502,
-       because the group is gone but the ledger still holds a row for it. */
+       point it at. A wipe that failed is a 500; a group that is gone but whose bookkeeping did not
+       finish — a slot the Registry did not take back, an id that could not be cleared — is a 502,
+       because the group is gone and the ledger's side of it is not clean. */
     if (pathname === '/destroy') {
       const destroyed = await this.destroy();
       return json(destroyed, destroyed.ok ? 200 : destroyed.destroyed ? 502 : 500);
@@ -334,6 +346,10 @@ export class Group {
     const identity = this.identities.get(socket);
     if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
 
+    /* The same rule as a record write: a group that is being wiped takes no host decisions either,
+       or an approval arriving behind the wipe would leave a member entry in it. */
+    if (meta.wiping === true) return this.sendRefusal(socket, 'wiping');
+
     if (frame.t === 'mode') {
       if (frame.mode !== 'open' && frame.mode !== 'approval') {
         this.sendRefusal(socket, 'bad_mode');
@@ -396,6 +412,7 @@ export class Group {
   async importMembers(socket, frame) {
     const meta = await this.ctx.storage.get(GROUP_KEY);
     if (!meta) return this.refuse(socket, 'unknown_group');
+    if (meta.wiping === true) return this.sendRefusal(socket, 'wiping');
 
     const identity = this.identities.get(socket);
     if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
@@ -460,6 +477,7 @@ export class Group {
 
     const identity = this.identities.get(socket);
     if (!identity) return this.refuse(socket, 'unapproved');
+    if (meta.wiping === true) return this.sendRefusal(socket, 'wiping');
     if (identity.memberId === meta.hostId) {
       this.sendRefusal(socket, 'host_must_end');
       return;
@@ -484,8 +502,16 @@ export class Group {
   }
 
   /**
-   * The host ends the group. Every socket is told once, then the storage and the Registry slot go.
-   * A device that never reconnects keeps its own copy; the client clears it on the next contact.
+   * The host ends the group: the same act as `destroy`, so the same fixed order and the same slot.
+   *
+   * The wipe goes first, then the sockets, then the slot the create persisted. Sending `ended` on
+   * the way in would tell every client the group ended while its meta and records were still
+   * stored, and a wipe that then failed would leave a group that exists with clients who believe it
+   * does not. A wipe that fails sends `wipe-failed` and leaves the sockets attached, because the
+   * group they are attached to is still there.
+   *
+   * The slot is named by the id the create persisted, never by this instance: a release that used
+   * the Durable Object's own id names a row this group never held.
    */
   async end(socket) {
     const meta = await this.ctx.storage.get(GROUP_KEY);
@@ -494,22 +520,43 @@ export class Group {
     const identity = this.identities.get(socket);
     if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
 
+    const slot = await this.persistedSlot(meta);
+
+    try {
+      await this.wipe();
+    } catch {
+      this.notifyWipeFailed();
+      return;
+    }
+
     this.closeAll();
 
-    await this.ctx.storage.deleteAll();
-    await this.callRegistry('/release', { groupId: meta.groupId ?? this.ctx.id.toString() }).catch(() => {
-      /* the slot is a reconciliation problem, not a reason to keep the group alive */
-    });
+    if (slot === null) return;
+    /* The wipe is already done, so a release the Registry refused is not a reason to keep anything
+       alive: the slot id stays, which is what lets the operator's destroy finish the release. */
+    if ((await this.releaseSlot(slot)) === 'refused') return;
+    /* The sockets were told the group ended a moment ago, so there is no caller left to report a
+       slot key that will not go: the row is free either way, and a later destroy finds the ledger
+       row already gone and clears the key then. */
+    await this.ctx.storage.delete(SLOT_KEY).catch(() => {});
   }
 
   /**
-   * Take this group off the air in one call: sockets, then storage, then the slot.
+   * Take this group off the air in one call: storage, then sockets, then the slot.
    *
-   * The order is the release-critical part. The Registry is told the slot is free only after every
-   * key is gone, so a wipe that dies part-way leaves a group that still exists, holding the slot
-   * the ledger still believes it holds — a state a caller can see and a retry can finish. A release
-   * the Registry refuses is answered with `released: false` rather than a claim the slot is free,
-   * because the ledger's row is the only truth about it.
+   * The order is the release-critical part. Every key goes first, so a wipe that dies part-way
+   * leaves a group that still exists, holding the slot the ledger still believes it holds — a state
+   * a caller can see and a retry can finish. The sockets are told only once the wipe has finished:
+   * `ended` is the frame that says the data is gone, and sending it before the rows were removed
+   * told every client the group ended while its records were still stored. A wipe that fails sends
+   * `wipe-failed` instead and leaves the sockets open, because the group they are attached to still
+   * exists.
+   *
+   * The slot is named by the id the create persisted, never derived from this instance: a retry
+   * after a wipe found no meta would otherwise resolve a slot the group never held. A release the
+   * Registry did not actually free a row for is answered `released: false` rather than a claim the
+   * slot is free, because the ledger's row is the only truth about it — and a ledger that answers
+   * `freed: 0` is a row that is already gone, which is a finished destroy, not a stuck one.
    *
    * There is no caller-side identity check: this route is reached by the Worker, not by a browser
    * socket, and the Worker is the only thing that can name this instance.
@@ -517,26 +564,55 @@ export class Group {
    * @returns {Promise<{ok: boolean, destroyed: boolean, released: boolean, closed: number, error?: string}>}
    */
   async destroy() {
+    /* Read before the wipe: it is the wipe that removes the meta, and a retried destroy has only
+       the persisted slot id to go on. */
     const meta = await this.ctx.storage.get(GROUP_KEY);
-    const closed = this.closeAll();
+    const slot = await this.persistedSlot(meta);
 
     try {
       await this.wipe();
     } catch {
-      return { ok: false, destroyed: false, released: false, closed, error: 'storage' };
+      this.notifyWipeFailed();
+      return { ok: false, destroyed: false, released: false, closed: 0, error: 'storage' };
     }
 
-    /* The id the slot was reserved under, then the DO's own name as the last resort: a group
-       written before `groupId` was stored still holds a slot under the name it was created with. */
-    const slot = meta?.groupId ?? this.ctx.id?.toString?.() ?? null;
-    if (typeof slot !== 'string' || slot === '') {
+    const closed = this.closeAll();
+
+    if (slot === null) {
       /* Nothing here ever held a slot, so there is none to give back. */
       return { ok: true, destroyed: true, released: false, closed };
     }
-    if (!(await this.releaseSlot(slot))) {
+    const outcome = await this.releaseSlot(slot);
+    if (outcome === 'refused') {
+      /* A genuine refusal: the ledger may still hold the row, so the id that names it stays and a
+         retry can still clear it. */
       return { ok: false, destroyed: true, released: false, closed, error: 'release' };
     }
-    return { ok: true, destroyed: true, released: true, closed };
+    /* The slot is free — deleted by this call, or already gone — so the id that named it is no
+       longer worth keeping, and a retry has nothing left to free. A storage that refuses this
+       delete therefore changes nothing about the group: it is wiped and its sockets are closed, so
+       the answer reports that, the ledger's own count, and the one key that stayed. */
+    try {
+      await this.ctx.storage.delete(SLOT_KEY);
+    } catch {
+      return { ok: false, destroyed: true, released: outcome === 'freed', closed, error: 'slot' };
+    }
+    return { ok: true, destroyed: true, released: outcome === 'freed', closed };
+  }
+
+  /**
+   * The Registry slot id this group was created under, or `null` when it never held one.
+   *
+   * The persisted key is read first, because the wipe removes the meta and a retried destroy has
+   * only that key to go on; a group written before the key existed kept the id in its meta. This
+   * instance's own id is never a candidate: it names a Durable Object, not a row in the ledger.
+   *
+   * @returns {Promise<string|null>}
+   */
+  async persistedSlot(meta) {
+    const storedSlot = await this.ctx.storage.get(SLOT_KEY);
+    if (typeof storedSlot === 'string') return storedSlot;
+    return isId(meta?.groupId) ? meta.groupId : null;
   }
 
   /**
@@ -546,15 +622,57 @@ export class Group {
    * leaves a group that is still there — and still holds its slot — instead of a half-group whose
    * ledger entry has already been handed back. Deleting key by key rather than with `deleteAll` is
    * what makes that ordering possible.
+   *
+   * The group is marked as wiping in the meta before the first key goes, and every write reads that
+   * mark: a frame already in flight when the host ended the group — a put, a join, an approval —
+   * is refused for the whole duration of the wipe instead of being stored behind it. The mark lives
+   * in the meta, the key that goes last, so it is still there when the wipe is half done, and it is
+   * removed again when the wipe fails: a group whose sockets were told it still exists must still
+   * take writes.
+   *
+   * A write that had already read the meta before the mark was set is the one case the read alone
+   * cannot catch, so such a write reads the meta again after storing its record and removes the
+   * record it just wrote: the window between a write's read and its put cannot leave a record in a
+   * group the wipe has already listed.
+   *
+   * The slot id is the one key the wipe leaves: it is what a destroy that could not free the slot
+   * needs on its retry, and it is removed by `destroy` once the release has actually freed a row.
    */
   async wipe() {
-    const keys = [...(await this.ctx.storage.list()).keys()];
-    const ordered = keys.filter((key) => key !== GROUP_KEY);
-    if (keys.includes(GROUP_KEY)) ordered.push(GROUP_KEY);
-    for (const key of ordered) await this.ctx.storage.delete(key);
-    /* No alarm is set anywhere in this Worker today; the guard is what keeps this call true if one
-       is ever added, instead of an unconditional call that would throw on a storage without it. */
-    if (typeof this.ctx.storage.deleteAlarm === 'function') await this.ctx.storage.deleteAlarm();
+    try {
+      const meta = await this.ctx.storage.get(GROUP_KEY);
+      if (meta) await this.ctx.storage.put(GROUP_KEY, { ...meta, wiping: true });
+
+      const keys = [...(await this.ctx.storage.list()).keys()];
+      const ordered = keys.filter((key) => key !== GROUP_KEY && key !== SLOT_KEY);
+      if (keys.includes(GROUP_KEY)) ordered.push(GROUP_KEY);
+      for (const key of ordered) await this.ctx.storage.delete(key);
+      /* No alarm is set anywhere in this Worker today; the guard is what keeps this call true if
+         one is ever added, instead of an unconditional call that would throw on a storage without
+         it. */
+      if (typeof this.ctx.storage.deleteAlarm === 'function') await this.ctx.storage.deleteAlarm();
+    } catch (error) {
+      /* The wipe stopped part-way, so the mark has to come off again. The failing storage is the
+         failure the caller reports; a clear that could not be written leaves the group marked, and
+         a retry of the wipe is what finishes it. */
+      await this.clearWipeMark().catch(() => {});
+      throw error;
+    }
+  }
+
+  /**
+   * Take the wiping mark off a group whose wipe did not finish.
+   *
+   * The meta is read again rather than rewritten from the copy the wipe held: a join mode changed
+   * between the two would otherwise be undone by taking the mark off. A meta that is already gone
+   * needs nothing — the group does not exist to write to.
+   */
+  async clearWipeMark() {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta || meta.wiping !== true) return;
+    const cleared = { ...meta };
+    delete cleared.wiping;
+    await this.ctx.storage.put(GROUP_KEY, cleared);
   }
 
   /** Tell every attached socket the group is gone, close it, forget it; answer how many there were. */
@@ -576,11 +694,26 @@ export class Group {
   }
 
   /**
-   * Ask the Registry to drop the slot, and say whether it actually did.
+   * Tell every attached socket that the wipe failed, and leave all of them open.
    *
-   * `false` covers a refusal, a non-200 and an unreachable Registry alike: from here they are one
-   * answer — the slot is not known to be free — and reporting otherwise would tell the operator a
-   * slot came back that the ledger still holds.
+   * The group still exists — the wipe stopped before the meta — so the sockets still have a group
+   * to talk to. `ended` is not sent: it is the frame that says the data is gone, and sending it
+   * while the rows were still stored is the one lie this path must not tell.
+   */
+  notifyWipeFailed() {
+    for (const socket of this.sockets) this.sendFrame(socket, { t: 'wipe-failed' });
+  }
+
+  /**
+   * Ask the Registry to drop the slot, and say what its answer means.
+   *
+   * `freed` is what the ledger deleted, so `ok: true` alone is not the answer. Three outcomes:
+   * `freed` when a row went, `absent` when the ledger answered `ok: true, freed: 0` — the row is
+   * already gone, which is what a compensated or lost create leaves, and no retry could ever clear
+   * it — and `refused` for everything else: a non-200, an unreachable Registry or a body that is
+   * not the shape this call documents. Only `refused` means the ledger may still hold the row.
+   *
+   * @returns {Promise<'freed'|'absent'|'refused'>}
    */
   async releaseSlot(groupId) {
     try {
@@ -589,11 +722,12 @@ export class Group {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ groupId })
       });
-      if (!response.ok) return false;
+      if (!response.ok) return 'refused';
       const body = await response.json().catch(() => null);
-      return body?.ok === true;
+      if (body?.ok !== true || !Number.isSafeInteger(body.freed)) return 'refused';
+      return body.freed > 0 ? 'freed' : 'absent';
     } catch {
-      return false;
+      return 'refused';
     }
   }
 
@@ -658,6 +792,13 @@ export class Group {
     const meta = await this.ctx.storage.get(GROUP_KEY);
     if (!meta) {
       this.rejectSocket(socket, 'unknown_group');
+      return;
+    }
+    /* A group in the middle of its wipe takes no joins: the member entry a join writes would
+       otherwise be stored after the wipe read its key set. The socket is refused, not closed, so a
+       wipe that then fails leaves it attached to a group that still exists. */
+    if (meta.wiping === true) {
+      this.sendRefusal(socket, 'wiping');
       return;
     }
 
@@ -793,6 +934,21 @@ export class Group {
       return;
     }
 
+    /* The group's own state is read before every accepted write, unlike the blind stamp below: a
+       group that is being wiped takes no records. A frame already in flight when the host ended the
+       group would otherwise be stored after the wipe read its key set, leaving a record and its
+       stamp behind in a group the wipe then reported as gone. The read is not written back, so
+       nothing here can put a stale meta in place of a join mode changed a moment earlier. */
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta) {
+      this.sendFrame(socket, { t: 'refused', code: 'unknown_group', id: frame.id });
+      return;
+    }
+    if (meta.wiping === true) {
+      this.sendFrame(socket, { t: 'refused', code: 'wiping', id: frame.id });
+      return;
+    }
+
     const key = recordKey(frame.id);
     const existing = await this.ctx.storage.get(key);
     if (existing?.deleted) {
@@ -821,6 +977,17 @@ export class Group {
     };
 
     await this.ctx.storage.put(key, record);
+    /* The meta above was read before this write, so a wipe that set its mark in between listed its
+       keys without this record in them, and the record would outlive a wipe that reported success.
+       Read it again: a group that is being wiped now removes the record this write has just stored
+       and refuses it, so nothing is stored behind the wipe whatever order the two arrive in. The
+       stamp is not written in that case, for the same reason. */
+    const current = await this.ctx.storage.get(GROUP_KEY);
+    if (current?.wiping === true) {
+      await this.ctx.storage.delete(key);
+      this.sendFrame(socket, { t: 'refused', code: 'wiping', id: frame.id });
+      return;
+    }
     /* A blind put of the time alone: nothing here read the meta, so nothing here can write one back
        stale. A write rejected above never reaches this line, so the time is the last *accepted*
        write. */

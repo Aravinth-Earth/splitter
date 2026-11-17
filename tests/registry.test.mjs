@@ -33,12 +33,17 @@ function fakeContext() {
     if (text.startsWith('CREATE TABLE IF NOT EXISTS join_failures')) return { toArray: () => [] };
     if (text.startsWith('SELECT 1 FROM slots')) return { toArray: () => (rows.has(params[0]) ? [{}] : []) };
     if (text.startsWith('SELECT COUNT(*) AS held FROM slots')) return { toArray: () => [{ held: rows.size }] };
-    /* The listing's walk: `ORDER BY group_id` with the page bound as a parameter, so the fake
-       answers exactly what the query asks for — a listing that ignored its bound would be handed
-       the whole ledger here and fail the bound test. */
-    if (text.startsWith('SELECT group_id FROM slots ORDER BY group_id LIMIT ?')) {
-      const page = [...rows.keys()].sort().slice(0, params[0]);
-      return { toArray: () => page.map((group_id) => ({ group_id })) };
+    /* The listing's walk: the cursor as `group_id > ?`, the page bound as a second parameter, so
+       the fake answers exactly what the query asks for — a listing that ignored its bound or its
+       cursor would be handed the wrong page here and fail the bound and cursor tests. One row past
+       the page is what the real query fetches to know whether another page exists, so the fake
+       answers that too: `slice(0, bound)` over the whole order, not `slice(from, from + bound)`. */
+    if (text.startsWith('SELECT group_id FROM slots WHERE group_id > ? ORDER BY group_id LIMIT ?')) {
+      const after = [...rows.keys()]
+        .filter((group_id) => group_id > params[0])
+        .sort()
+        .slice(0, params[1]);
+      return { toArray: () => after.map((group_id) => ({ group_id })) };
     }
     if (text.startsWith('INSERT INTO slots')) {
       rows.set(params[0], true);
@@ -145,8 +150,31 @@ test('registry: /reserve and /release are routed whole, so a suffix is not a rou
 
   const released = await post(registry, { groupId: id(1) }, { path: '/release' });
   assert.equal(released.status, 200);
-  assert.deepEqual(await released.json(), { ok: true });
+  assert.deepEqual(await released.json(), { ok: true, freed: 1 }, 'the answer counts the row it deleted');
   assert.equal(rows.has(id(1)), false, '/release must drop the slot');
+});
+
+test('registry: /release reports the rows it deleted, so a release for no slot is not a freeing', async () => {
+  const { ctx, rows } = fakeContext();
+  const registry = new Registry(ctx, { MAX_GROUPS: '3' });
+  registry.reserve(id(1));
+  registry.reserve(id(2));
+
+  const released = await post(registry, { groupId: id(1) }, { path: '/release' });
+  assert.deepEqual(await released.json(), { ok: true, freed: 1 }, 'one held slot is one row freed');
+  assert.equal(rows.has(id(2)), true, 'the other slot is untouched');
+
+  /* The state a wipe that succeeded followed by a failed release leaves behind: a retry arrives
+     for a slot nobody holds. It is not an error — the ledger has nothing to drop — but it must not
+     read as a freed slot, because that count is what the group reports as `released`. */
+  const again = await post(registry, { groupId: id(1) }, { path: '/release' });
+  assert.equal(again.status, 200);
+  assert.deepEqual(await again.json(), { ok: true, freed: 0 });
+
+  const unknown = await post(registry, { groupId: id(9) }, { path: '/release' });
+  assert.equal(unknown.status, 200);
+  assert.deepEqual(await unknown.json(), { ok: true, freed: 0 }, 'an unknown id frees nothing');
+  assert.equal(rows.size, 1, 'no release freed a slot it did not hold');
 });
 
 test('registry: a method other than POST is refused and names the method it allows', async () => {
@@ -290,6 +318,7 @@ test('registry: a list of three groups reports the counters each group answered'
   assert.deepEqual(await response.json(), {
     limit: LIST_PAGE_LIMIT,
     total: 3,
+    next: null,
     groups: [
       { id: id(1), readable: true, createdAt: 1000, lastWriteAt: 2000, records: 2, bytes: 300 },
       { id: id(2), readable: true, createdAt: 1500, lastWriteAt: null, records: 0, bytes: 0 },
@@ -327,9 +356,75 @@ test('registry: the list stops at its bound and answers in a stable order', asyn
   assert.deepEqual(body.groups.map((entry) => entry.id), expected, 'the page is ordered by id');
   assert.equal(body.groups.length, LIST_PAGE_LIMIT, 'a page never reads more than its bound');
   assert.equal(groups.asked.length, LIST_PAGE_LIMIT, 'no group past the bound is even asked');
+  /* A full page is not the end of the ledger: it names the id to continue from, or the eleven slots
+     behind it could never be listed. */
+  assert.equal(body.next, id(LIST_PAGE_LIMIT), 'a full page names its own last id as the cursor');
 
   /* The same ledger answers the same page: the order is the ledger's, not the groups'. */
   assert.deepEqual(await (await post(registry, {}, { path: '/list' })).json(), body);
+});
+
+test('registry: twelve slots are listed across two pages that meet exactly', async () => {
+  const { ctx } = fakeContext();
+  const answers = {};
+  for (let n = 1; n <= 12; n += 1) answers[id(n)] = () => ({ body: counters(n, null, 0, 0) });
+  const groups = fakeGroups(answers);
+  const registry = new Registry(ctx, { MAX_GROUPS: '12', ...groups.env });
+  for (let n = 12; n >= 1; n -= 1) registry.reserve(id(n));
+
+  const first = await (await post(registry, {}, { path: '/list' })).json();
+  assert.deepEqual(
+    first.groups.map((entry) => entry.id),
+    Array.from({ length: LIST_PAGE_LIMIT }, (_, index) => id(index + 1)),
+    'the first page is the first ten slots, in ledger order'
+  );
+  assert.equal(first.total, 12, 'the total is the whole ledger, so the second page is visibly missing');
+  assert.equal(first.next, id(LIST_PAGE_LIMIT), 'the cursor is the id the first page ended on');
+
+  const second = await (await post(registry, { cursor: first.next }, { path: '/list' })).json();
+  assert.deepEqual(
+    second.groups.map((entry) => entry.id),
+    [id(11), id(12)],
+    'the second page starts where the first ended, with nothing repeated and nothing skipped'
+  );
+  assert.equal(second.next, null, 'the last page names no cursor');
+  assert.equal(second.total, 12, 'each page reports the whole ledger, not the rows behind it');
+
+  /* The two pages partition the ledger: twelve slots, twelve distinct ids, twelve group reads. */
+  const listed = [...first.groups, ...second.groups].map((entry) => entry.id);
+  assert.equal(listed.length, 12);
+  assert.equal(new Set(listed).size, 12, 'no slot may be listed twice across the pages');
+  assert.equal(groups.asked.length, 12, 'each live group is read once, across the two pages');
+
+  /* A cursor at the end of the ledger is an empty page, not a second copy of the first. It also must
+     not read a group to prove it: the bound is the SQL's. */
+  const askedBefore = groups.asked.length;
+  const beyond = await (await post(registry, { cursor: id(12) }, { path: '/list' })).json();
+  assert.deepEqual(beyond.groups, []);
+  assert.equal(beyond.next, null, 'there is nothing after the last slot');
+  assert.equal(groups.asked.length, askedBefore, 'an empty page reads no group');
+});
+
+test('registry: a cursor that is not a string is a bad request', async () => {
+  const { ctx } = fakeContext();
+  const groups = fakeGroups({ [id(1)]: () => ({ body: counters(1, null, 0, 0) }) });
+  const registry = new Registry(ctx, { MAX_GROUPS: '2', ...groups.env });
+  registry.reserve(id(1));
+
+  for (const cursor of [42, {}, ['x'], true]) {
+    const response = await post(registry, { cursor }, { path: '/list' });
+    assert.equal(response.status, 400, `a cursor of ${JSON.stringify(cursor)} is not a page boundary`);
+    assert.deepEqual(await response.json(), { error: 'bad_request' });
+  }
+  assert.equal(groups.asked.length, 0, 'a refused page must not read a single group');
+
+  /* An absent cursor is the first page, and an empty body is the same request: a read takes no
+     input, so a POST with nothing in it is not a bad request. */
+  const bare = await registry.fetch(
+    new Request('https://registry/list', { method: 'POST', headers: { 'content-type': 'application/json' } })
+  );
+  assert.equal(bare.status, 200);
+  assert.equal((await bare.json()).next, null);
 });
 
 test('registry: a group that throws is reported unreadable, not as zero', async () => {
