@@ -41,9 +41,11 @@ function sealed(bytes = 96) {
  */
 function makeStorage() {
   const stored = new Map();
+  const writes = [];
   const api = {
     get: async (key) => stored.get(key),
     put: async (key, value) => {
+      writes.push(key);
       stored.set(key, value);
     },
     list: async ({ prefix } = {}) => {
@@ -55,7 +57,7 @@ function makeStorage() {
     },
     delete: async (key) => stored.delete(key)
   };
-  return { api, stored };
+  return { api, stored, writes };
 }
 
 /**
@@ -90,7 +92,7 @@ function newGroup({ env = {}, storage = makeStorage(), id } = {}) {
   /* A Durable Object's own id: the name it was created under, which is not the slot the ledger
      holds. Tests that could be fooled by a fallback to it have to give the instance one. */
   if (id !== undefined) ctx.id = { toString: () => id };
-  return { group: new Group(ctx, env), stored: storage.stored };
+  return { group: new Group(ctx, env), stored: storage.stored, writes: storage.writes };
 }
 
 /** A socket as the Group holds one: it records the frames sent and the close it was given. */
@@ -121,31 +123,51 @@ function post(group, payload, { path = '/init', method = 'POST', raw } = {}) {
 }
 
 test('group: an empty init body is refused and writes nothing', async () => {
-  const { group, stored } = newGroup();
+  const { group, stored, writes } = newGroup();
 
   const response = await post(group, {});
   assert.equal(response.status, 400, 'an init with no host must not answer ok');
   assert.deepEqual(await response.json(), { ok: false, error: 'hostId' });
   assert.equal(stored.size, 0, 'a refused init must not write a group with no host');
+  /* Nothing was put and then removed either: the refusal is before the first write, which is what
+     keeps an empty body from leaving `hostId: undefined` behind a delete. */
+  assert.deepEqual(writes, [], 'an empty init must not put a key at all');
+
+  /* The refused instance is still a group nobody created. A valid init writes it, so the refusal
+     did not leave a half-group that would make the next create read as a retry. */
+  const valid = await post(group, { hostId: id22(), nameBlob: sealed() });
+  assert.equal(valid.status, 200, 'the refusal did not poison the instance');
+  assert.deepEqual(await valid.json(), { ok: true, created: true });
+  assert.deepEqual(writes, [GROUP_KEY], 'a valid init writes the meta, and writes it once');
 });
 
 test('group: an init without a usable host id or sealed name is refused', async () => {
   const cases = [
-    { hostId: 'host', nameBlob: sealed() },
-    { hostId: id22() },
-    { hostId: id22(), nameBlob: { iv: 'AAAAAAAAAAAAAAAA' } },
-    /* 12 characters, not 16: an iv counted in bytes is refused as a sealed value. */
-    { hostId: id22(), nameBlob: { iv: 'A'.repeat(12), ct: 'AAAA' } },
-    { hostId: id22(), nameBlob: sealed(), metaBlob: 'meta' }
+    /* An id that is neither shape an id can hold: not 22 base64url characters, not 64 hex. */
+    { payload: { hostId: 'host', nameBlob: sealed() }, error: 'hostId' },
+    { payload: { hostId: null, nameBlob: sealed() }, error: 'hostId' },
+    { payload: { hostId: 42, nameBlob: sealed() }, error: 'hostId' },
+    /* A usable host but no group name at all. */
+    { payload: { hostId: id22() }, error: 'blob' },
+    /* The iv counted in the wrong unit, and an envelope with no ciphertext. */
+    { payload: { hostId: id22(), nameBlob: { iv: 'A'.repeat(12), ct: 'AAAA' } }, error: 'blob' },
+    { payload: { hostId: id22(), nameBlob: { iv: 'A'.repeat(16) } }, error: 'blob' },
+    /* The two optional blobs are optional, not unchecked: present and unsealed is a refusal. */
+    { payload: { hostId: id22(), nameBlob: sealed(), hostNameBlob: 'name' }, error: 'blob' },
+    { payload: { hostId: id22(), nameBlob: sealed(), metaBlob: 'meta' }, error: 'blob' }
   ];
 
-  for (const payload of cases) {
-    const { group, stored } = newGroup();
+  for (const { payload, error } of cases) {
+    const { group, stored, writes } = newGroup();
     const response = await post(group, payload);
     assert.equal(response.status, 400, `${JSON.stringify(payload)} must be refused by the write itself`);
-    const body = await response.json();
-    assert.equal(body.ok, false, 'a refusal must be told apart from a write');
+    assert.deepEqual(
+      await response.json(),
+      { ok: false, error },
+      `${JSON.stringify(payload)} must name ${error}, not merely fail`
+    );
     assert.equal(stored.size, 0, 'a refused init must store nothing');
+    assert.deepEqual(writes, [], 'and must not put a key before refusing');
   }
 });
 
@@ -166,21 +188,41 @@ test('group: an absent meta is allowed, and a valid init writes the meta once', 
 });
 
 test('group: only /init is routed, so a path that merely ends in it is not an init', async () => {
-  const { group, stored } = newGroup();
+  const { group, stored, writes } = newGroup();
 
   const response = await post(group, { hostId: id22(), nameBlob: sealed() }, { path: '/nope/init' });
   assert.equal(response.status, 404, 'POST /nope/init must not initialise the group');
   assert.deepEqual(await response.json(), { error: 'not_found' });
   assert.equal(stored.size, 0, 'an unrouted path must leave the group unwritten');
+  assert.deepEqual(writes, [], 'and must not put a key on the way to a 404');
+
+  /* The positive half: the route the class does serve is still served, so a 404 above is a
+     routing answer and not a class that never initialises anything. */
+  const routed = await post(group, { hostId: id22(), nameBlob: sealed() }, { path: '/init' });
+  assert.equal(routed.status, 200, '/init itself is still the one init');
+  assert.deepEqual(await routed.json(), { ok: true, created: true });
+  assert.deepEqual(writes, [GROUP_KEY], 'and it wrote exactly what an init writes');
 });
 
-test('group: a method other than POST is refused and names the method it allows', async () => {
-  const { group } = newGroup();
+test('group: every write route answers a wrong method with Allow: POST', async () => {
+  /* Every route this class serves as a write, not just the one the create calls: a 405 without an
+     `Allow` makes a client guess, and RFC 9110 says the header is part of the answer. */
+  for (const path of ['/init', '/counters', '/destroy']) {
+    for (const method of ['GET', 'PUT', 'DELETE']) {
+      const { group, stored, writes } = newGroup();
+      const response = await post(group, null, { path, method });
 
-  const response = await post(group, null, { method: 'GET' });
-  assert.equal(response.status, 405);
-  assert.equal(response.headers.get('allow'), 'POST', 'a 405 must carry Allow: POST');
-  assert.deepEqual(await response.json(), { error: 'method' });
+      assert.equal(response.status, 405, `${method} ${path} must be refused`);
+      assert.equal(
+        response.headers.get('allow'),
+        'POST',
+        `${method} ${path} must carry Allow: POST`
+      );
+      assert.deepEqual(await response.json(), { error: 'method' });
+      assert.equal(stored.size, 0, 'a refused method must not write');
+      assert.deepEqual(writes, [], 'and must not put a key');
+    }
+  }
 });
 
 test('group: a body that is not a JSON object is a bad request', async () => {
