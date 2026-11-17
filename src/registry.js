@@ -5,6 +5,10 @@
  * first and is refused when the ledger is full. Nothing else about a group is known here — an id
  * is a hash of a code, so the ledger cannot be read into a list of anyone's groups.
  *
+ * The one thing it can say about a group is what the group itself answers to `/counters`: a count
+ * of records, their size, and two times. That is a walk of the ledger, bounded per request, and it
+ * carries no name, amount or code — the group is asked, and it answers only numbers.
+ *
  * Reserving is atomic without a transaction: `reserve` reads the row, counts and inserts with
  * synchronous SQL and never awaits between them, and a Durable Object delivers one call at a time,
  * so two concurrent creates cannot both see the last slot free.
@@ -13,6 +17,11 @@
 export const DEFAULT_MAX_GROUPS = 25;
 export const JOIN_LIMIT = 12;
 export const JOIN_WINDOW_MS = 5 * 60 * 1000;
+
+/* How many groups one `/list` reads. Every read is a call into another Durable Object, so a page
+   costs the same whatever the ledger holds, and a full ledger is read over several requests
+   instead of one that cannot answer. */
+export const LIST_PAGE_LIMIT = 10;
 
 function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
@@ -177,7 +186,7 @@ export class Registry {
     if (sql.exec('SELECT 1 FROM slots WHERE group_id = ?', groupId).toArray().length > 0) {
       return { ok: true, reserved: false };
     }
-    const [{ held }] = sql.exec('SELECT COUNT(*) AS held FROM slots').toArray();
+    const held = this.slotsHeld();
     if (held >= this.maxGroups()) return { ok: false, reserved: false };
     sql.exec('INSERT INTO slots (group_id) VALUES (?)', groupId);
     return { ok: true, reserved: true };
@@ -233,9 +242,16 @@ export class Registry {
        drop a slot for a caller that never asked to release one. Every internal call is written in
        this repo, so the set of paths is closed. */
     const { pathname } = new URL(request.url);
-    if (!['/reserve', '/release', '/join-blocked', '/join-failure'].includes(pathname)) {
+    if (
+      !['/reserve', '/release', '/join-blocked', '/join-failure', '/stats', '/list'].includes(pathname)
+    ) {
       return json({ error: 'not_found' }, 404);
     }
+
+    /* Read only: `/stats` and `/list` take no input and write nothing, so they are answered before
+       the body is parsed and a POST with an empty body is not a bad request. */
+    if (pathname === '/stats') return json(this.stats());
+    if (pathname === '/list') return json(await this.list());
 
     const body = await request.json().catch(() => null);
     if (typeof body !== 'object' || body === null) return json({ error: 'bad_request' }, 400);

@@ -12,7 +12,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { DEFAULT_MAX_GROUPS, JOIN_LIMIT, JOIN_WINDOW_MS, Registry } from '../src/registry.js';
+import { Group, GROUP_KEY } from '../src/group.js';
+
+import {
+  DEFAULT_MAX_GROUPS,
+  JOIN_LIMIT,
+  JOIN_WINDOW_MS,
+  LIST_PAGE_LIMIT,
+  Registry
+} from '../src/registry.js';
 
 /** A Registry ctx backed by one Map, plus the three statements reserve and release use. */
 function fakeContext() {
@@ -25,6 +33,13 @@ function fakeContext() {
     if (text.startsWith('CREATE TABLE IF NOT EXISTS join_failures')) return { toArray: () => [] };
     if (text.startsWith('SELECT 1 FROM slots')) return { toArray: () => (rows.has(params[0]) ? [{}] : []) };
     if (text.startsWith('SELECT COUNT(*) AS held FROM slots')) return { toArray: () => [{ held: rows.size }] };
+    /* The listing's walk: `ORDER BY group_id` with the page bound as a parameter, so the fake
+       answers exactly what the query asks for — a listing that ignored its bound would be handed
+       the whole ledger here and fail the bound test. */
+    if (text.startsWith('SELECT group_id FROM slots ORDER BY group_id LIMIT ?')) {
+      const page = [...rows.keys()].sort().slice(0, params[0]);
+      return { toArray: () => page.map((group_id) => ({ group_id })) };
+    }
     if (text.startsWith('INSERT INTO slots')) {
       rows.set(params[0], true);
       return { toArray: () => [] };
