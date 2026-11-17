@@ -63,6 +63,60 @@ test('calc: percentages must total 100, and a zero percent is left out', () => {
   assert.throws(() => percent(100, { a: 50.1, b: 50.1 }), /total 100/);
 });
 
+test('calc: percentages that only round to 100 are refused, not split', () => {
+  /* Every one of these totals 100 at one decimal place, so a guard that rounds the total accepts
+     it and the engine normalises the shares over a total that is not 100. */
+  const onlyRounds = [
+    { a: 33.34, b: 33.34, c: 33.34 }, /* 100.02 */
+    { a: 49.96, b: 50 }, /* 99.96 */
+    { a: 50.01, b: 50.01 }, /* 100.02 */
+    { a: 99.96, b: 0.039 } /* 99.999 */
+  ];
+  for (const percentages of onlyRounds) {
+    assert.throws(
+      () => percent(1_000, percentages),
+      /total 100/,
+      `${JSON.stringify(percentages)} must be refused`
+    );
+  }
+
+  /* The check is exact but not bit-exact: tenths added up carry a few units in the last place. */
+  const withinTolerance = percent(1_000, { a: 50 + 1e-10, b: 50 });
+  assert.deepEqual(Object.keys(withinTolerance).sort(), ['a', 'b']);
+  assert.equal(totalOf(withinTolerance), 1_000);
+  assert.throws(() => percent(1_000, { a: 50 + 1e-6, b: 50 }), /total 100/);
+});
+
+test('calc: an accepted percent split adds up and stays within a paisa of the exact share', () => {
+  const parties = [
+    { a: 100 },
+    { a: 50, b: 50, c: 0 },
+    { a: 33.4, b: 33.3, c: 33.3 },
+    { a: 12.5, b: 12.5, c: 25, d: 50 },
+    { a: 0.1, b: 0.2, c: 0.3, d: 99.4 }
+  ];
+
+  for (const percentages of parties) {
+    for (const totalPaise of [1, 2, 7, 100, 101, 999, 1_000, 12_345, 1_000_000_000]) {
+      const shares = percent(totalPaise, percentages);
+      const at = `${JSON.stringify(percentages)} at ${totalPaise} paise`;
+
+      assert.equal(totalOf(shares), totalPaise, at);
+      for (const [id, percentage] of Object.entries(percentages)) {
+        if (percentage === 0) {
+          assert.equal(Object.hasOwn(shares, id), false, `${id} is left out at ${at}`);
+          continue;
+        }
+        const exact = (totalPaise * percentage) / 100;
+        assert.ok(
+          Math.abs(shares[id] - exact) <= 1,
+          `${id}: ${shares[id]} paise is more than a paisa from ${exact} at ${at}`
+        );
+      }
+    }
+  }
+});
+
 test('calc: a weight that cannot take part is refused, not guessed at', () => {
   assert.throws(() => allocate(100, {}), /at least one weight above zero/);
   assert.throws(() => allocate(100, { a: 0, b: 0 }), /at least one weight above zero/);
@@ -74,6 +128,10 @@ test('calc: a weight that cannot take part is refused, not guessed at', () => {
   assert.throws(() => equal(100, []), /at least one member/);
   assert.throws(() => equal(100, ['a', 'a']), /appears twice/);
   assert.throws(() => equal(100, ['a', '']), /needs an id/);
+  assert.throws(() => percent(100, {}), /at least one weight above zero/);
+  assert.throws(() => percent(100, { a: 0, b: 0 }), /at least one weight above zero/);
+  assert.throws(() => percent(100, { a: -1, b: 101 }), /non-negative/);
+  assert.throws(() => percent(100, []), /percentages must be an object/);
 });
 
 test('calc: two hundred generated splits never lose or invent a paisa', () => {
