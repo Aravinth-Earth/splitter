@@ -130,8 +130,8 @@ export async function groupIdFromCode(input) {
 
 /**
  * The group's AES-256-GCM key. Non-extractable: it exists to seal and open, never as bytes.
- * The salt is a hash of the group id, so it is deterministic per group and carries no secret
- * the server does not already have.
+ * The salt is sha256(`sp1:key:` + the group id), so it is deterministic per group, names the
+ * group the key belongs to and carries no secret the server does not already have.
  */
 export async function deriveGroupKey(input) {
   const code = normalizeCode(input);
