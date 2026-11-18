@@ -154,6 +154,12 @@ export function presenceText(ids, selfId = null, label = () => 'Someone') {
   return `${ids.size} here · ${[...ids].map((id) => label(id)).join(', ')}`;
 }
 
+/** The chip's hidden flag and text: nothing to say is the only reason to hide it. */
+export function presenceChip(text) {
+  const hidden = text === '';
+  return { hidden, text: hidden ? '' : text };
+}
+
 /* The app is the whole of its origin, so a relative path is the API on this origin and nothing
    else. */
 const CREATE_PATH = 'api/create';
@@ -1862,14 +1868,9 @@ export function init(doc = document, win = window) {
    * from `presenceIds`, which is the one reader of a here frame on this page.
    */
   function renderPresence() {
-    const text = presenceText(presentIds, selfId, memberLabel);
-    if (text === '') {
-      presence.hidden = true;
-      presence.textContent = '';
-      return;
-    }
-    presence.hidden = false;
-    presence.textContent = text;
+    const chip = presenceChip(presenceText(presentIds, selfId, memberLabel));
+    presence.hidden = chip.hidden;
+    presence.textContent = chip.text;
   }
 
   function handlePresence(frame) {

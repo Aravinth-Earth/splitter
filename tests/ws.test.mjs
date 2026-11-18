@@ -512,6 +512,44 @@ async function approveMember(worker, group, host, { name = 'Here' } = {}) {
   return { socket, id, secret };
 }
 
+/**
+ * The next `here` frame that satisfies `wanted`, plus every frame passed on the way to it.
+ *
+ * `seen` is unfiltered — the matching frame included — so a test can say what the wire never
+ * carried as well as what it did. `elapsed` is how long the matching frame took: on the unset 30 s
+ * heartbeat, a frame inside 1.5 s is the change and not the timer.
+ */
+async function hereWithin(socket, wanted, timeoutMs = 1_500) {
+  const started = Date.now();
+  const seen = [];
+  for (;;) {
+    const left = timeoutMs - (Date.now() - started);
+    if (left <= 0) throw new Error(`no matching here frame within ${timeoutMs} ms`);
+    const frame = await socket.next(left, true);
+    seen.push(frame);
+    if (frame.t === 'here' && wanted(frame)) return { frame, seen, elapsed: Date.now() - started };
+  }
+}
+
+/** A here frame as the wire promises it: the two keys, and ids that are strings. */
+function assertHereFrame(frame) {
+  assert.deepEqual(
+    Object.keys(frame).sort(),
+    ['ids', 't'],
+    'a here frame has these two keys and nothing else'
+  );
+  assert.equal(Array.isArray(frame.ids), true, 'ids is a list');
+  for (const id of frame.ids) assert.equal(typeof id, 'string', 'every id is a string');
+}
+
+/** Presence has one spelling on the wire: no legacy `presence` frame and no top-level `here` key. */
+function assertPresenceOnly(frames) {
+  for (const frame of frames) {
+    assert.notEqual(frame.t, 'presence', 'the legacy presence frame is not on the wire');
+    assert.equal(Object.hasOwn(frame, 'here'), false, 'presence is not a top-level here key');
+  }
+}
+
 /* ------------------------------------------------------- presence: a heartbeat, ids only */
 
 test('a here frame carries the two keys and nothing else, and every heartbeat sends one', async (t) => {
@@ -738,6 +776,170 @@ test('every change to the present set sends a here frame at once on the default 
   member.socket.close();
   const left = await hereWhere(host, (frame) => !frame.ids.includes(member.id), 1_500);
   assert.deepEqual(left.ids, [group.hostId], 'a close reaches the others at once');
+});
+
+test('member authentication, open admission, removal and leave each send a here frame at once', async (t) => {
+  /* No HEARTBEAT_MS: the default is 30 s, so a frame inside 1.5 s of a change is that change. */
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  assert.equal((await host.next()).t, 'state');
+  assert.deepEqual((await hereWhere(host, () => true)).ids, [group.hostId], 'the host arrives alone');
+
+  const member = await approveMember(worker, group, host);
+  t.after(() => member.socket.close());
+  await hereWhere(host, (frame) => frame.ids.includes(member.id));
+
+  /* 1. A member authenticating on a second socket: the host hears it without a beat to wait for. */
+  member.socket.close();
+  await hereWhere(host, (frame) => !frame.ids.includes(member.id));
+
+  const resumed = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => resumed.close());
+  resumed.send({ t: 'auth', id: member.id, secret: member.secret, mode: 'resume' });
+  const authenticated = await hereWithin(host, (frame) => frame.ids.includes(member.id));
+  assert.ok(authenticated.elapsed <= 1_500, 'authentication is announced at once');
+  assertHereFrame(authenticated.frame);
+  assert.deepEqual([...authenticated.frame.ids].sort(), [group.hostId, member.id].sort());
+  assertPresenceOnly(authenticated.seen);
+  assert.equal((await resumed.next()).t, 'state', 'the member is told who it is');
+
+  /* 2. Open admission: nobody approves, so the only thing that can tell the host is the change. */
+  host.send({ t: 'mode', mode: 'open' });
+  assert.equal((await host.next()).t, 'state', 'the mode change is acknowledged');
+
+  const openedSecret = randomSecret();
+  const openedId = await idFromSecret(openedSecret);
+  const opened = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => opened.close());
+  opened.send({
+    t: 'auth',
+    id: openedId,
+    secret: openedSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Walk-in' })
+  });
+  const admitted = await hereWithin(host, (frame) => frame.ids.includes(openedId));
+  assert.ok(admitted.elapsed <= 1_500, 'open admission is announced at once');
+  assertHereFrame(admitted.frame);
+  assert.deepEqual(
+    [...admitted.frame.ids].sort(),
+    [group.hostId, member.id, openedId].sort(),
+    'the walk-in is here alongside the two who were'
+  );
+  assertPresenceOnly(admitted.seen);
+  assert.equal((await opened.next()).t, 'state', 'open admission admits without a decision');
+
+  /* 3. Removal: the removed id leaves ids on the same act, not on the next beat. */
+  host.send({ t: 'remove', memberId: openedId });
+  assert.deepEqual(await opened.next(), { t: 'removed' });
+  const removed = await hereWithin(host, (frame) => !frame.ids.includes(openedId));
+  assert.ok(removed.elapsed <= 1_500, 'a removal is announced at once');
+  assertHereFrame(removed.frame);
+  assert.deepEqual([...removed.frame.ids].sort(), [group.hostId, member.id].sort());
+  assertPresenceOnly(removed.seen);
+
+  /* 4. Leave: the leaving socket says so itself, and the host hears the same change. */
+  /* Drain the state broadcasts the mode change, the admission and the removal sent this socket,
+     so the next frame it receives is the answer to the leave. */
+  await resumed.window(50);
+  resumed.send({ t: 'leave' });
+  assert.deepEqual(await resumed.next(), { t: 'left' });
+  const left = await hereWithin(host, (frame) => !frame.ids.includes(member.id));
+  assert.ok(left.elapsed <= 1_500, 'a leave is announced at once');
+  assertHereFrame(left.frame);
+  assert.deepEqual(left.frame.ids, [group.hostId]);
+  assertPresenceOnly(left.seen);
+  assert.equal((await resumed.waitClosed()).code, 1000, 'the leaving socket is closed normally');
+});
+
+test('the host ids names no unauthenticated, pending, refused or just-removed id', async (t) => {
+  const worker = await startWorker({ vars: { HEARTBEAT_MS: '300', MAX_MEMBERS: '2' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  assert.equal((await host.next()).t, 'state');
+  assert.deepEqual((await hereWhere(host, () => true)).ids, [group.hostId], 'the host arrives alone');
+
+  /* Attached and not yet anybody: a socket with no identity has no id to be named. */
+  const anonymous = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => anonymous.close());
+
+  /* A pending join holds the group's last seat; its id is a real member id and it is not here. */
+  const secret = randomSecret();
+  const id = await idFromSecret(secret);
+  const pending = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => pending.close());
+  pending.send({
+    t: 'auth',
+    id,
+    secret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Waiting' })
+  });
+  assert.equal((await pending.next()).t, 'waiting');
+  await host.next(); // the host's pending notification
+
+  const waiting = (await host.window(900)).filter((frame) => frame.t === 'here');
+  assert.ok(waiting.length >= 2, 'the heartbeat ran while the pending socket waited');
+  for (const frame of waiting) {
+    assertHereFrame(frame);
+    assert.deepEqual(
+      frame.ids,
+      [group.hostId],
+      'a pending id is not here, and an unauthenticated socket has no id'
+    );
+  }
+  assertPresenceOnly(waiting);
+
+  /* The group is full, so this join is refused and its socket closed: its id is never named. */
+  const refusedSecret = randomSecret();
+  const refusedId = await idFromSecret(refusedSecret);
+  const refused = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => refused.close());
+  refused.send({
+    t: 'auth',
+    id: refusedId,
+    secret: refusedSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Too Many' })
+  });
+  assert.deepEqual(await refused.next(), { t: 'refused', code: 'group_full' });
+  await refused.waitClosed();
+
+  const stillWaiting = (await host.window(600)).filter((frame) => frame.t === 'here');
+  assert.ok(stillWaiting.length >= 1, 'the heartbeat ran while the refused id was kept out');
+  for (const frame of stillWaiting) {
+    assert.equal(frame.ids.includes(refusedId), false, 'a refused id is not here');
+  }
+
+  /* Admitted, so the capture is not vacuous: an approved socket is named on the same act. */
+  host.send({ t: 'approve', memberId: id });
+  assert.equal((await pending.next()).role, 'member');
+  await host.next(); // the roster frame the approval sends the host
+  const admitted = await hereWhere(host, (frame) => frame.ids.includes(id));
+  assert.deepEqual([...admitted.ids].sort(), [group.hostId, id].sort(), 'the approved socket is here');
+
+  /* Removed: `ids` drops the id on the removal itself, and no later beat brings it back. */
+  host.send({ t: 'remove', memberId: id });
+  assert.deepEqual(await pending.next(), { t: 'removed' });
+  const gone = await hereWhere(host, (frame) => !frame.ids.includes(id));
+  assert.deepEqual(gone.ids, [group.hostId], 'a removed id leaves ids at once');
+
+  const after = (await host.window(900)).filter((frame) => frame.t === 'here');
+  assert.ok(after.length >= 2, 'the heartbeat ran after the removal');
+  for (const frame of after) {
+    assertHereFrame(frame);
+    assert.deepEqual(frame.ids, [group.hostId], 'a just-removed id is named by no later beat');
+  }
+  assertPresenceOnly(after);
 });
 
 test('no here frame reaches a pending, refused or removed socket', async (t) => {
