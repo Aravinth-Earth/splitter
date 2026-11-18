@@ -94,6 +94,10 @@ export const WIPE_FAILED_MESSAGE =
    is, rather than treating the refusal as the group's end. */
 export const WIPING_MESSAGE = 'This group is being deleted. Try again in a moment.';
 
+/* One sentence for the group's end, whichever way the page learns it: an `ended` frame, or a
+   stored seat whose room the probe can no longer find. Two spellings would read as two events. */
+export const ENDED_MESSAGE = 'This group has ended. It cannot be reopened.';
+
 /**
  * What a lifecycle frame means for this page.
  *
@@ -563,6 +567,9 @@ export function init(doc = document, win = window) {
   let cacheTimer = null;
   let cachedSavedAt = 0;
   let connectionStatus = 'offline';
+  /* Per connection: false until this exact socket's state frame arrives. A reconnect starts false
+     again, so an open socket that has not spoken is still waiting, not connected. */
+  let stateFrameSpoke = false;
   let queuedEditBases = new Map();
   let queuedEditRetries = new Set();
   let lifecycleAction = null;
@@ -849,26 +856,36 @@ export function init(doc = document, win = window) {
     }
   }
 
+  /**
+   * The connection chip is derived, not assigned by each event: it is up while the group screen is
+   * up and this connection has not sent its state frame, and hidden and empty otherwise.
+   *
+   * An `open` socket is not a speaking one — the server has accepted the socket but not yet said
+   * what the group holds — so opening a reconnect does not clear the chip. Only the state frame
+   * does, and any status but `open` starts the next connection as unspeaking again.
+   */
+  function renderConnectionChip() {
+    if (!connection) return;
+    const shown = !groupHeader.hidden && !stateFrameSpoke;
+    connection.hidden = !shown;
+    connection.textContent = shown ? 'Reconnecting…' : '';
+  }
+
+  /** This connection has now said what the group holds; the chip has nothing left to wait for. */
+  function markStateFrame() {
+    stateFrameSpoke = true;
+    renderConnectionChip();
+  }
+
   function setConnection(status) {
     connectionStatus = status;
+    if (status !== 'open') stateFrameSpoke = false;
     if (status !== 'open' && presentIds.size > 0) {
       presentIds = new Set();
       renderPresence();
     }
     if (cachedBase) renderOfflineBanner(status);
-    if (!connection) return;
-    if (status === 'open' || status === 'closed') {
-      connection.hidden = true;
-      connection.textContent = '';
-    } else {
-      connection.hidden = false;
-      connection.textContent =
-        status === 'offline'
-          ? 'Offline — changes will sync when the connection returns.'
-          : status === 'reconnecting'
-            ? 'Reconnecting…'
-            : 'Connecting…';
-    }
+    renderConnectionChip();
 
     if (status !== 'open') toggleModeButton.disabled = true;
     if (!waitingPanel.hidden) {
@@ -955,6 +972,7 @@ export function init(doc = document, win = window) {
     waitingPanel.hidden = true;
     groupHeader.hidden = false;
     emptyLedger.hidden = false;
+    renderConnectionChip();
 
     /* The hint is a one-time note: a copy dismisses it, and so does anything else done in the
        header. The listener is added now so the click that created the group does not count. */
@@ -1064,6 +1082,7 @@ export function init(doc = document, win = window) {
 
     if (code && !resume) joinNameInput.focus();
     else joinCodeInput.focus();
+    renderConnectionChip();
   }
 
   function showCreate() {
@@ -1071,6 +1090,7 @@ export function init(doc = document, win = window) {
     closeHostSocket();
     closeExpenseSheet();
     closeSettlementSheet();
+    closeLifecycle();
     hideNotice();
     group = null;
     resumeSession = null;
@@ -1087,6 +1107,7 @@ export function init(doc = document, win = window) {
     emptyLedger.hidden = true;
     createPanel.hidden = false;
     hideJoinError();
+    renderConnectionChip();
     nameInput.focus();
   }
 
@@ -1110,6 +1131,7 @@ export function init(doc = document, win = window) {
     waitingCopy.textContent =
       'The organizer has to let you in. Nothing from the group is shown until they do.';
     waitingBack.hidden = false;
+    renderConnectionChip();
     waitingTitle.focus();
   }
 
@@ -1324,7 +1346,7 @@ export function init(doc = document, win = window) {
         dropGroupCache(groupIdValue);
         forget(groupIdValue);
         showCreate();
-        showNotice('This group has ended.');
+        showNotice(ENDED_MESSAGE);
         return;
       }
       if (reachable === 'offline') {
@@ -1378,6 +1400,7 @@ export function init(doc = document, win = window) {
         }
 
         if (frame.t === 'state') {
+          markStateFrame();
           const key = await groupKey;
           let name = 'Your group';
           try {
@@ -1512,6 +1535,7 @@ export function init(doc = document, win = window) {
         }
 
         if (frame.t === 'state' && frame.role === 'member') {
+          markStateFrame();
           if (group) {
             applyMode(frame.joinMode, 'member');
             await applyGroupState(frame, groupKeyPromise);
@@ -1647,6 +1671,7 @@ export function init(doc = document, win = window) {
       },
       onFrame: (frame) => {
         if (frame.t === 'state') {
+          markStateFrame();
           void renderRoster(frame, key);
           void applyGroupState(frame, key);
           return;
@@ -3604,7 +3629,9 @@ export function init(doc = document, win = window) {
 
   /** The organizer ended the group: forget it before navigating, so no cache can resume it. */
   function handleEnded() {
-    const current = groupId;
+    /* Before any state frame the page may not know the group id; the stored last group is the
+       seat's only name, and leaving it stored would offer a group that no longer exists. */
+    const current = groupId ?? lastGroup(local);
     if (current && endedHandledFor === current) return;
     endedHandledFor = current;
     dropGroupCache(current);
@@ -3612,7 +3639,7 @@ export function init(doc = document, win = window) {
     closeHostSocket();
     closeJoinSocket();
     showCreate();
-    showNotice('This group has ended. It cannot be reopened.');
+    showNotice(ENDED_MESSAGE);
   }
 
   /**
