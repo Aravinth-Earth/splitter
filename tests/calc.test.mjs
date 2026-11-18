@@ -70,7 +70,10 @@ test('calc: percentages that only round to 100 are refused, not split', () => {
     { a: 33.34, b: 33.34, c: 33.34 }, /* 100.02 */
     { a: 49.96, b: 50 }, /* 99.96 */
     { a: 50.01, b: 50.01 }, /* 100.02 */
-    { a: 99.96, b: 0.039 } /* 99.999 */
+    { a: 99.96, b: 0.039 }, /* 99.999 */
+    { a: 100.01 }, /* one member, one paisa over */
+    { a: 100.04 }, /* still 100.0 at one decimal */
+    { a: 49.9, b: 50 } /* 99.9, the sheet's own half step */
   ];
   for (const percentages of onlyRounds) {
     assert.throws(
@@ -112,6 +115,10 @@ test('calc: an accepted percent split adds up and stays within a paisa of the ex
           Math.abs(shares[id] - exact) <= 1,
           `${id}: ${shares[id]} paise is more than a paisa from ${exact} at ${at}`
         );
+        assert.ok(
+          shares[id] <= totalPaise,
+          `${id}: ${shares[id]} paise is more than the whole ${totalPaise} at ${at}`
+        );
       }
     }
   }
@@ -122,6 +129,8 @@ test('calc: a weight that cannot take part is refused, not guessed at', () => {
   assert.throws(() => allocate(100, { a: 0, b: 0 }), /at least one weight above zero/);
   assert.throws(() => allocate(100, { a: -1, b: 1 }), /non-negative/);
   assert.throws(() => allocate(100, { a: Number.NaN }), /non-negative/);
+  assert.throws(() => allocate(100, { a: Number.POSITIVE_INFINITY }), /non-negative/);
+  assert.throws(() => allocate(100, { a: Number.NEGATIVE_INFINITY }), /non-negative/);
   assert.throws(() => allocate(100, []), /weights must be an object/);
   assert.throws(() => allocate(-1, { a: 1 }), /non-negative integer/);
   assert.throws(() => allocate(1.5, { a: 1 }), /non-negative integer/);
@@ -131,6 +140,8 @@ test('calc: a weight that cannot take part is refused, not guessed at', () => {
   assert.throws(() => percent(100, {}), /at least one weight above zero/);
   assert.throws(() => percent(100, { a: 0, b: 0 }), /at least one weight above zero/);
   assert.throws(() => percent(100, { a: -1, b: 101 }), /non-negative/);
+  assert.throws(() => percent(100, { a: Number.POSITIVE_INFINITY }), /non-negative/);
+  assert.throws(() => percent(100, { a: Number.NEGATIVE_INFINITY }), /non-negative/);
   assert.throws(() => percent(100, []), /percentages must be an object/);
 });
 
