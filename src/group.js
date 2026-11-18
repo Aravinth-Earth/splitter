@@ -42,6 +42,10 @@ const LAST_WRITE_KEY = 'last-write';
 const SLOT_KEY = 'slot';
 const DEFAULT_MAX_MEMBERS = 20;
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
+/* A socket is only here while it is speaking: the heartbeat re-announces the present set, and a
+   socket that has been quiet for longer than this is no longer in it. */
+const DEFAULT_SILENCE_MS = 90_000;
+const DEFAULT_HEARTBEAT_MS = 30_000;
 const MAX_RECORD_BYTES = 64 * 1024;
 
 const encoder = new TextEncoder();
@@ -79,6 +83,13 @@ export class Group {
        ever waiting on the connection. */
     this.sockets = new Set();
     this.identities = new Map();
+    /* When each socket last sent a frame. Freshness is per socket, not per member: two tabs of one
+       person each have to keep themselves alive, and the person is here while either of them is. */
+    this.lastSeen = new Map();
+    /* The one presence timer. It is a self-scheduling timeout rather than an interval so it can
+       wake at the next beat or at the first socket's silence deadline, whichever is sooner. */
+    this.heartbeatTimer = null;
+    this.beatAt = null;
     /* The source address for the throttle, captured from Cloudflare at the upgrade and never from
        a field a client sends. One row per socket, because one DO can hold several sources. */
     this.clientIps = new Map();
@@ -145,6 +156,18 @@ export class Group {
   authTimeoutMs() {
     const configured = Number(this.env?.AUTH_TIMEOUT_MS);
     return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_AUTH_TIMEOUT_MS;
+  }
+
+  /** How long a socket may stay quiet before it is no longer counted as here. */
+  presenceSilenceMs() {
+    const configured = Number(this.env?.SILENCE_MS);
+    return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_SILENCE_MS;
+  }
+
+  /** How often presence is re-sent when nothing about the present set changed. */
+  heartbeatMs() {
+    const configured = Number(this.env?.HEARTBEAT_MS);
+    return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_HEARTBEAT_MS;
   }
 
   async fetch(request) {
@@ -256,17 +279,11 @@ export class Group {
     server.addEventListener('message', (event) => {
       this.handleMessage(server, event.data).catch(() => this.rejectSocket(server, 'server'));
     });
-    server.addEventListener('close', () => {
-      this.identities.delete(server);
-      this.clientIps.delete(server);
-      this.sockets.delete(server);
-      this.broadcastPresence();
+    server.addEventListener('close', async () => {
+      await this.socketGone(server);
     });
-    server.addEventListener('error', () => {
-      this.identities.delete(server);
-      this.clientIps.delete(server);
-      this.sockets.delete(server);
-      this.broadcastPresence();
+    server.addEventListener('error', async () => {
+      await this.socketGone(server);
     });
 
     /* A socket that never introduces itself is closed, not left open as an anonymous reader. The
@@ -295,6 +312,13 @@ export class Group {
       this.rejectSocket(socket, 'auth');
       return;
     }
+
+    /* Any frame from an authenticated socket is the socket speaking, so it is here: freshness is
+       refreshed before the frame is handled, and a second tab speaking on its own keeps the member
+       in presence just as their first tab would. Unknown frame types count too — they are still a
+       live connection — and a ping is therefore enough to stay here. */
+    this.lastSeen.set(socket, Date.now());
+    this.scheduleHeartbeat();
 
     try {
       if (this.identities.has(socket)) {
@@ -377,7 +401,7 @@ export class Group {
       await this.ctx.storage.put(key, { ...entry, status: 'removed' });
       const handled = await this.notifyMember(meta, frame.memberId, 'removed');
       await this.notifyState(meta, handled);
-      this.broadcastPresence();
+      await this.broadcastPresence();
       return;
     }
 
@@ -399,7 +423,7 @@ export class Group {
       frame.t === 'approve' ? 'approved' : 'declined'
     );
     await this.notifyState(meta, handled);
-    this.broadcastPresence();
+    await this.broadcastPresence();
   }
 
   /**
@@ -491,9 +515,13 @@ export class Group {
     }
 
     await this.ctx.storage.put(key, { ...entry, status: 'left' });
+    /* Left is not attached: the row is no longer approved, and the socket that said so goes with
+       it. Their other tab is still attached, and presence has to stop naming them anyway. */
+    this.forget(socket);
     this.sendFrame(socket, { t: 'left' });
     await this.notifyState(meta, new Set([socket]));
-    this.broadcastPresence();
+    await this.broadcastPresence();
+    this.scheduleHeartbeat();
     try {
       socket.close(1000, 'left');
     } catch {
@@ -675,8 +703,14 @@ export class Group {
     await this.ctx.storage.put(GROUP_KEY, cleared);
   }
 
-  /** Tell every attached socket the group is gone, close it, forget it; answer how many there were. */
+  /**
+   * Tell every attached socket the group is gone, close it, forget it; answer how many there were.
+   *
+   * The presence timer goes first: a group that has ended has no present set to announce, and a
+   * wake that fired after the wipe would tell sockets about a group that no longer exists.
+   */
   closeAll() {
+    this.stopHeartbeat();
     let closed = 0;
     for (const socket of this.sockets) {
       this.sendFrame(socket, { t: 'ended' });
@@ -689,6 +723,7 @@ export class Group {
     }
     this.sockets.clear();
     this.identities.clear();
+    this.lastSeen.clear();
     this.clientIps.clear();
     return closed;
   }
@@ -731,19 +766,44 @@ export class Group {
     }
   }
 
-  /** One frame per change: the member ids with an approved socket right now. Ids only. */
-  presenceFrame() {
-    const here = new Set();
+  /**
+   * The presence frame: who is here, as ids and nothing else.
+   *
+   * The set is the approved roster intersected with the sockets that are still speaking. The
+   * roster read is what makes a member who left (or was removed) absent even while their other
+   * tab is still attached — their row is no longer approved — and the per-socket freshness is
+   * what makes a member absent once their last tab stops speaking, without a close. Two sockets
+   * for one member are one id: the ids are a Set.
+   *
+   * @returns {Promise<{t: 'here', ids: string[]}>}
+   */
+  async presenceFrame() {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    const approved = new Set();
+    if (meta) {
+      approved.add(meta.hostId);
+      for (const [key, entry] of await this.members()) {
+        if (entry?.status === 'approved') approved.add(key.slice(MEMBER_PREFIX.length));
+      }
+    }
+
+    const now = Date.now();
+    const silence = this.presenceSilenceMs();
+    const ids = new Set();
     for (const socket of this.sockets) {
       const identity = this.identities.get(socket);
-      if (!identity) continue;
-      if (identity.role === 'host' || identity.role === 'member') here.add(identity.memberId);
+      if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
+      if (!approved.has(identity.memberId)) continue;
+      const seen = this.lastSeen.get(socket);
+      if (!Number.isFinite(seen) || seen <= now - silence) continue;
+      ids.add(identity.memberId);
     }
-    return { t: 'presence', here: [...here] };
+    return { t: 'here', ids: [...ids] };
   }
 
-  broadcastPresence() {
-    const frame = JSON.stringify(this.presenceFrame());
+  /** One frame per change and per beat: the same shape, to every socket that may see it. */
+  async broadcastPresence() {
+    const frame = JSON.stringify(await this.presenceFrame());
     for (const socket of this.sockets) {
       const identity = this.identities.get(socket);
       if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
@@ -753,6 +813,81 @@ export class Group {
         /* a socket that is already gone is not a reason to stop telling the others */
       }
     }
+  }
+
+  /**
+   * Schedule the next presence wake.
+   *
+   * The timer is what tells the others that a socket has gone quiet, because nothing else happens
+   * when silence begins. It wakes at the next beat, or at the first present socket's silence
+   * deadline when that is sooner, so a departure is announced as it happens rather than at the end
+   * of a beat interval. The beat clock is kept apart from the deadline (`beatAt`): a frame arriving
+   * sooner only shortens this wait, it never postpones the beat, so steady traffic cannot starve
+   * the heartbeat. One timer per instance — rescheduling replaces it, never adds a second.
+   */
+  scheduleHeartbeat() {
+    if (this.heartbeatTimer !== null) clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+
+    if (this.sockets.size === 0) {
+      this.beatAt = null;
+      return;
+    }
+
+    const now = Date.now();
+    if (!Number.isFinite(this.beatAt) || this.beatAt <= now) this.beatAt = now + this.heartbeatMs();
+
+    const silence = this.presenceSilenceMs();
+    let wakeAt = this.beatAt;
+    for (const socket of this.sockets) {
+      const identity = this.identities.get(socket);
+      if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
+      const seen = this.lastSeen.get(socket);
+      if (!Number.isFinite(seen)) continue;
+      /* A millisecond past the deadline: waking at the instant itself could still see the socket
+         inside its window, and the next wake after that would be a whole beat away. */
+      const deadline = seen + silence + 1;
+      if (deadline > now && deadline < wakeAt) wakeAt = deadline;
+    }
+
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = null;
+      if (this.sockets.size === 0) {
+        this.beatAt = null;
+        return;
+      }
+      /* A wake at a silence deadline is not a beat, so the beat clock survives it. */
+      if (Date.now() >= this.beatAt) this.beatAt = null;
+      this.broadcastPresence()
+        .catch(() => {})
+        .finally(() => this.scheduleHeartbeat());
+    }, Math.max(1, wakeAt - now));
+  }
+
+  /** Stop the presence timer: a group with no sockets has nothing to announce. */
+  stopHeartbeat() {
+    if (this.heartbeatTimer !== null) clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+    this.beatAt = null;
+  }
+
+  /**
+   * Drop a socket's identity and freshness: on close, error, leave, removal and decline.
+   *
+   * Its source address goes with it, so a reconnect is counted as the new socket it is.
+   */
+  forget(socket) {
+    this.identities.delete(socket);
+    this.lastSeen.delete(socket);
+    this.clientIps.delete(socket);
+    this.sockets.delete(socket);
+  }
+
+  /** A socket left for any reason: forget it, tell whoever is left, and re-arm the timer. */
+  async socketGone(socket) {
+    this.forget(socket);
+    await this.broadcastPresence().catch(() => {});
+    this.scheduleHeartbeat();
   }
 
   /** A decision reaches the person waiting, if they still have a socket. */
@@ -777,6 +912,9 @@ export class Group {
       } catch {
         /* already gone */
       }
+      /* The decision is final for this socket: removed or declined, its identity goes, so no beat
+         can name it again while the close is still in flight. */
+      this.forget(socket);
     }
     return handled;
   }
@@ -805,7 +943,8 @@ export class Group {
     if (frame.id === meta.hostId) {
       this.identities.set(socket, { memberId: frame.id, role: 'host' });
       socket.send(JSON.stringify(await this.rosterFrame(meta, frame.id, 'host')));
-      this.broadcastPresence();
+      await this.broadcastPresence();
+      this.scheduleHeartbeat();
       return;
     }
 
@@ -814,12 +953,14 @@ export class Group {
       if (entry.status === 'approved') {
         this.identities.set(socket, { memberId: frame.id, role: 'member' });
         socket.send(JSON.stringify(await this.rosterFrame(meta, frame.id, 'member')));
-        this.broadcastPresence();
+        await this.broadcastPresence();
+        this.scheduleHeartbeat();
         return;
       }
       if (entry.status === 'pending') {
         this.identities.set(socket, { memberId: frame.id, role: 'pending' });
         socket.send(JSON.stringify({ t: 'waiting', memberId: frame.id }));
+        this.scheduleHeartbeat();
         return;
       }
       this.rejectSocket(socket, 'removed');
@@ -879,7 +1020,8 @@ export class Group {
         })
       );
       await this.notifyState(meta, new Set([socket]));
-      this.broadcastPresence();
+      await this.broadcastPresence();
+      this.scheduleHeartbeat();
       return;
     }
 
@@ -892,6 +1034,7 @@ export class Group {
     this.identities.set(socket, { memberId: frame.id, role: 'pending' });
     socket.send(JSON.stringify({ t: 'waiting', memberId: frame.id }));
     await this.notifyHosts(meta);
+    this.scheduleHeartbeat();
   }
 
   /**

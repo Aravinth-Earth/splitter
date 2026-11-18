@@ -125,6 +125,35 @@ export function isWipingRefusal(frame) {
   return frame !== null && typeof frame === 'object' && frame.t === 'refused' && frame.code === 'wiping';
 }
 
+/**
+ * The ids in a presence frame, or `null` when the frame is not one.
+ *
+ * Presence is `{t:'here', ids:[...]}` — ids only, on a heartbeat. Reading it here, once, is what
+ * keeps the host, member and resume sockets from drifting apart: a frame of any other type moves no
+ * chip, and an id that is not a string is not an id. An empty list is a real answer — nobody is
+ * here — so it is a Set, not `null`.
+ *
+ * @returns {Set<string>|null}
+ */
+export function presenceIds(frame) {
+  if (frame === null || typeof frame !== 'object') return null;
+  if (frame.t !== 'here' || !Array.isArray(frame.ids)) return null;
+  return new Set(frame.ids.filter((id) => typeof id === 'string'));
+}
+
+/**
+ * The presence chip's text for a set of ids, or `''` when the chip should be hidden.
+ *
+ * The copy is the one the page already showed: "Just you here" when the only person present is the
+ * viewer, otherwise a count and the label each id resolves to. `label` is the page's own
+ * `memberLabel`, so a removed or departed member keeps whatever marker that gives them.
+ */
+export function presenceText(ids, selfId = null, label = () => 'Someone') {
+  if (!(ids instanceof Set) || ids.size === 0) return '';
+  if (ids.size === 1 && selfId && ids.has(selfId)) return 'Just you here';
+  return `${ids.size} here · ${[...ids].map((id) => label(id)).join(', ')}`;
+}
+
 /* The app is the whole of its origin, so a relative path is the API on this origin and nothing
    else. */
 const CREATE_PATH = 'api/create';
@@ -1395,7 +1424,7 @@ export function init(doc = document, win = window) {
           return;
         }
 
-        if (frame.t === 'presence') {
+        if (frame.t === 'here') {
           handlePresence(frame);
           return;
         }
@@ -1507,7 +1536,7 @@ export function init(doc = document, win = window) {
           return;
         }
 
-        if (frame.t === 'presence') {
+        if (frame.t === 'here') {
           handlePresence(frame);
           return;
         }
@@ -1616,7 +1645,7 @@ export function init(doc = document, win = window) {
           void applyGroupState(frame, key);
           return;
         }
-        if (frame.t === 'presence') {
+        if (frame.t === 'here') {
           handlePresence(frame);
           return;
         }
@@ -1826,26 +1855,26 @@ export function init(doc = document, win = window) {
     return splitModes.find((radio) => radio.checked)?.value ?? 'equal';
   }
 
-  /** A name as the whole page should show it; a removed member keeps their name and gets a marker. */
+  /**
+   * The presence chip, from the ids the last here frame carried.
+   *
+   * The text comes from `presenceText`, which is the copy this chip always showed; the ids come
+   * from `presenceIds`, which is the one reader of a here frame on this page.
+   */
   function renderPresence() {
-    if (presentIds.size === 0) {
+    const text = presenceText(presentIds, selfId, memberLabel);
+    if (text === '') {
       presence.hidden = true;
       presence.textContent = '';
       return;
     }
-    if (presentIds.size === 1 && selfId && presentIds.has(selfId)) {
-      presence.hidden = false;
-      presence.textContent = 'Just you here';
-      return;
-    }
     presence.hidden = false;
-    presence.textContent = `${presentIds.size} here · ${[...presentIds]
-      .map((id) => memberLabel(id))
-      .join(', ')}`;
+    presence.textContent = text;
   }
 
   function handlePresence(frame) {
-    const ids = new Set((frame.here ?? []).filter((id) => typeof id === 'string'));
+    const ids = presenceIds(frame);
+    if (ids === null) return;
     if (groupHeader.hidden) {
       pendingPresence = ids;
       return;
