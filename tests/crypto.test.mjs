@@ -303,27 +303,50 @@ test('the wire accepts a 16-character iv and refuses a 12-character one', async 
   assert.equal(Buffer.from('A'.repeat(IV_BASE64_CHARS), 'base64url').length, IV_BYTES);
 });
 
-test('the server has one iv constant, and it is in the file both readers import', () => {
+test('the iv has one constant on each side, and none of them is named IV_LENGTH', () => {
   /* A second definition is how the two units drifted apart before: `IV_LENGTH = 16` in the Worker
-     read as bytes and disagreed with the browser's `IV_BYTES = 12`. The scan is over the server's
-     modules, so a stray definition anywhere in `src` — used or not — is the finding. */
-  const src = new URL('../src/', import.meta.url);
-  const files = readdirSync(src).filter((name) => name.endsWith('.js'));
-  assert.ok(files.includes('wire.js'), 'the scan found the module the constant lives in');
-  assert.ok(files.length >= 5, `the scan reads the server modules, found ${files.join(', ')}`);
+     read as bytes and disagreed with the browser's `IV_BYTES = 12`. The scan runs over the server's
+     modules and the browser's alike — a stray definition on either side, used or not, is the
+     finding — so the two constants that remain are the two units of the same number. */
+  const trees = [
+    { name: 'src', dir: new URL('../src/', import.meta.url), expected: 'src/wire.js: IV_BASE64_CHARS =' },
+    { name: 'public', dir: new URL('../public/', import.meta.url), expected: 'public/crypto.js: IV_BYTES =' }
+  ];
 
   const definitions = [];
-  for (const name of files) {
-    const text = readFileSync(new URL(name, src), 'utf8');
-    for (const match of text.matchAll(/\bIV_[A-Z0-9_]+\s*=/g)) {
-      definitions.push(`${name}: ${match[0].trim()}`);
+  const mentions = [];
+  for (const tree of trees) {
+    const files = readdirSync(tree.dir).filter((name) => name.endsWith('.js'));
+    assert.ok(files.length >= 5, `the scan reads the ${tree.name} modules, found ${files.join(', ')}`);
+
+    for (const name of files) {
+      const text = readFileSync(new URL(name, tree.dir), 'utf8');
+      for (const match of text.matchAll(/\bIV_[A-Z0-9_]+\s*=/g)) {
+        definitions.push(`${tree.name}/${name}: ${match[0].trim()}`);
+      }
+      for (const match of text.matchAll(/\bIV_LENGTH\b/g)) {
+        mentions.push(`${tree.name}/${name}: ${match[0]}`);
+      }
     }
   }
 
   assert.deepEqual(
-    definitions,
-    ['wire.js: IV_BASE64_CHARS ='],
-    'one iv constant, in the file both the edge and the Durable Object import'
+    mentions,
+    [],
+    'IV_LENGTH is the name that read as bytes and counted characters; it may not come back'
+  );
+  assert.deepEqual(
+    definitions.sort(),
+    trees.map((tree) => tree.expected).sort(),
+    'one iv constant per side, each in the module the other side already imports'
+  );
+  assert.ok(
+    definitions.includes('public/crypto.js: IV_BYTES ='),
+    'the scan found the browser constant the server constant is measured against'
+  );
+  assert.ok(
+    definitions.includes('src/wire.js: IV_BASE64_CHARS ='),
+    'and the server constant both the edge and the Durable Object import'
   );
 });
 

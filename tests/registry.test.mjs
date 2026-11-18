@@ -132,6 +132,11 @@ function post(registry, payload, { path, method = 'POST' } = {}) {
   );
 }
 
+/** A read of the ledger: GET with no body, which is the only route that takes one. */
+function get(registry, path) {
+  return registry.fetch(new Request(`https://registry${path}`));
+}
+
 test('registry: /reserve and /release are routed whole, so a suffix is not a route', async () => {
   const { ctx, rows } = fakeContext();
   const registry = new Registry(ctx, { MAX_GROUPS: '2' });
@@ -196,9 +201,10 @@ test('registry: a method other than POST is refused and names the method it allo
 });
 
 test('registry: every route answers a wrong method with Allow: POST', async () => {
-  /* The whole set, not the two routes a create calls: the ledger takes no GET, PUT or DELETE on any
-     of them, and a 405 has to name the method it does take. */
-  const PATHS = ['/reserve', '/release', '/join-blocked', '/join-failure', '/stats', '/list'];
+  /* The whole set of writes, not the two a create calls: the ledger takes no GET, PUT or DELETE on
+     any of them, and a 405 has to name the method it does take. `/stats` is the one read, and its
+     own test covers the write methods it refuses. */
+  const PATHS = ['/reserve', '/release', '/join-blocked', '/join-failure', '/list'];
 
   for (const path of PATHS) {
     for (const method of ['GET', 'PUT', 'DELETE']) {
@@ -207,11 +213,7 @@ test('registry: every route answers a wrong method with Allow: POST', async () =
       const response = await post(registry, null, { path, method });
 
       assert.equal(response.status, 405, `${method} ${path} must be refused`);
-      assert.equal(
-        response.headers.get('allow'),
-        'POST',
-        `${method} ${path} must carry Allow: POST`
-      );
+      assert.equal(response.headers.get('allow'), 'POST', `${method} ${path} must carry Allow: POST`);
       assert.deepEqual(await response.json(), { error: 'method' });
       assert.equal(rows.size, 0, 'a refused method must not take a slot');
       assert.equal(joinRows.length, 0, 'nor count a join failure');
@@ -238,7 +240,7 @@ test('registry: stats names the cap in force and the slots free', async () => {
   registry.reserve(id(1));
   registry.reserve(id(2));
 
-  const response = await post(registry, {}, { path: '/stats' });
+  const response = await get(registry, '/stats');
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { cap: 3, reserved: 2, free: 1 });
   assert.equal(rows.size, 2, 'stats must neither take nor free a slot');
@@ -246,7 +248,7 @@ test('registry: stats names the cap in force and the slots free', async () => {
   /* The third reserve fills the ledger, and the next read says zero free — the number the create
      path compares and the number this route reports are one number. */
   registry.reserve(id(3));
-  assert.deepEqual(await (await post(registry, {}, { path: '/stats' })).json(), {
+  assert.deepEqual(await (await get(registry, '/stats')).json(), {
     cap: 3,
     reserved: 3,
     free: 0
@@ -255,7 +257,7 @@ test('registry: stats names the cap in force and the slots free', async () => {
 
   /* A deploy that lowers the cap under what is already reserved must not report negative room. */
   const narrower = new Registry(ctx, { MAX_GROUPS: '2' });
-  assert.deepEqual(await (await post(narrower, {}, { path: '/stats' })).json(), {
+  assert.deepEqual(await (await get(narrower, '/stats')).json(), {
     cap: 2,
     reserved: 3,
     free: 0
@@ -268,7 +270,7 @@ test('registry: a malformed MAX_GROUPS falls back to 25 and says so', async () =
     const { ctx } = fakeContext();
     const registry = new Registry(ctx, { MAX_GROUPS: value });
 
-    const response = await post(registry, {}, { path: '/stats' });
+    const response = await get(registry, '/stats');
     assert.equal(response.status, 200);
     assert.deepEqual(
       await response.json(),
@@ -280,15 +282,21 @@ test('registry: a malformed MAX_GROUPS falls back to 25 and says so', async () =
   assert.equal(DEFAULT_MAX_GROUPS, 25, 'the cap in force is the documented default, never zero');
 });
 
-test('registry: stats by GET is refused with allow: POST', async () => {
+test('registry: stats is a GET, and a write method is refused with allow: GET', async () => {
   const { ctx, rows } = fakeContext();
   const registry = new Registry(ctx, { MAX_GROUPS: '2' });
   registry.reserve(id(1));
 
-  for (const method of ['GET', 'PUT', 'DELETE']) {
+  /* `/stats` takes no body at all, so a read is the only method that can reach it. A ledger that
+     answered a POST here would be a route a cross-site form could reach with no negotiation. */
+  const read = await get(registry, '/stats');
+  assert.equal(read.status, 200, 'GET /stats is the read');
+  assert.deepEqual(await read.json(), { cap: 2, reserved: 1, free: 1 });
+
+  for (const method of ['POST', 'PUT', 'DELETE']) {
     const response = await post(registry, null, { path: '/stats', method });
     assert.equal(response.status, 405, `${method} /stats must be refused`);
-    assert.equal(response.headers.get('allow'), 'POST', 'a 405 must carry Allow: POST');
+    assert.equal(response.headers.get('allow'), 'GET', 'a 405 must carry Allow: GET');
     assert.deepEqual(await response.json(), { error: 'method' });
   }
 
