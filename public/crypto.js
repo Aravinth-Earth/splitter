@@ -28,6 +28,12 @@ export const KEY_BITS = 256;
 export const IV_BYTES = 12;
 export const ID_BYTES = 16;
 export const ID_LENGTH = 22; /* 16 bytes, base64url, unpadded */
+/**
+ * The block a sealed value is measured in. Every record is padded to a whole number of these before
+ * it is encrypted, so the length of a frame says which bucket a record fell in and nothing about
+ * how big the record itself is.
+ */
+export const BUCKET_BYTES = 256;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -181,6 +187,21 @@ function gcmParams(iv, associated) {
   return params;
 }
 
+/**
+ * Copy `bytes` up to the smallest 256-byte bucket at or above its length, and fill the rest with
+ * spaces.
+ *
+ * JSON treats trailing whitespace as insignificant, so a padded frame parses to the value that went
+ * in and `open` needs no unpadding step of its own. A space (0x20) rather than a zero byte keeps the
+ * buffer valid UTF-8 as it stands; the input is never written through.
+ */
+export function padToBucket(bytes) {
+  const padded = new Uint8Array(Math.ceil(bytes.length / BUCKET_BYTES) * BUCKET_BYTES);
+  padded.set(bytes);
+  padded.fill(0x20, bytes.length);
+  return padded;
+}
+
 /** Seal a JSON value under a group key, with a fresh 12-byte IV every time. */
 export async function seal(key, value, associated) {
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
@@ -188,7 +209,7 @@ export async function seal(key, value, associated) {
   const ciphertext = await crypto.subtle.encrypt(
     params,
     key,
-    encoder.encode(JSON.stringify(value))
+    padToBucket(encoder.encode(JSON.stringify(value)))
   );
   return { iv: toBase64Url(iv), ct: toBase64Url(new Uint8Array(ciphertext)) };
 }
