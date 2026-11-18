@@ -15,6 +15,7 @@ import {
   LABELS,
   CODE_LENGTH,
   ID_LENGTH,
+  ID_BYTES,
   IV_BYTES,
   KEY_BITS,
   PBKDF2_ITERATIONS,
@@ -37,6 +38,13 @@ const CODE_PATTERN = /^[0-9A-HJKMNP-TV-Z]{16}$/;
 const BASE64URL_22 = /^[A-Za-z0-9_-]{22}$/;
 const HEX_64 = /^[0-9a-f]{64}$/;
 const SAMPLES = 200;
+
+/* The two derivations restated from the wire format, so a test can name the bytes it expects
+   instead of asking the module what it thinks they are. */
+const sha256 = async (text) =>
+  new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+const hex = (bytes) => Buffer.from(bytes).toString('hex');
+const base64url = (bytes) => Buffer.from(bytes).toString('base64url');
 
 test('the alphabet is Crockford base32 and the constants name the plan', () => {
   assert.equal(ALPHABET.length, 32);
@@ -148,7 +156,9 @@ test('the group id is 64 lowercase hex characters and does not carry the code', 
   const id = await groupIdFromCode(code);
 
   assert.match(id, HEX_64);
-  assert.equal(id.length, 64);
+  /* HEX_64 already fixes the length at 64, so restating it proved nothing. The bytes are the
+     check: drop the group label from the derivation and this id changes while keeping its shape. */
+  assert.equal(id, hex(await sha256(`${LABELS.group}${normalizeCode(code)}`)));
 
   /* The uppercase checks this replaces could not fail: an id that matches HEX_64 carries no
      uppercase letter, so a code written upper case was never going to appear in it. The shape
@@ -236,11 +246,6 @@ test('a frame carrying a prototype key is refused', async () => {
      member — who holds the group key — can seal exactly this. Without the guard the next
      `Object.assign({}, opened)` would set the target's prototype instead of copying a field. */
   const trap = JSON.parse('{"__proto__":{"polluted":1}}');
-  assert.equal(
-    Object.assign({}, trap).polluted,
-    1,
-    'the guard exists because merging this frame would pollute the target'
-  );
 
   await assert.rejects(open(key, await seal(key, trap)), /__proto__/);
 
@@ -376,13 +381,15 @@ test('a member id is 22 base64url characters derived from a secret, not the code
 
   const id = await idFromSecret(secret);
   assert.match(id, BASE64URL_22);
-  assert.equal(id.length, ID_LENGTH);
 
-  /* The equality of lengths is what makes `notEqual` the whole check: an id of the same 22
-     characters that contained the secret would *be* the secret, so `includes` could only ever
-     fail on the same run as the line above it. */
-  assert.equal(id.length, secret.length);
+  /* BASE64URL_22 on both of the values above already fixes both lengths, so stating them again
+     could only fail on the same run as the shape check. The bytes are what is left to check. */
   assert.notEqual(id, secret, 'the id must not be the secret');
+  assert.equal(
+    id,
+    base64url((await sha256(`${LABELS.member}${secret}`)).subarray(0, ID_BYTES)),
+    'the member id is the first 16 bytes of the member derivation, in base64url'
+  );
 
   /* And the label has to be `member`, not `group`. Read alike, the id is the first 16 bytes of
      the group derivation of the same input — same shape, same length, same uniqueness — and no
