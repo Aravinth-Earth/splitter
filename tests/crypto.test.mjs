@@ -11,6 +11,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 
 import {
   ALPHABET,
+  BUCKET_BYTES,
   DOMAIN_PREFIX,
   LABELS,
   CODE_LENGTH,
@@ -26,6 +27,7 @@ import {
   deriveGroupKey,
   randomSecret,
   idFromSecret,
+  padToBucket,
   seal,
   open
 } from '../public/crypto.js';
@@ -499,4 +501,257 @@ test('a seal can bind the record it belongs to', async () => {
   );
   await assert.rejects(open(key, sealed, 7), /associated data must be a string/);
   await assert.rejects(seal(key, { amount: 100 }, null), /associated data must be a string/);
+});
+
+/* ------------------------------------------------------------------------ padding to a bucket */
+
+/*
+ * Every sealed value is padded to a whole number of 256-byte buckets before it is encrypted, so a
+ * frame's length says which bucket a record fell in and nothing about how big the record is. The
+ * padding is spaces: trailing whitespace is insignificant in JSON, so the bytes still parse to the
+ * value that went in and `open` needs no unpadding step of its own.
+ */
+const GCM_TAG_BYTES = 16;
+const SPACE = 0x20;
+
+test('padToBucket rounds a byte length up to the smallest 256-byte bucket', () => {
+  assert.equal(BUCKET_BYTES, 256, 'the bucket is the block the ciphertext length is measured in');
+
+  /* 256 and 512 are in the table because a table of non-multiples alone cannot tell "at or above"
+     from "strictly above": both readings agree on 1, 257, 511 and 513. */
+  const table = [
+    [1, 256],
+    [256, 256],
+    [257, 512],
+    [511, 512],
+    [512, 512],
+    [513, 768]
+  ];
+
+  for (const [length, bucket] of table) {
+    const bytes = new Uint8Array(length).fill(0x41);
+    const padded = padToBucket(bytes);
+
+    assert.equal(padded.length, bucket, `${length} bytes take the ${bucket}-byte bucket`);
+    assert.ok(padded.length >= length, 'the bucket always holds the input');
+    /* One bucket less would not hold it, which is what "the smallest" means. */
+    assert.ok(length > bucket - BUCKET_BYTES, `${bucket} is the first bucket that fits ${length} bytes`);
+  }
+});
+
+test('padding leaves every record byte unchanged and fills the rest with spaces', () => {
+  const json = JSON.stringify({ amount: 500, note: 'rent for october' });
+  const bytes = new TextEncoder().encode(json);
+  const before = [...bytes];
+
+  const padded = padToBucket(bytes);
+  assert.ok(padded.length > bytes.length, 'the fixture sits inside a bucket, so there is a tail to fill');
+
+  assert.deepEqual([...padded.subarray(0, bytes.length)], before, 'every record byte is copied verbatim');
+  assert.deepEqual([...bytes], before, 'the input is not filled through in place');
+  assert.notEqual(padded.buffer, bytes.buffer, 'the result is its own buffer');
+
+  for (let at = bytes.length; at < padded.length; at += 1) {
+    assert.equal(padded[at], SPACE, `byte ${at} of the tail is a space`);
+  }
+  /* A zero-filled tail would pass every length check above and fail here: 0x00 is not JSON
+     whitespace, so the frame would open to a parse error instead of the record. */
+  assert.equal(padded[bytes.length], SPACE, 'the tail is spaces, not NUL bytes');
+
+  /* An input that already fills its bucket is copied as it stands, with no tail to add. */
+  const exact = new Uint8Array(BUCKET_BYTES).fill(0x42);
+  const copy = padToBucket(exact);
+  assert.equal(copy.length, BUCKET_BYTES);
+  assert.deepEqual([...copy], [...exact]);
+});
+
+test('the padded bytes still decode and parse to the value that went in', () => {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const values = [
+    { kind: 'expense', amount: 500, group: 'Flat 3' },
+    { amount: 1, note: 'x'.repeat(200) },
+    { total: 50000000, split: { ana: 25000000, bo: 25000000 } }
+  ];
+
+  for (const value of values) {
+    const json = JSON.stringify(value);
+    const bytes = encoder.encode(json);
+    const padded = padToBucket(bytes);
+    const text = decoder.decode(padded);
+
+    assert.equal(text.slice(0, json.length), json, 'the JSON text is unchanged');
+    assert.equal(
+      text.slice(json.length),
+      ' '.repeat(padded.length - bytes.length),
+      'the tail decodes as the spaces it was filled with'
+    );
+    assert.deepEqual(JSON.parse(text), value, 'trailing spaces are insignificant to JSON.parse');
+    assert.ok(!text.includes('\u0000'), 'a NUL would be a parse error, not padding');
+    assert.ok(!text.includes('\uFFFD'), 'the tail decodes as itself, not as a replacement character');
+  }
+});
+
+test('records in one bucket seal to one ciphertext length, bound or unbound', async () => {
+  const key = await deriveGroupKey(generateCode());
+  const bound = 'sp1:rec:g:73e7f14/kind:expense/id:7';
+  const small = { amount: 1 }; /* 12 bytes of JSON */
+  const large = { amount: 1, note: 'x'.repeat(200) }; /* 222 bytes: the same bucket */
+
+  const frames = [
+    await seal(key, small),
+    await seal(key, large),
+    await seal(key, small, bound),
+    await seal(key, large, bound)
+  ];
+  const lengths = frames.map((frame) => Buffer.from(frame.ct, 'base64url').length);
+
+  assert.equal(
+    new Set(lengths).size,
+    1,
+    `four records in one bucket, one length: ${lengths.join(', ')}`
+  );
+  assert.equal(
+    lengths[0],
+    BUCKET_BYTES + GCM_TAG_BYTES,
+    'the padding fills the bucket and GCM adds its tag'
+  );
+
+  /* The length is blind to size, not to the record: the two frames must still be different bytes. */
+  assert.notEqual(frames[0].ct, frames[1].ct, 'equal lengths must not mean equal ciphertexts');
+
+  assert.deepEqual(await open(key, frames[0]), small);
+  assert.deepEqual(await open(key, frames[1]), large);
+  assert.deepEqual(await open(key, frames[2], bound), small, 'the bound frame opens under its binding');
+  assert.deepEqual(await open(key, frames[3], bound), large);
+});
+
+test('a record past 256 bytes seals longer than one inside the first bucket', async () => {
+  const key = await deriveGroupKey(generateCode());
+  const inside = { amount: 1 };
+  const past = { amount: 1, note: 'y'.repeat(300) }; /* 322 bytes of JSON */
+
+  const short = await seal(key, inside);
+  const long = await seal(key, past);
+  const shortLength = Buffer.from(short.ct, 'base64url').length;
+  const longLength = Buffer.from(long.ct, 'base64url').length;
+
+  assert.equal(shortLength, BUCKET_BYTES + GCM_TAG_BYTES);
+  assert.equal(longLength, 2 * BUCKET_BYTES + GCM_TAG_BYTES, 'one bucket more, not one byte more');
+  assert.ok(longLength > shortLength, 'a record past the bucket is visibly longer on the wire');
+
+  assert.deepEqual(await open(key, short), inside);
+  assert.deepEqual(await open(key, long), past);
+});
+
+test('the five-rupee and the five-million-paise record seal to one length and both open', async () => {
+  const key = await deriveGroupKey(generateCode());
+  /* In paise: 500 is five rupees and 50000000 is five lakh rupees — the same field, five orders of
+     magnitude apart, and both far inside the first bucket. */
+  const fiveRupees = { amount: 500 };
+  const fiveLakhRupees = { amount: 50000000 };
+
+  const one = await seal(key, fiveRupees);
+  const two = await seal(key, fiveLakhRupees);
+  const oneLength = Buffer.from(one.ct, 'base64url').length;
+  const twoLength = Buffer.from(two.ct, 'base64url').length;
+
+  assert.equal(oneLength, twoLength, 'one bucket, one length, whatever the amount');
+  assert.equal(oneLength, BUCKET_BYTES + GCM_TAG_BYTES);
+  assert.notEqual(one.ct, two.ct, 'the amounts are different records');
+
+  assert.deepEqual(await open(key, one), fiveRupees);
+  assert.deepEqual(await open(key, two), fiveLakhRupees);
+  assert.equal((await open(key, two)).amount, 50000000, 'the amount survives the padding, not just the shape');
+});
+
+test('a Tamil name round-trips to the same code points, never U+FFFD', async () => {
+  const key = await deriveGroupKey(generateCode());
+  const name = 'கார்த்திக்'; /* 10 code points, 30 UTF-8 bytes */
+  const group = 'தமிழ்';
+  const value = { name, group };
+
+  const opened = await open(key, await seal(key, value));
+  assert.deepEqual(opened, value);
+
+  for (const field of ['name', 'group']) {
+    assert.deepEqual(
+      [...opened[field]].map((character) => character.codePointAt(0)),
+      [...value[field]].map((character) => character.codePointAt(0)),
+      `${field} keeps its code points`
+    );
+    assert.ok(!opened[field].includes('\uFFFD'), `${field} carries no replacement character`);
+  }
+
+  /* The bytes as well as the round trip: TextDecoder writes U+FFFD where a sequence is cut, so a
+     pad that fell inside a three-byte character would show up here even if a lenient reader
+     repaired the name afterwards. */
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const text = new TextDecoder().decode(padToBucket(bytes));
+  assert.ok(!text.includes('\uFFFD'), 'the padded bytes decode without a replacement character');
+  assert.deepEqual(JSON.parse(text), value);
+});
+
+test('a value short in characters but long in bytes takes the bigger bucket', async () => {
+  const key = await deriveGroupKey(generateCode());
+  /* 130 Tamil characters: 130 code points and 390 UTF-8 bytes, so the record's JSON is 401 bytes.
+     A bucket chosen by character count would put it in the first bucket; its bytes need the
+     second. */
+  const tamil = 'ம'.repeat(130);
+  const value = { note: tamil };
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+
+  assert.equal(tamil.length, 130);
+  assert.equal([...tamil].length, 130, 'one code point per character, so only the byte count grows');
+  assert.ok(bytes.length > BUCKET_BYTES, `the fixture must pass the first bucket, got ${bytes.length} bytes`);
+  assert.equal(
+    padToBucket(bytes).length,
+    2 * BUCKET_BYTES,
+    'the bytes, not the characters, choose the bucket'
+  );
+
+  const sealed = await seal(key, value);
+  assert.equal(Buffer.from(sealed.ct, 'base64url').length, 2 * BUCKET_BYTES + GCM_TAG_BYTES);
+  assert.equal((await open(key, sealed)).note, tamil, 'and the characters come back whole');
+});
+
+test('a padded frame carries its iv and its ct and nothing else', async () => {
+  const key = await deriveGroupKey(generateCode());
+  const frame = await seal(key, { amount: 500 });
+
+  assert.deepEqual(Object.keys(frame).sort(), ['ct', 'iv'], 'padding adds no field to the frame');
+  assert.equal(frame.iv.length, IV_BASE64_CHARS, 'the iv is the 16 characters the wire expects');
+  assert.equal(Buffer.from(frame.iv, 'base64url').length, IV_BYTES);
+  assert.equal(Buffer.from(frame.ct, 'base64url').length, BUCKET_BYTES + GCM_TAG_BYTES);
+  assert.equal(isSealed(frame), true, 'a padded frame is storable');
+
+  /* The same validator, on the same padded ct: 16 characters is an iv and 12 is the byte count
+     written in the wrong unit, whatever the ciphertext behind it measures. */
+  assert.equal(isSealed({ iv: 'A'.repeat(16), ct: frame.ct }), true);
+  assert.equal(isSealed({ iv: 'A'.repeat(12), ct: frame.ct }), false);
+
+  assert.deepEqual(await open(key, frame), { amount: 500 });
+});
+
+test('a padded frame still binds the kind, the group and the record it belongs to', async () => {
+  const key = await deriveGroupKey(generateCode());
+  const bound = 'sp1:rec:g:73e7f14/kind:expense/id:7';
+  const frame = await seal(key, { amount: 500 }, bound);
+
+  assert.deepEqual(await open(key, frame, bound), { amount: 500 });
+  assert.deepEqual(Object.keys(frame).sort(), ['ct', 'iv'], 'the binding stays out of the frame');
+
+  const elsewhere = [
+    'sp1:rec:g:73e7f14/kind:settlement/id:7', /* another kind */
+    'sp1:rec:g:73e7f15/kind:expense/id:7', /* another group */
+    'sp1:rec:g:73e7f14/kind:expense/id:8' /* another record */
+  ];
+  for (const other of elsewhere) {
+    await assert.rejects(
+      open(key, frame, other),
+      /sealed under this key/,
+      `${other} must not open a frame bound to ${bound}`
+    );
+  }
+  await assert.rejects(open(key, frame), /sealed under this key/, 'nor does an unbound open');
 });
