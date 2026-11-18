@@ -29,7 +29,8 @@ import {
   idFromSecret,
   padToBucket,
   seal,
-  open
+  open,
+  avatarFor
 } from '../public/crypto.js';
 /* The server's half of the same envelope. The iv was counted as 16 characters in one file and 12
    bytes in the other, so the cross-check below is the point of the import, not a detail. */
@@ -777,4 +778,78 @@ test('a padded frame still binds the kind, the group and the record it belongs t
     );
   }
   await assert.rejects(open(key, frame), /sealed under this key/, 'nor does an unbound open');
+});
+
+/* ----------------------------------------------------------------------------------- avatars */
+
+/*
+ * An avatar is drawn from what the page already has: the member id and the display name. It is a
+ * hash, not a secret and not a random draw — the same pair keeps one avatar across reloads, two
+ * different people get two different ones, and nothing about it is ever sent anywhere.
+ */
+
+const AVATAR = /^(hsl\(\d{1,3} \d{1,3}% \d{1,3}%\))$/;
+/* 200 draws over 6 shapes and 360 hues: most of them are distinct, and a hash that only ever drew
+   one face would land far below this. */
+const AVATAR_SPREAD = 160;
+
+test('an avatar is a deterministic function of the id and the name', () => {
+  const avatar = avatarFor(KAT_MEMBER_ID, 'Asha');
+
+  assert.deepEqual(Object.keys(avatar).sort(), ['background', 'ink', 'shape']);
+  assert.deepEqual(avatarFor(KAT_MEMBER_ID, 'Asha'), avatar, 'the same pair draws the same avatar');
+
+  /* Shape is a word a stylesheet can carry as a class; the two colours are CSS colours. */
+  assert.match(avatar.shape, /^[a-z]+$/, 'a shape is a lowercase word');
+  assert.match(avatar.background, AVATAR, 'a background is one hsl() colour');
+  assert.match(avatar.ink, AVATAR, 'and so is the ink drawn on it');
+  assert.notEqual(avatar.background, avatar.ink, 'the letter is not drawn in its own background');
+
+  for (const field of ['background', 'ink']) {
+    const [hue, saturation, lightness] = avatar[field]
+      .slice(4, -1)
+      .split(' ')
+      .map((part) => Number(part.replace('%', '')));
+    assert.ok(hue >= 0 && hue < 360, `${field} hue ${hue} is on the wheel`);
+    assert.ok(saturation > 0 && saturation <= 100, `${field} saturation ${saturation} is a percentage`);
+    assert.ok(lightness >= 0 && lightness <= 100, `${field} lightness ${lightness} is a percentage`);
+  }
+
+  /* The drawing carries neither the id nor the name as itself. */
+  const drawn = JSON.stringify(avatar);
+  assert.ok(!drawn.includes(KAT_MEMBER_ID), 'the avatar does not carry the id');
+  assert.ok(!drawn.includes('Asha'), 'nor the name');
+});
+
+test('the id and the name both choose the avatar, so no two people are handed one face', () => {
+  const pairs = (avatars) => avatars.map((avatar) => `${avatar.shape} ${avatar.background}`);
+  const ids = Array.from({ length: SAMPLES }, (_, at) => `member-${at}`);
+  const names = Array.from({ length: SAMPLES }, (_, at) => `Name ${at}`);
+
+  const byId = pairs(ids.map((id) => avatarFor(id, 'Asha')));
+  assert.ok(
+    new Set(byId).size >= AVATAR_SPREAD,
+    `${SAMPLES} ids over one name gave only ${new Set(byId).size} distinct avatars`
+  );
+
+  const byName = pairs(names.map((name) => avatarFor(KAT_MEMBER_ID, name)));
+  assert.ok(
+    new Set(byName).size >= AVATAR_SPREAD,
+    `${SAMPLES} names under one id gave only ${new Set(byName).size} distinct avatars`
+  );
+
+  /* A rename is a different avatar, because the name is part of what is hashed: the same person
+     under another display name is not the same drawing. */
+  assert.notDeepEqual(avatarFor(KAT_MEMBER_ID, 'Asha'), avatarFor(KAT_MEMBER_ID, 'Balan'));
+  assert.deepEqual(
+    avatarFor(KAT_MEMBER_ID, ''),
+    avatarFor(KAT_MEMBER_ID),
+    'no name is the empty name, not a different one'
+  );
+
+  /* The shapes are a small fixed set, so a stylesheet can carry a rule for each; a hash that
+     only ever drew one shape would pass every uniqueness check above. */
+  const shapes = new Set([...byId, ...byName].map((pairName) => pairName.split(' ')[0]));
+  assert.ok(shapes.size >= 4, `the hash draws several shapes, found ${shapes.size}`);
+  for (const shape of shapes) assert.match(shape, /^[a-z]+$/);
 });

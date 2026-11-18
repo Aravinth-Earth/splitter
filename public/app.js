@@ -21,6 +21,7 @@
  */
 
 import {
+  avatarFor,
   deriveGroupKey,
   formatCode,
   generateCode,
@@ -162,6 +163,69 @@ export function presenceText(ids, selfId = null, label = () => 'Someone') {
 export function presenceChip(text) {
   const hidden = text === '';
   return { hidden, text: hidden ? '' : text };
+}
+
+/**
+ * Draw the presence chip: one avatar per id, in the order the set holds them, then the sentence.
+ *
+ * The avatars are `aria-hidden`, so the chip's accessible name is exactly what `presenceText`
+ * writes and never a run of initials. `doc` and `element` are handed in rather than reached for, so
+ * this is a rule a test can run without a browser: it makes spans, writes their text, and fetches
+ * nothing. An empty set leaves the element hidden and empty.
+ */
+export function renderPresenceChip(
+  doc,
+  element,
+  ids,
+  selfId = null,
+  label = () => 'Someone',
+  name = () => ''
+) {
+  const here = ids instanceof Set ? ids : new Set();
+  const chip = presenceChip(presenceText(here, selfId, label));
+
+  element.replaceChildren();
+  element.hidden = chip.hidden;
+  if (chip.hidden) return chip;
+
+  for (const id of here) {
+    const person = name(id);
+    const avatar = avatarFor(id, person);
+
+    const face = doc.createElement('span');
+    face.className = `presence-avatar presence-avatar-${avatar.shape}`;
+    face.setAttribute('aria-hidden', 'true');
+    paintAvatar(face, avatar);
+    face.textContent = initialOf(person);
+    element.append(face);
+  }
+
+  const text = doc.createElement('span');
+  text.className = 'presence-text';
+  text.textContent = chip.text;
+  element.append(text);
+
+  return chip;
+}
+
+/**
+ * Put one avatar's colours on its node.
+ *
+ * The shape is a class, because the stylesheet owns it; the hue is per person, so it is written on
+ * the node instead. A stand-in document need not model `style` at all, and a here frame must never
+ * throw for a colour: a browser always has one, and where it is missing the shape class still
+ * draws the avatar.
+ */
+function paintAvatar(node, avatar) {
+  if (!node.style) return;
+  node.style.background = avatar.background;
+  node.style.color = avatar.ink;
+}
+
+/** The one character an avatar carries: the first code point of the name, in capitals. */
+function initialOf(name) {
+  const first = [...String(name ?? '').trim()][0];
+  return first ? first.toUpperCase() : '';
 }
 
 /* The app is the whole of its origin, so a relative path is the API on this origin and nothing
@@ -1890,12 +1954,17 @@ export function init(doc = document, win = window) {
    * The presence chip, from the ids the last here frame carried.
    *
    * The text comes from `presenceText`, which is the copy this chip always showed; the ids come
-   * from `presenceIds`, which is the one reader of a here frame on this page.
+   * from `presenceIds`, which is the one reader of a here frame on this page. `renderPresenceChip`
+   * draws one avatar per id from the member's own name, so the suffix `memberLabel` adds for a
+   * member who left does not move their avatar.
    */
   function renderPresence() {
-    const chip = presenceChip(presenceText(presentIds, selfId, memberLabel));
-    presence.hidden = chip.hidden;
-    presence.textContent = chip.text;
+    renderPresenceChip(doc, presence, presentIds, selfId, memberLabel, memberName);
+  }
+
+  /** The name an avatar is seeded with: the member's own, without the label's suffix. */
+  function memberName(id) {
+    return members.get(id) ?? '';
   }
 
   function handlePresence(frame) {

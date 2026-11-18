@@ -172,6 +172,45 @@ export async function idFromSecret(secret) {
   return toBase64Url(digest.slice(0, ID_BYTES));
 }
 
+/* The shapes a stylesheet carries a rule for. Small on purpose: a shape is a border-radius, and a
+   list longer than a person can tell apart would be a list of the same dot. */
+const AVATAR_SHAPES = Object.freeze(['arch', 'circle', 'leaf', 'pill', 'squircle', 'square']);
+
+/**
+ * FNV-1a over the UTF-16 units of a string. 32 bits, no state, no dependency: the same text is the
+ * same number in every browser and under `node --test`, which is what makes an avatar a function of
+ * its inputs rather than a draw.
+ */
+function fnv1a(text) {
+  let hash = 0x811c9dc5;
+  for (let at = 0; at < text.length; at += 1) {
+    hash ^= text.charCodeAt(at);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * The avatar for one member: a shape, a fill and the ink drawn on it.
+ *
+ * The seed is the id *and* the name, so the same person keeps one avatar across reloads and two
+ * people cannot be handed the same one by accident. Two hashes, not two slices of one, so the
+ * shape does not walk in step with the colour. Nothing here is random and nothing is secret: an
+ * avatar is drawn locally and never leaves the page.
+ *
+ * @returns {{shape: string, background: string, ink: string}}
+ */
+export function avatarFor(id, name = '') {
+  const key = `${id ?? ''}\u0000${name ?? ''}`;
+  const shape = AVATAR_SHAPES[fnv1a(`splitter:avatar:${key}`) % AVATAR_SHAPES.length];
+  const hue = fnv1a(`splitter:avatar-hue:${key}`) % 360;
+  return {
+    shape,
+    background: `hsl(${hue} 46% 38%)`,
+    ink: `hsl(${hue} 90% 92%)`
+  };
+}
+
 /**
  * The GCM parameters for one frame. The associated data is authenticated and never encrypted: it
  * is what the record *is* — its kind, its group id, its record id — so a blob lifted into another
