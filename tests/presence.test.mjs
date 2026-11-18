@@ -15,7 +15,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { presenceIds, presenceText } from '../public/app.js';
+import { presenceChip, presenceIds, presenceText } from '../public/app.js';
 
 test('the page reads ids from a here frame and from no other frame', () => {
   assert.deepEqual([...presenceIds({ t: 'here', ids: ['a', 'b'] })], ['a', 'b']);
@@ -67,4 +67,15 @@ test('the presence chip is unchanged for a given id set', () => {
     '3 here · Asha, Balan, Chitra',
     'the label is the chip\'s only name source'
   );
+});
+
+test('the chip is hidden with empty text exactly when the text is empty', () => {
+  /* The one text that hides the chip: nothing to say is nothing to show. */
+  assert.deepEqual(presenceChip(''), { hidden: true, text: '' });
+
+  /* Every other text is shown as it is, including one that is only whitespace: emptiness is the
+     exact empty string, not a trimmed or coerced one. */
+  for (const text of ['Just you here', '1 here · Asha', '2 here · Asha, Balan', ' ']) {
+    assert.deepEqual(presenceChip(text), { hidden: false, text }, `${JSON.stringify(text)} is shown`);
+  }
 });

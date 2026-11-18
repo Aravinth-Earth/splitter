@@ -996,3 +996,54 @@ test('group: counters on a group that was never initialised is a 404, not an emp
   assert.deepEqual(await response.json(), { error: 'unknown_group' });
 });
 
+/**
+ * Attach a socket to the instance as the WebSocket path would, with an identity and a last frame
+ * at `seen`. The presence frame reads exactly these three maps, so a test can place a socket at a
+ * chosen age without waiting ninety seconds for one.
+ */
+function attach(group, { memberId, role, seen }) {
+  const socket = newSocket();
+  group.sockets.add(socket);
+  if (memberId !== null) group.identities.set(socket, { memberId, role });
+  if (seen !== null) group.lastSeen.set(socket, seen);
+  return socket;
+}
+
+test('group: presence defaults are 90 s of silence and a 30 s beat, and a socket past that is absent', async () => {
+  const { group, stored } = newGroup();
+  const hostId = id22();
+  await post(group, { hostId, nameBlob: sealed() });
+
+  /* No SILENCE_MS or HEARTBEAT_MS in the environment: both numbers are the code's own, so a
+     deploy that forgets the vars still gets a heartbeat rather than silence or a tight loop. */
+  assert.equal(group.presenceSilenceMs(), 90_000, 'a socket quiet beyond 90 s is no longer here');
+  assert.equal(group.heartbeatMs(), 30_000, 'presence is re-announced every 30 s');
+
+  const memberId = id22();
+  const quietId = id22();
+  const pendingId = id22();
+  stored.set(`member:${memberId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 0 });
+  stored.set(`member:${quietId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 0 });
+  stored.set(`member:${pendingId}`, { status: 'pending', nameBlob: sealed(), joinedAt: 0 });
+
+  const now = Date.now();
+  attach(group, { memberId: hostId, role: 'host', seen: now });
+  /* One second inside the default window: still here. */
+  attach(group, { memberId, role: 'member', seen: now - 89_000 });
+  /* One second past it: the silence default, not a var, is what drops them. */
+  const quiet = attach(group, { memberId: quietId, role: 'member', seen: now - 91_000 });
+  /* Neither of these may be named: a pending row is not approved, and an unauthenticated socket
+     has no identity at all. */
+  attach(group, { memberId: pendingId, role: 'pending', seen: now });
+  attach(group, { memberId: null, role: null, seen: now });
+
+  const frame = await group.presenceFrame();
+  assert.deepEqual(frame, { t: 'here', ids: [hostId, memberId] }, 'only the speaking approved sockets');
+
+  /* The quiet socket is still attached and still fresh in the map; it is the age alone that
+     leaves it out, and a frame a second later does not bring it back. */
+  assert.equal(group.sockets.has(quiet), true, 'nothing closed the quiet socket');
+  const later = await group.presenceFrame();
+  assert.equal(later.ids.includes(quietId), false, 'a socket past the silence window stays absent');
+});
+
