@@ -255,11 +255,6 @@ export class Registry {
   }
 
   async fetch(request) {
-    if (request.method !== 'POST') {
-      /* RFC 9110: a 405 has to name the methods it does allow. */
-      return json({ error: 'method' }, 405, { allow: 'POST' });
-    }
-
     /* Compared whole, never by suffix: `/nope/release` ends in `/release`, and a suffix match would
        drop a slot for a caller that never asked to release one. Every internal call is written in
        this repo, so the set of paths is closed. */
@@ -270,11 +265,24 @@ export class Registry {
       return json({ error: 'not_found' }, 404);
     }
 
-    /* `/stats` is read before the body is parsed: it takes no input and writes nothing, so a POST
-       with an empty body is not a bad request. `/list` takes an optional cursor — the last id of
-       the page before — so it reads its body first: an absent body asks for the first page, and a
-       body that is not a JSON object is a bad request, not a page nobody asked for. */
-    if (pathname === '/stats') return json(this.stats());
+    /* `/stats` is the ledger's one read: GET, and it takes no input and writes nothing, so a write
+       method is refused before anything is parsed and the 405 names the method that works.
+
+       `/list` takes an optional cursor — the last id of the page before — so it reads its body
+       first: an absent body asks for the first page, and a body that is not a JSON object is a bad
+       request, not a page nobody asked for. */
+    if (pathname === '/stats') {
+      if (request.method !== 'GET') {
+        /* RFC 9110: a 405 has to name the methods it does allow. */
+        return json({ error: 'method' }, 405, { allow: 'GET' });
+      }
+      return json(this.stats());
+    }
+
+    if (request.method !== 'POST') {
+      /* RFC 9110: a 405 has to name the methods it does allow. */
+      return json({ error: 'method' }, 405, { allow: 'POST' });
+    }
 
     const raw = await request.text().catch(() => '');
     let body = {};

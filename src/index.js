@@ -157,12 +157,15 @@ async function readCappedBody(request) {
  * decides what a broken ledger means; the status travels because the operator surface passes it on
  * — a destroy that wiped the group but could not free its slot is a 502, not a 200.
  */
-async function callDurable(stub, url, body) {
-  const response = await stub.fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body)
-  });
+async function callDurable(stub, url, body, method = 'POST') {
+  /* A GET carries no body and no content type: `/stats` is a read, and a Durable Object that took
+     it as a POST would answer 405 by its own method gate. */
+  const init = { method };
+  if (method !== 'GET') {
+    init.headers = { 'content-type': 'application/json' };
+    init.body = JSON.stringify(body);
+  }
+  const response = await stub.fetch(url, init);
   return {
     ok: response.ok,
     status: response.status,
@@ -347,7 +350,7 @@ async function handleOperator(request, env, path) {
   if (path === '/stats') {
     if (request.method !== 'GET') return json({ error: 'method' }, 405, { allow: 'GET' });
     const registry = env.REGISTRY.get(env.REGISTRY.idFromName('registry'));
-    const answer = await callDurable(registry, 'https://registry/stats', {});
+    const answer = await callDurable(registry, 'https://registry/stats', null, 'GET');
     return json(answer.body, answer.status);
   }
 
