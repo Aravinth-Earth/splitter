@@ -23,6 +23,7 @@ import {
   validateNote,
   validateTime
 } from '../public/expense.js';
+import { percent } from '../public/calc.js';
 
 test('expense: a typed amount becomes integer paise, and the edges are refused', () => {
   assert.deepEqual(parseAmount('1,234.56'), { ok: true, paise: 123_456 });
@@ -80,6 +81,17 @@ test('expense: default percentages are one decimal and sum to 100 for any group 
     for (const value of Object.values(percentages)) {
       assert.equal(Math.round(value * 10), value * 10, 'one decimal');
     }
+
+    /* The defaults are a real split, not just a set of numbers that add up: the guard accepts
+       them and the parts fit the amount. */
+    const at = `${count} members`;
+    const shares = percent(10_000, percentages);
+    const paid = Object.values(shares).reduce((sum, paise) => sum + paise, 0);
+    assert.equal(Object.keys(shares).length, count, at);
+    assert.equal(paid, 10_000, at);
+    for (const paise of Object.values(shares)) {
+      assert.ok(Number.isSafeInteger(paise) && paise >= 0 && paise <= 10_000, at);
+    }
   }
 });
 
@@ -102,6 +114,12 @@ test('expense: a percent split that does not total 100 is refused, and 100 % is 
     percentages: { a: 33.34, b: 33.34, c: 33.34 }
   });
   assert.equal(onlyRounds.ok, false);
+
+  assert.deepEqual(
+    splitFor({ mode: 'percent', amountPaise: 1_000, percentages: { a: 100.02 } }),
+    { ok: false, message: 'Percentages must total 100 %.' },
+    'one member at 100.02 % is refused with the sentence the sheet shows'
+  );
 
   assert.deepEqual(splitFor({ mode: 'percent', amountPaise: 1_000, percentages: { a: 100 } }), {
     ok: true,
