@@ -6,7 +6,8 @@
  * - the outbox: sealed `put` frames waiting for a socket, in local order, with the id minted before
  *   the first send so a replay is the same write;
  * - the last state: the sealed records the server sent, so a cold load can draw the ledger before
- *   the network answers.
+ *   the network answers. One row per group under its own key, so a save never rewrites another
+ *   group's records; the single `splitter:cache` blob an older version wrote is still read.
  *
  * Neither holds a group code, a key or a readable value. A storage that throws or is full returns
  * false from saves; the page keeps working online and says what it cannot keep.
@@ -21,6 +22,9 @@ const STATE_KEY = 'splitter:cache';
 const GROUP_ID = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9_-]{22}$/;
 const MAX_QUEUE = 500;
+
+/** One state row per group, so a save never rewrites a blob that holds other groups' records. */
+const stateKey = (groupId) => `${STATE_KEY}:${groupId}`;
 
 function read(storage, key) {
   if (!storage) return {};
@@ -38,6 +42,16 @@ function write(storage, key, value) {
   if (!storage) return false;
   try {
     storage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function remove(storage, key) {
+  if (!storage || typeof storage.removeItem !== 'function') return false;
+  try {
+    storage.removeItem(key);
     return true;
   } catch {
     return false;
@@ -129,6 +143,35 @@ function isRosterEntry(member) {
 }
 
 /**
+ * The parsed state rows this tab already has, per storage.
+ *
+ * A save writes only its own group's key, so no read of the other groups happens and none of them
+ * can be dropped by a stale copy; the memo means the second read of a row costs no parse. A row
+ * another tab wrote is not seen here until a reload, which is the same staleness the one shared
+ * blob had.
+ */
+const rowsByStorage = new WeakMap();
+
+function rowsFor(storage) {
+  let rows = rowsByStorage.get(storage);
+  if (!rows) {
+    rows = new Map();
+    rowsByStorage.set(storage, rows);
+  }
+  return rows;
+}
+
+/** One group's stored row: its own key first, the pre-split `splitter:cache` blob second. */
+function rowFor(storage, groupId) {
+  if (!storage) return null;
+  const rows = rowsFor(storage);
+  if (rows.has(groupId)) return rows.get(groupId);
+  const row = read(storage, stateKey(groupId))[groupId] ?? read(storage, STATE_KEY)[groupId] ?? null;
+  rows.set(groupId, row);
+  return row;
+}
+
+/**
  * The last state seen for a group: sealed metadata, roster and records only.
  *
  * Nothing here can draw a decrypted row until the group code is present, which lives in
@@ -136,8 +179,7 @@ function isRosterEntry(member) {
  */
 export function cacheFor(storage, groupId) {
   if (!GROUP_ID.test(groupId)) return null;
-  const all = read(storage, STATE_KEY);
-  const row = all[groupId];
+  const row = rowFor(storage, groupId);
   if (
     !row ||
     row.schema !== CACHE_SCHEMA ||
@@ -204,7 +246,9 @@ export function saveCache(storage, groupId, state, savedAt = Date.now()) {
     })),
     records: state.records.filter(isRecord).map((record) => ({ ...record }))
   };
-  return write(storage, STATE_KEY, { ...read(storage, STATE_KEY), [groupId]: row });
+  if (!write(storage, stateKey(groupId), { [groupId]: row })) return false;
+  rowsFor(storage).set(groupId, row);
+  return true;
 }
 
 
@@ -217,5 +261,7 @@ export function forgetGroupCache(storage, groupId) {
   delete cache[groupId];
   const savedOutbox = write(storage, OUTBOX_KEY, outbox);
   const savedCache = write(storage, STATE_KEY, cache);
-  return savedOutbox && savedCache;
+  const savedRow = remove(storage, stateKey(groupId));
+  if (storage) rowsFor(storage).delete(groupId);
+  return savedOutbox && savedCache && savedRow;
 }
