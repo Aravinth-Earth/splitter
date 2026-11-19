@@ -22,12 +22,24 @@
 
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { createServer as holdServer } from 'node:http';
+import { createServer } from 'node:net';
 import test from 'node:test';
 
 import { generateCode, groupIdFromCode, randomSecret } from '../public/crypto.js';
-import { API, startWorker } from './wrangler.mjs';
+import {
+  API,
+  COLD_START_UPPER_MS,
+  DEFAULT_HEALTH_TIMEOUT_MS,
+  PORT_ATTEMPTS,
+  REQUEST_TIMEOUT_MS,
+  startWorker
+} from './wrangler.mjs';
 
-/** 22 characters: 16 bytes, base64url, unpadded — the id shape the client sends. */
+/**
+ * A member id: 22 characters, 16 bytes, base64url, unpadded — the shape the client sends for a
+ * person. It is never a group id, so it appears here only as `hostId`.
+ */
 function id22() {
   return randomBytes(16).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
@@ -38,6 +50,11 @@ function sealed(bytes = 96) {
     iv: randomBytes(12).toString('base64').replace(/\+/g, '-').replace(/\//g, '_'),
     ct: randomBytes(bytes).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
   };
+}
+
+/** A group id as crypto.js derives it: 64 lowercase hex characters, the one shape a group has. */
+function groupFixtureId() {
+  return randomBytes(32).toString('hex');
 }
 
 function createBody(groupId) {
@@ -53,7 +70,7 @@ async function post(baseUrl, path, payload, { method = 'POST', raw, type = 'appl
     method,
     headers,
     body: hasBody ? (raw ?? JSON.stringify(payload)) : undefined,
-    signal: AbortSignal.timeout(15_000)
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   });
   const body = await response.json().catch(() => ({}));
   return { status: response.status, headers: response.headers, body };
@@ -89,10 +106,9 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
 
   /* The cap is spent first, on purpose. Every malformed case below then runs against a full
      ledger, where any request that reached the ledger would be answered 429 — so a 400 is proof
-     the validation refused it before a slot was asked for, and a 429 afterwards is proof the
-     ledger is exactly as full as it was. */
+     the validation refused it before a slot was asked for. */
   await t.test('26 distinct creates leave 25 ok answers and one limit', async () => {
-    const ids = Array.from({ length: 26 }, () => id22());
+    const ids = Array.from({ length: 26 }, () => groupFixtureId());
     assert.equal(new Set(ids).size, 26, 'the 26 ids must be distinct');
 
     const results = [];
@@ -108,13 +124,6 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
     assert.equal(limited.length, 1, `exactly one create must be refused for the cap, got ${limited.length}`);
     for (const result of ok) assert.deepEqual(result.body, { ok: true });
     for (const result of limited) assert.deepEqual(result.body, { error: 'limit' });
-    /* The two buckets partition the answers, so a third status — a 500 from a broken binding, say —
-       cannot hide behind two filters that each quietly found nothing to check. */
-    assert.equal(
-      ok.length + limited.length,
-      results.length,
-      'every create must be either an acceptance or a cap refusal'
-    );
 
     /* A refusal is not a slot: re-sending the refused id while the ledger is still full is
        refused again, so the refusal neither held a slot nor freed one. */
@@ -130,7 +139,7 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
     assert.equal(again.status, 200);
     assert.deepEqual(again.body, { ok: true });
 
-    const fresh = await createGroup(worker.baseUrl, createBody(id22()));
+    const fresh = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
     assert.equal(fresh.status, 429, 'a retry must not free or add a slot');
     assert.deepEqual(fresh.body, { error: 'limit' });
   });
@@ -141,48 +150,14 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
     assert.deepEqual(result.body, { error: 'body' });
   });
 
-  await t.test('a groupId that is not an id is refused', async () => {
-    const bad = [
-      '',
-      'not-an-id',
-      id22().slice(0, 21),
-      `${id22().slice(0, 21)}!`,
-      `${id22()}A`,
-      `${id22()}=`,
-      '0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210AA', // 66 characters
-      '0FDD7A502A8BB14CF22851CD4A0C60FCA5C514FB7C8ECB391DC47E3F9BE7F786' // 64 hex, upper case
-    ];
-
-    for (const groupId of bad) {
-      const result = await createGroup(worker.baseUrl, { ...createBody(id22()), groupId });
-      /* With the ledger full, a request that reached it would answer 429 — so a 400 is the
-         validation firing before a slot is asked for, which is what the message claims. */
-      assert.equal(result.status, 400, `"${groupId}" must be refused before any slot is taken`);
-      assert.deepEqual(result.body, { error: 'groupId' });
-    }
-
-    /* Absent and non-string ids are refused the same way. */
-    for (const groupId of [undefined, 42, null]) {
-      const result = await createGroup(worker.baseUrl, { ...createBody(id22()), groupId });
-      assert.equal(result.status, 400);
-      assert.deepEqual(result.body, { error: 'groupId' });
-    }
-
-    /* And the ledger is exactly as full as it was: a refused create neither took a slot nor freed
-       one, which is the "before any slot is taken" half of the claim above. */
-    const stillFull = await createGroup(worker.baseUrl, createBody(id22()));
-    assert.equal(stillFull.status, 429, 'refusing a bad groupId must not take, free or bypass a slot');
-    assert.deepEqual(stillFull.body, { error: 'limit' });
-  });
-
   await t.test('a missing or unusable sealed name is refused', async () => {
     const cases = [
-      { ...createBody(id22()), nameBlob: undefined },
-      { ...createBody(id22()), nameBlob: null },
-      { ...createBody(id22()), nameBlob: { iv: 'AAAAAAAAAAAAAAAA' } },
-      { ...createBody(id22()), nameBlob: { iv: 'AAAA', ct: 'AAAA' } },
-      { ...createBody(id22()), nameBlob: 'Ana' },
-      { ...createBody(id22()), metaBlob: { iv: 'AAAAAAAAAAAAAAAA' } }
+      { ...createBody(groupFixtureId()), nameBlob: undefined },
+      { ...createBody(groupFixtureId()), nameBlob: null },
+      { ...createBody(groupFixtureId()), nameBlob: { iv: 'AAAAAAAAAAAAAAAA' } },
+      { ...createBody(groupFixtureId()), nameBlob: { iv: 'AAAA', ct: 'AAAA' } },
+      { ...createBody(groupFixtureId()), nameBlob: 'Ana' },
+      { ...createBody(groupFixtureId()), metaBlob: { iv: 'AAAAAAAAAAAAAAAA' } }
     ];
     for (const payload of cases) {
       const result = await createGroup(worker.baseUrl, payload);
@@ -192,7 +167,7 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
   });
 
   await t.test('a hostId that is not an id is refused', async () => {
-    const result = await createGroup(worker.baseUrl, { ...createBody(id22()), hostId: 'host' });
+    const result = await createGroup(worker.baseUrl, { ...createBody(groupFixtureId()), hostId: 'host' });
     assert.equal(result.status, 400);
     assert.deepEqual(result.body, { error: 'hostId' });
   });
@@ -203,6 +178,50 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
     assert.equal(result.headers.get('allow'), 'POST', 'a 405 must carry Allow: POST (RFC 9110)');
     assert.deepEqual(result.body, { error: 'method' });
   });
+});
+
+/* ---------------------------------------------------- the refusal that must cost nothing */
+
+test('create: a bad groupId is refused before any slot is taken', async (t) => {
+  /* One slot, free, and every refusal comes first: the valid create that follows taking it is
+     what proves the refusals spent nothing. Run against a full ledger instead, a 400 would only
+     show the validation fired before a 429 — it could not show the ledger was left alone. */
+  const worker = await startWorker({ vars: { MAX_GROUPS: '1' } });
+  t.after(async () => {
+    await worker.stop();
+  });
+
+  const bad = [
+    '',
+    'not-an-id',
+    /* A member id, whole: the one non-group shape a create used to accept, which made a group
+       the destroy could never name. */
+    id22(),
+    id22().slice(0, 21),
+    `${id22().slice(0, 21)}!`,
+    `${id22()}A`,
+    `${id22()}=`,
+    '0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210AA', // 66 characters
+    '0FDD7A502A8BB14CF22851CD4A0C60FCA5C514FB7C8ECB391DC47E3F9BE7F786' // 64 hex, upper case
+  ];
+
+  for (const groupId of bad) {
+    const result = await createGroup(worker.baseUrl, { ...createBody(groupFixtureId()), groupId });
+    assert.equal(result.status, 400, `"${groupId}" must be refused before any slot is taken`);
+    assert.deepEqual(result.body, { error: 'groupId' });
+  }
+
+  /* Absent and non-string ids are refused the same way. */
+  for (const groupId of [undefined, 42, null]) {
+    const result = await createGroup(worker.baseUrl, { ...createBody(groupFixtureId()), groupId });
+    assert.equal(result.status, 400);
+    assert.deepEqual(result.body, { error: 'groupId' });
+  }
+
+  /* The only slot is still there to take: a refusal neither took one nor bypassed the cap. */
+  const accepted = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
+  assert.equal(accepted.status, 200, 'the only slot must still be free after every bad groupId');
+  assert.deepEqual(accepted.body, { ok: true });
 });
 
 /* --------------------------------------------------------------- the media type */
@@ -216,13 +235,13 @@ test('create: only application/json may reach a slot, and a refused type spends 
     await worker.stop();
   });
 
-  const simple = await post(worker.baseUrl, '/create', createBody(id22()), { type: 'text/plain' });
+  const simple = await post(worker.baseUrl, '/create', createBody(groupFixtureId()), { type: 'text/plain' });
   assert.equal(simple.status, 400, 'a CORS-simple media type must be refused before a slot is asked for');
   assert.deepEqual(simple.body, { error: 'body' });
 
   /* The same body in the type the page will send: the exact type, with a charset. It takes the one
      slot — which is only possible because the request above spent nothing. */
-  const accepted = await post(worker.baseUrl, '/create', createBody(id22()), {
+  const accepted = await post(worker.baseUrl, '/create', createBody(groupFixtureId()), {
     type: 'application/json; charset=utf-8'
   });
   assert.equal(accepted.status, 200, 'application/json with a charset is accepted, and the slot was free');
@@ -236,7 +255,7 @@ test('create: only application/json may reach a slot, and a refused type spends 
     'application/x-www-form-urlencoded',
     'Text/Plain'
   ]) {
-    const refused = await post(worker.baseUrl, '/create', createBody(id22()), { type });
+    const refused = await post(worker.baseUrl, '/create', createBody(groupFixtureId()), { type });
     assert.equal(refused.status, 400, `content-type ${type} must be refused before the ledger is asked`);
     assert.deepEqual(refused.body, { error: 'body' });
   }
@@ -245,21 +264,21 @@ test('create: only application/json may reach a slot, and a refused type spends 
      `text/plain` of its own and hide the case. */
   const untyped = await fetch(`${worker.baseUrl}${API}/create`, {
     method: 'POST',
-    body: streamedJson(JSON.stringify(createBody(id22()))),
+    body: streamedJson(JSON.stringify(createBody(groupFixtureId()))),
     duplex: 'half',
-    signal: AbortSignal.timeout(15_000)
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   });
   assert.equal(untyped.status, 400, 'a create with no media type is not JSON');
   assert.deepEqual(await untyped.json(), { error: 'body' });
 
   /* Media types are case-insensitive, so a mixed-case one is accepted by the gate and refused only
      by the cap — a 400 here would mean the gate compares strings case-sensitively. */
-  const mixedCase = await post(worker.baseUrl, '/create', createBody(id22()), { type: 'Application/JSON' });
+  const mixedCase = await post(worker.baseUrl, '/create', createBody(groupFixtureId()), { type: 'Application/JSON' });
   assert.equal(mixedCase.status, 429, 'a mixed-case media type is accepted and only the full ledger refuses');
   assert.deepEqual(mixedCase.body, { error: 'limit' });
 
   /* Nothing above freed or added a slot. */
-  const next = await createGroup(worker.baseUrl, createBody(id22()));
+  const next = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
   assert.equal(next.status, 429, 'a refused content-type must neither take nor free a slot');
   assert.deepEqual(next.body, { error: 'limit' });
 });
@@ -319,7 +338,7 @@ test('create: a refused init gives its slot back', async () => {
      answer with a refusal. The Worker is therefore driven with bindings that answer the way a
      refusing Group does, and the release is what the call log shows. */
   const { default: worker } = await import('../src/index.js');
-  const groupId = id22();
+  const groupId = groupFixtureId();
   const { calls, env } = fakeBindings({ initRefuses: true });
 
   const response = await worker.fetch(createRequest(createBody(groupId)), env);
@@ -340,7 +359,7 @@ test('create: an init failure after a retry frees nothing, because the retry too
   const { default: worker } = await import('../src/index.js');
   const { calls, env } = fakeBindings({ initRefuses: true, reserved: false });
 
-  const response = await worker.fetch(createRequest(createBody(id22())), env);
+  const response = await worker.fetch(createRequest(createBody(groupFixtureId())), env);
   assert.equal(response.status, 500);
   assert.deepEqual(
     calls.map((call) => call.pathname),
@@ -351,7 +370,7 @@ test('create: an init failure after a retry frees nothing, because the retry too
 
 test('create: a successful create reserves, initialises, and releases nothing', async () => {
   const { default: worker } = await import('../src/index.js');
-  const groupId = id22();
+  const groupId = groupFixtureId();
   const body = createBody(groupId);
   const { calls, env } = fakeBindings();
 
@@ -380,9 +399,10 @@ test('create: an id derived by crypto.js is accepted, and the cap comes from the
     await worker.stop();
   });
 
-  /* crypto.js hashes the code into 64 lowercase hex characters — not the 22-character shape the
-     ledger was specified against. A 400 here would mean the page's own group id is refused as
-     malformed, so this case pins that both shapes are accepted. */
+  /* crypto.js hashes the code into 64 lowercase hex characters. A 400 here would mean the page's
+     own group id is refused as malformed, so this case pins that the derived shape is accepted —
+     and the create and the destroy check the same shape, so it is also the shape the operator can
+     remove. */
   const derived = await groupIdFromCode(generateCode());
   assert.match(derived, /^[0-9a-f]{64}$/);
 
@@ -395,7 +415,7 @@ test('create: an id derived by crypto.js is accepted, and the cap comes from the
   assert.deepEqual(created.body, { ok: true });
 
   /* One slot, already taken: the cap is the number in the environment, not a constant. */
-  const limited = await createGroup(worker.baseUrl, createBody(id22()));
+  const limited = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
   assert.equal(limited.status, 429);
   assert.deepEqual(limited.body, { error: 'limit' });
 
@@ -458,7 +478,7 @@ test('create: a body over the cap is refused without a content-length to check',
   });
 
   /* Just over the 64 KiB cap, and sent chunked: no content-length header exists to read. */
-  const payload = JSON.stringify({ groupId: id22(), hostId: id22(), nameBlob: sealed(50_000) });
+  const payload = JSON.stringify({ groupId: groupFixtureId(), hostId: id22(), nameBlob: sealed(50_000) });
   assert.ok(payload.length > 64 * 1024, 'the fixture must exceed the cap');
 
   const response = await fetch(`${worker.baseUrl}${API}/create`, {
@@ -466,13 +486,13 @@ test('create: a body over the cap is refused without a content-length to check',
     headers: { 'content-type': 'application/json' },
     body: streamedJson(payload),
     duplex: 'half',
-    signal: AbortSignal.timeout(15_000)
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   });
   assert.equal(response.status, 400, 'the cap is on the bytes received, not on a header');
   assert.deepEqual(await response.json(), { error: 'body' });
 
   /* A refused body is not a create: the only slot is still free. */
-  const created = await createGroup(worker.baseUrl, createBody(id22()));
+  const created = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
   assert.equal(created.status, 200, 'an oversized body must not have taken the only slot');
   assert.deepEqual(created.body, { ok: true });
 });
@@ -487,7 +507,7 @@ test('create: the body cap is a threshold, not a wall', async (t) => {
   });
 
   /* About 120 KB: over the 64 KiB cap. */
-  const oversized = { ...createBody(id22()), nameBlob: sealed(90_000) };
+  const oversized = { ...createBody(groupFixtureId()), nameBlob: sealed(90_000) };
   const oversizedBytes = JSON.stringify(oversized).length;
   assert.ok(oversizedBytes > 64 * 1024, `the fixture must exceed the cap, got ${oversizedBytes} bytes`);
   const refused = await createGroup(worker.baseUrl, oversized);
@@ -496,7 +516,7 @@ test('create: the body cap is a threshold, not a wall', async (t) => {
 
   /* About 53 KB: a large but legal create, comfortably inside the cap. It must still get the
      slot, so the cap cannot be satisfied by refusing everything. */
-  const large = { ...createBody(id22()), nameBlob: sealed(40_000) };
+  const large = { ...createBody(groupFixtureId()), nameBlob: sealed(40_000) };
   const size = JSON.stringify(large).length;
   assert.ok(size > 32 * 1024 && size < 64 * 1024, `the fixture must sit under the cap, got ${size} bytes`);
   const accepted = await createGroup(worker.baseUrl, large);
@@ -504,7 +524,121 @@ test('create: the body cap is a threshold, not a wall', async (t) => {
   assert.deepEqual(accepted.body, { ok: true });
 
   /* The oversized body spent nothing and the legal one spent the one slot: hence the refusal. */
-  const next = await createGroup(worker.baseUrl, createBody(id22()));
+  const next = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
   assert.equal(next.status, 429, 'the refusal must not have taken a slot, and the acceptance must have');
   assert.deepEqual(next.body, { error: 'limit' });
+});
+
+/* ------------------------------------------------------------- the harness itself */
+
+/**
+ * A port another process holds: a real HTTP server that answers 503.
+ *
+ * Answering, rather than accepting and saying nothing, matters: a probe against a silent socket
+ * would hold one request open for the whole deadline and turn a three-second bind failure into a
+ * fifteen-second wait. This server is the other tenant the retry exists for.
+ */
+async function holdPort(t) {
+  const server = holdServer((request, response) => {
+    response.writeHead(503, { 'content-type': 'text/plain' });
+    response.end('held by the test\n');
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  return server.address().port;
+}
+
+/**
+ * A port nothing holds, asked for the way the harness asks for one: bind, read, close.
+ *
+ * Duplicated from tests/wrangler.mjs on purpose — the harness does not export its port chooser,
+ * and a test that had to reach inside it could not tell an injected port from a chosen one.
+ */
+async function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.unref();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+test('wrangler: a port another process holds is retried, and the result is only baseUrl and stop', async (t) => {
+  /* The first port is taken by a live server, so wrangler's own bind fails; the second is handed
+     in so the successful attempt's address is known in advance. Asserting on that address is what
+     makes the retry observable — a harness that ignored `ports` would pick a free port of its own,
+     boot, and pass every other assertion in this test. */
+  const occupied = await holdPort(t);
+  const next = await freePort();
+  const worker = await startWorker({ ports: [occupied, next] });
+  t.after(async () => {
+    await worker.stop();
+  });
+
+  assert.equal(
+    worker.baseUrl,
+    `http://127.0.0.1:${next}`,
+    'after a lost bind the next attempt must listen on the port it was handed'
+  );
+  assert.deepEqual(
+    Object.keys(worker).sort(),
+    ['baseUrl', 'stop'],
+    'the handle carries the address and the stopper, and nothing a caller could come to depend on'
+  );
+  const health = await fetch(`${worker.baseUrl}${API}/health`, {
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  });
+  assert.equal(health.status, 200, 'the worker behind the retried port must really answer');
+});
+
+test('wrangler: every attempt that loses its port reports the bind, not a health timeout', async (t) => {
+  const occupied = await holdPort(t);
+  /* Every attempt is handed the same held port, so none can succeed: this is the aggregate error
+     a caller sees when the retry budget runs out. */
+  await assert.rejects(
+    startWorker({ ports: Array(PORT_ATTEMPTS).fill(occupied), timeoutMs: 30_000 }),
+    (error) => {
+      assert.match(
+        error.message,
+        new RegExp(`could not bind port ${occupied}`),
+        'the failure must name the port that was lost'
+      );
+      assert.equal(typeof error.log, 'string', "the aggregate error must carry wrangler's log");
+      assert.match(error.log, /address already in use/i, "the log must be wrangler's own bind error");
+      assert.match(
+        error.message,
+        /address already in use/i,
+        'the bind must be in the message, not only in the attached log'
+      );
+      assert.doesNotMatch(
+        error.message,
+        /never answered/,
+        'a lost bind must never be reported as a start that did not answer'
+      );
+      return true;
+    }
+  );
+});
+
+test('wrangler: the recorded cold start leaves the health wait and every request room', () => {
+  /* Every deadline is a multiple of the recorded bound, so a boot that is slower than usual is a
+     slow test rather than a flake, and a bound quietly raised to meet a deadline fails here. */
+  assert.ok(COLD_START_UPPER_MS > 0, 'the cold start must have a recorded bound');
+  assert.ok(
+    DEFAULT_HEALTH_TIMEOUT_MS >= 10 * COLD_START_UPPER_MS,
+    `a ${DEFAULT_HEALTH_TIMEOUT_MS} ms health wait must leave ten cold starts of room`
+  );
+  assert.ok(
+    REQUEST_TIMEOUT_MS >= 2 * COLD_START_UPPER_MS,
+    `a ${REQUEST_TIMEOUT_MS} ms request must leave two cold starts of room`
+  );
 });

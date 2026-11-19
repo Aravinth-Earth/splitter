@@ -8,6 +8,9 @@
  * No imports and no build step: this file is served to the browser and imported by its tests.
  */
 
+/** The refusal a split with nothing above zero gets, whichever entry point reached it. */
+const NO_WEIGHTS = 'splitter: a split needs at least one weight above zero';
+
 /**
  * Validate the weights and return the entries that take part.
  *
@@ -32,7 +35,7 @@ function weighted(weights) {
   }
 
   if (entries.length === 0) {
-    throw new Error('splitter: a split needs at least one weight above zero');
+    throw new Error(NO_WEIGHTS);
   }
 
   return entries;
@@ -104,11 +107,12 @@ export function subset(totalPaise, memberIds) {
 }
 
 /**
- * Percentages, which must total 100 to one decimal place.
+ * Percentages, which must total 100.
  *
- * A member at 0 % is omitted from the answer rather than listed with zero. The total is rounded to
- * one decimal — the precision the sheet offers — so 99.9 % is refused while 100.0 % passes, which
- * is the refusal the story names.
+ * A member at 0 % is omitted from the answer rather than listed with zero. The total is compared
+ * with 100 without rounding, allowing only the error a double carries when tenths are added up, so
+ * a set that merely rounds to 100.0 — 99.96 % or 100.02 % — is refused rather than normalised over
+ * a total that is not 100.
  */
 export function percent(totalPaise, percentages) {
   if (percentages === null || typeof percentages !== 'object' || Array.isArray(percentages)) {
@@ -123,7 +127,11 @@ export function percent(totalPaise, percentages) {
     total += value;
   }
 
-  if (Math.round(total * 10) !== 1_000) {
+  if (total === 0) {
+    throw new Error(NO_WEIGHTS);
+  }
+
+  if (Math.abs(total - 100) > 1e-9) {
     throw new Error('splitter: percentages must total 100');
   }
 

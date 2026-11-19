@@ -19,8 +19,8 @@ export const JOIN_LIMIT = 12;
 export const JOIN_WINDOW_MS = 5 * 60 * 1000;
 
 /* How many groups one `/list` reads. Every read is a call into another Durable Object, so a page
-   costs the same whatever the ledger holds, and a full ledger is read over several requests
-   instead of one that cannot answer. */
+   costs the same whatever the ledger holds: `next` names the id to continue from, and a ledger
+   larger than one page is read over as many requests as it takes. */
 export const LIST_PAGE_LIMIT = 10;
 
 function json(body, status = 200, headers = {}) {
@@ -106,35 +106,50 @@ export class Registry {
   }
 
   /**
-   * Every live group the page covers, with the counters each one answers — read only.
+   * One page of the live groups, with the counters each one answers — read only.
    *
-   * The walk is `ORDER BY group_id LIMIT ?`: the order is the ledger's, so two calls over the same
-   * ledger answer the same page, and the bound is the SQL's, so no group past it is read at all.
+   * The walk is `WHERE group_id > ? ORDER BY group_id LIMIT ?`: `cursor` is the last id of the
+   * previous page (the empty string for the first one), so a page is decided by the ledger's own
+   * order and two callers with the same ledger and the same cursor read the same page. The bound
+   * is the SQL's, so no group past it is read at all; one row beyond the page is fetched to decide
+   * whether another page exists, and `next` is the id to ask with — `null` on the last page.
+   *
    * `total` is the whole ledger rather than the page, which is what lets a caller see that a page
-   * is a page.
+   * is a page and how many more there are.
    *
    * A group that cannot be read is listed as `readable: false` with no counters. It is never
    * answered as a group of zeroes: a slot with nothing behind it is the leak this listing exists
    * to make visible, and a zero would hide it.
    *
-   * @returns {Promise<{limit: number, total: number, groups: object[]}>}
+   * @returns {Promise<{limit: number, total: number, next: string|null, groups: object[]}>}
    */
-  async list() {
+  async list(cursor = '') {
+    const after = typeof cursor === 'string' ? cursor : '';
     const rows = this.ctx.storage.sql
-      .exec('SELECT group_id FROM slots ORDER BY group_id LIMIT ?', LIST_PAGE_LIMIT)
+      .exec(
+        'SELECT group_id FROM slots WHERE group_id > ? ORDER BY group_id LIMIT ?',
+        after,
+        LIST_PAGE_LIMIT + 1
+      )
       .toArray();
 
-    const groups = [];
-    for (const row of rows) {
-      const counters = await this.readCounters(row.group_id);
-      groups.push(
-        counters === null
-          ? { id: row.group_id, readable: false }
-          : { id: row.group_id, readable: true, ...counters }
-      );
-    }
+    const page = rows.slice(0, LIST_PAGE_LIMIT);
+    const next = rows.length > LIST_PAGE_LIMIT ? page[page.length - 1].group_id : null;
 
-    return { limit: LIST_PAGE_LIMIT, total: this.slotsHeld(), groups };
+    /* A page is at most `LIST_PAGE_LIMIT` groups, and they are asked together: the page costs one
+       round of calls rather than one call per row waited on in turn. `Promise.all` keeps the page's
+       order, and `readCounters` answers `null` instead of throwing, so a group that cannot be read
+       still lands where its row is. */
+    const groups = await Promise.all(
+      page.map(async (row) => {
+        const counters = await this.readCounters(row.group_id);
+        return counters === null
+          ? { id: row.group_id, readable: false }
+          : { id: row.group_id, readable: true, ...counters };
+      })
+    );
+
+    return { limit: LIST_PAGE_LIMIT, total: this.slotsHeld(), next, groups };
   }
 
   /**
@@ -195,9 +210,19 @@ export class Registry {
   /**
    * Drop a slot: the compensation for a create that reserved and then failed, and the hook destroy
    * and expiry hand a slot back through. A retry never calls it — an id that holds a slot keeps it.
+   *
+   * Answers the number of rows actually deleted, which is 1 or 0: the read and the delete are both
+   * synchronous, so nothing can take the row between them inside one Durable Object. A caller that
+   * reported "released" on the call arriving rather than on this number would announce a freed slot
+   * whose row is still there.
+   *
+   * @returns {number}
    */
   release(groupId) {
-    this.ctx.storage.sql.exec('DELETE FROM slots WHERE group_id = ?', groupId);
+    const sql = this.ctx.storage.sql;
+    if (sql.exec('SELECT 1 FROM slots WHERE group_id = ?', groupId).toArray().length === 0) return 0;
+    sql.exec('DELETE FROM slots WHERE group_id = ?', groupId);
+    return 1;
   }
 
   /** Drop counters outside the window; there is no alarm, so every read and write prunes first. */
@@ -233,11 +258,6 @@ export class Registry {
   }
 
   async fetch(request) {
-    if (request.method !== 'POST') {
-      /* RFC 9110: a 405 has to name the methods it does allow. */
-      return json({ error: 'method' }, 405, { allow: 'POST' });
-    }
-
     /* Compared whole, never by suffix: `/nope/release` ends in `/release`, and a suffix match would
        drop a slot for a caller that never asked to release one. Every internal call is written in
        this repo, so the set of paths is closed. */
@@ -248,13 +268,43 @@ export class Registry {
       return json({ error: 'not_found' }, 404);
     }
 
-    /* Read only: `/stats` and `/list` take no input and write nothing, so they are answered before
-       the body is parsed and a POST with an empty body is not a bad request. */
-    if (pathname === '/stats') return json(this.stats());
-    if (pathname === '/list') return json(await this.list());
+    /* `/stats` is the ledger's one read: GET, and it takes no input and writes nothing, so a write
+       method is refused before anything is parsed and the 405 names the method that works.
 
-    const body = await request.json().catch(() => null);
-    if (typeof body !== 'object' || body === null) return json({ error: 'bad_request' }, 400);
+       `/list` takes an optional cursor — the last id of the page before — so it reads its body
+       first: an absent body asks for the first page, and a body that is not a JSON object is a bad
+       request, not a page nobody asked for. */
+    if (pathname === '/stats') {
+      if (request.method !== 'GET') {
+        /* RFC 9110: a 405 has to name the methods it does allow. */
+        return json({ error: 'method' }, 405, { allow: 'GET' });
+      }
+      return json(this.stats());
+    }
+
+    if (request.method !== 'POST') {
+      /* RFC 9110: a 405 has to name the methods it does allow. */
+      return json({ error: 'method' }, 405, { allow: 'POST' });
+    }
+
+    const raw = await request.text().catch(() => '');
+    let body = {};
+    if (raw.trim() !== '') {
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return json({ error: 'bad_request' }, 400);
+      }
+    }
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      return json({ error: 'bad_request' }, 400);
+    }
+
+    if (pathname === '/list') {
+      const cursor = body.cursor ?? '';
+      if (typeof cursor !== 'string') return json({ error: 'bad_request' }, 400);
+      return json(await this.list(cursor));
+    }
 
     if (pathname === '/join-blocked' || pathname === '/join-failure') {
       if (typeof body.ip !== 'string' || body.ip === '' || body.ip.length > 64) {
@@ -268,7 +318,8 @@ export class Registry {
     if (typeof body.groupId !== 'string') return json({ error: 'bad_request' }, 400);
     if (pathname === '/reserve') return json(this.reserve(body.groupId));
 
-    this.release(body.groupId);
-    return json({ ok: true });
+    /* `freed` is the number of rows this call deleted, so a caller can tell a slot that came back
+       from a release that arrived for a slot nobody was holding. */
+    return json({ ok: true, freed: this.release(body.groupId) });
   }
 }

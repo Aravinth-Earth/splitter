@@ -15,9 +15,12 @@
  * Storage is the key-value API on a SQLite-backed namespace: one key per record, so a later write
  * to a record cannot rewrite its neighbours, and the meta is written once.
  *
- * Destroy is the operator's one call out, and it runs in a fixed order: every socket, then every
- * key with the meta last, then the Registry slot. The order is the guarantee — a wipe that dies
- * part-way leaves a group that still exists, holding the slot the ledger still counts for it.
+ * Destroy is the operator's one call out, and the host's end is the same act from a socket: both run
+ * in one fixed order — every key with the meta last, then every socket, then the Registry slot. The
+ * order is the guarantee: a wipe that dies part-way leaves a group that still exists, holding the
+ * slot the ledger still counts for it, and its sockets are told the wipe failed rather than that the
+ * group ended. The group is marked as wiping before the first key goes, so a write that arrives
+ * while the wipe is running is refused instead of being stored behind it.
  */
 
 /* The shapes the edge also checks. Validating here again is not belt and braces: this is the write
@@ -33,8 +36,21 @@ const RECORD_PREFIX = 'record:';
    therefore stamp it with a blind put, and cannot clobber a join mode a host changed a moment
    earlier between this write's read and its write of the meta. */
 const LAST_WRITE_KEY = 'last-write';
+/* The id the Registry slot was taken under, in its own key rather than in the meta. The meta is the
+   key a wipe removes last and the key that makes the group exist, so a destroy that wiped the group
+   and then failed to free the slot would otherwise lose the only record of which slot to retry. */
+const SLOT_KEY = 'slot';
+/* The running total of record bytes and record keys, kept in its own key rather than in the meta: a
+   write moves it in one small read-and-put, so nothing there can write a meta read back stale.
+   Reading the total is what keeps `/counters` from walking every `record:` key, and the value is
+   repaired from the records when a group predates the key. */
+const TOTALS_KEY = 'totals';
 const DEFAULT_MAX_MEMBERS = 20;
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
+/* A socket is only here while it is speaking: the heartbeat re-announces the present set, and a
+   socket that has been quiet for longer than this is no longer in it. */
+const DEFAULT_SILENCE_MS = 90_000;
+const DEFAULT_HEARTBEAT_MS = 30_000;
 const MAX_RECORD_BYTES = 64 * 1024;
 
 const encoder = new TextEncoder();
@@ -72,9 +88,19 @@ export class Group {
        ever waiting on the connection. */
     this.sockets = new Set();
     this.identities = new Map();
+    /* When each socket last sent a frame. Freshness is per socket, not per member: two tabs of one
+       person each have to keep themselves alive, and the person is here while either of them is. */
+    this.lastSeen = new Map();
+    /* The one presence timer. It is a self-scheduling timeout rather than an interval so it can
+       wake at the next beat or at the first socket's silence deadline, whichever is sooner. */
+    this.heartbeatTimer = null;
+    this.beatAt = null;
     /* The source address for the throttle, captured from Cloudflare at the upgrade and never from
        a field a client sends. One row per socket, because one DO can hold several sources. */
     this.clientIps = new Map();
+    /* The running total of record bytes is a read, a move and a write; this queue is what stops two
+       writes accepted in the same window from reading the same baseline and losing one of them. */
+    this.totalsChain = Promise.resolve();
   }
 
   /**
@@ -106,6 +132,10 @@ export class Group {
     const existing = await this.ctx.storage.get(GROUP_KEY);
     if (existing) return { ok: true, created: false };
 
+    /* The slot is written first and only once: a retried create finds the meta and returns above,
+       so the id the ledger was asked for cannot be rewritten by a second caller. */
+    if (isId(groupId)) await this.ctx.storage.put(SLOT_KEY, groupId);
+
     await this.ctx.storage.put(GROUP_KEY, {
       groupId: isId(groupId) ? groupId : null,
       hostId,
@@ -136,6 +166,18 @@ export class Group {
     return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_AUTH_TIMEOUT_MS;
   }
 
+  /** How long a socket may stay quiet before it is no longer counted as here. */
+  presenceSilenceMs() {
+    const configured = Number(this.env?.SILENCE_MS);
+    return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_SILENCE_MS;
+  }
+
+  /** How often presence is re-sent when nothing about the present set changed. */
+  heartbeatMs() {
+    const configured = Number(this.env?.HEARTBEAT_MS);
+    return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_HEARTBEAT_MS;
+  }
+
   async fetch(request) {
     const { pathname } = new URL(request.url);
 
@@ -160,8 +202,9 @@ export class Group {
        route. Every internal call is written in this repo, so the set of paths is closed. */
     /* A group's own removal, called by the Worker on the operator surface. The body is ignored:
        the instance is the subject, so there is nothing to validate and nothing a caller could
-       point it at. A wipe that failed is a 500; a slot the Registry did not take back is a 502,
-       because the group is gone but the ledger still holds a row for it. */
+       point it at. A wipe that failed is a 500; a group that is gone but whose bookkeeping did not
+       finish — a slot the Registry did not take back, an id that could not be cleared — is a 502,
+       because the group is gone and the ledger's side of it is not clean. */
     if (pathname === '/destroy') {
       const destroyed = await this.destroy();
       return json(destroyed, destroyed.ok ? 200 : destroyed.destroyed ? 502 : 500);
@@ -182,9 +225,11 @@ export class Group {
    * What this group holds, as counts: no name, no amount, no code.
    *
    * `records` is how many record keys are stored and `bytes` the UTF-8 size of their stored values,
-   * tombstones included — the same shape the write cap is measured on. Both times are `null` when
-   * this group predates them: a group created before they were stamped has no creation time to
-   * report, and a made-up one would be a claim the storage cannot support.
+   * tombstones included — the same shape the write cap is measured on. Both are answered from the
+   * running total the group keeps beside its records, so a read costs one small key instead of the
+   * whole ledger. Both times are `null` when this group predates them: a group created before they
+   * were stamped has no creation time to report, and a made-up one would be a claim the storage
+   * cannot support.
    *
    * @returns {Promise<null | {createdAt: number|null, lastWriteAt: number|null, records: number, bytes: number}>}
    */
@@ -193,16 +238,42 @@ export class Group {
     if (!meta) return null;
 
     const lastWrite = await this.ctx.storage.get(LAST_WRITE_KEY);
-    const records = await this.ctx.storage.list({ prefix: RECORD_PREFIX });
-    let bytes = 0;
-    for (const [, record] of records) bytes += storedBytes(record);
+    const totals = await this.recordTotals();
 
     return {
       createdAt: Number.isSafeInteger(meta.createdAt) ? meta.createdAt : null,
       lastWriteAt: Number.isSafeInteger(lastWrite?.at) ? lastWrite.at : null,
-      records: records.size,
-      bytes
+      records: totals.records,
+      bytes: totals.bytes
     };
+  }
+
+  /**
+   * The running total of record keys and their stored bytes.
+   *
+   * A group created before the total existed has no key to read, and neither has one whose wipe died
+   * part-way and took the key with it. Both are repaired here by summing the records once — the same
+   * sum `counters` used to do on every read — and, on the read route, the answer is stored so the
+   * next read is one key. A stored total that is not the shape this file writes is treated the same
+   * way as an absent one, because a value nobody can read is no better than no value.
+   *
+   * `backfill` is how the write route asks for the baseline without storing it: the total there is
+   * written once the write has been accepted, so a write refused during a wipe leaves no key behind.
+   *
+   * @returns {Promise<{records: number, bytes: number}>}
+   */
+  async recordTotals({ backfill = true } = {}) {
+    const stored = await this.ctx.storage.get(TOTALS_KEY);
+    if (stored && Number.isSafeInteger(stored.records) && Number.isSafeInteger(stored.bytes)) {
+      return { records: stored.records, bytes: stored.bytes };
+    }
+
+    const records = await this.ctx.storage.list({ prefix: RECORD_PREFIX });
+    let bytes = 0;
+    for (const [, record] of records) bytes += storedBytes(record);
+    const totals = { records: records.size, bytes };
+    if (backfill) await this.ctx.storage.put(TOTALS_KEY, totals);
+    return totals;
   }
 
   /**
@@ -244,17 +315,11 @@ export class Group {
     server.addEventListener('message', (event) => {
       this.handleMessage(server, event.data).catch(() => this.rejectSocket(server, 'server'));
     });
-    server.addEventListener('close', () => {
-      this.identities.delete(server);
-      this.clientIps.delete(server);
-      this.sockets.delete(server);
-      this.broadcastPresence();
+    server.addEventListener('close', async () => {
+      await this.socketGone(server);
     });
-    server.addEventListener('error', () => {
-      this.identities.delete(server);
-      this.clientIps.delete(server);
-      this.sockets.delete(server);
-      this.broadcastPresence();
+    server.addEventListener('error', async () => {
+      await this.socketGone(server);
     });
 
     /* A socket that never introduces itself is closed, not left open as an anonymous reader. The
@@ -283,6 +348,13 @@ export class Group {
       this.rejectSocket(socket, 'auth');
       return;
     }
+
+    /* Any frame from an authenticated socket is the socket speaking, so it is here: freshness is
+       refreshed before the frame is handled, and a second tab speaking on its own keeps the member
+       in presence just as their first tab would. Unknown frame types count too — they are still a
+       live connection — and a ping is therefore enough to stay here. */
+    this.lastSeen.set(socket, Date.now());
+    this.scheduleHeartbeat();
 
     try {
       if (this.identities.has(socket)) {
@@ -334,6 +406,10 @@ export class Group {
     const identity = this.identities.get(socket);
     if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
 
+    /* The same rule as a record write: a group that is being wiped takes no host decisions either,
+       or an approval arriving behind the wipe would leave a member entry in it. */
+    if (meta.wiping === true) return this.sendRefusal(socket, 'wiping');
+
     if (frame.t === 'mode') {
       if (frame.mode !== 'open' && frame.mode !== 'approval') {
         this.sendRefusal(socket, 'bad_mode');
@@ -361,7 +437,7 @@ export class Group {
       await this.ctx.storage.put(key, { ...entry, status: 'removed' });
       const handled = await this.notifyMember(meta, frame.memberId, 'removed');
       await this.notifyState(meta, handled);
-      this.broadcastPresence();
+      await this.broadcastPresence();
       return;
     }
 
@@ -383,7 +459,7 @@ export class Group {
       frame.t === 'approve' ? 'approved' : 'declined'
     );
     await this.notifyState(meta, handled);
-    this.broadcastPresence();
+    await this.broadcastPresence();
   }
 
   /**
@@ -396,6 +472,7 @@ export class Group {
   async importMembers(socket, frame) {
     const meta = await this.ctx.storage.get(GROUP_KEY);
     if (!meta) return this.refuse(socket, 'unknown_group');
+    if (meta.wiping === true) return this.sendRefusal(socket, 'wiping');
 
     const identity = this.identities.get(socket);
     if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
@@ -460,6 +537,7 @@ export class Group {
 
     const identity = this.identities.get(socket);
     if (!identity) return this.refuse(socket, 'unapproved');
+    if (meta.wiping === true) return this.sendRefusal(socket, 'wiping');
     if (identity.memberId === meta.hostId) {
       this.sendRefusal(socket, 'host_must_end');
       return;
@@ -473,9 +551,13 @@ export class Group {
     }
 
     await this.ctx.storage.put(key, { ...entry, status: 'left' });
+    /* Left is not attached: the row is no longer approved, and the socket that said so goes with
+       it. Their other tab is still attached, and presence has to stop naming them anyway. */
+    this.forget(socket);
     this.sendFrame(socket, { t: 'left' });
     await this.notifyState(meta, new Set([socket]));
-    this.broadcastPresence();
+    await this.broadcastPresence();
+    this.scheduleHeartbeat();
     try {
       socket.close(1000, 'left');
     } catch {
@@ -484,8 +566,16 @@ export class Group {
   }
 
   /**
-   * The host ends the group. Every socket is told once, then the storage and the Registry slot go.
-   * A device that never reconnects keeps its own copy; the client clears it on the next contact.
+   * The host ends the group: the same act as `destroy`, so the same fixed order and the same slot.
+   *
+   * The wipe goes first, then the sockets, then the slot the create persisted. Sending `ended` on
+   * the way in would tell every client the group ended while its meta and records were still
+   * stored, and a wipe that then failed would leave a group that exists with clients who believe it
+   * does not. A wipe that fails sends `wipe-failed` and leaves the sockets attached, because the
+   * group they are attached to is still there.
+   *
+   * The slot is named by the id the create persisted, never by this instance: a release that used
+   * the Durable Object's own id names a row this group never held.
    */
   async end(socket) {
     const meta = await this.ctx.storage.get(GROUP_KEY);
@@ -494,22 +584,43 @@ export class Group {
     const identity = this.identities.get(socket);
     if (identity?.memberId !== meta.hostId) return this.refuse(socket, 'not_host');
 
+    const slot = await this.persistedSlot(meta);
+
+    try {
+      await this.wipe();
+    } catch {
+      this.notifyWipeFailed();
+      return;
+    }
+
     this.closeAll();
 
-    await this.ctx.storage.deleteAll();
-    await this.callRegistry('/release', { groupId: meta.groupId ?? this.ctx.id.toString() }).catch(() => {
-      /* the slot is a reconciliation problem, not a reason to keep the group alive */
-    });
+    if (slot === null) return;
+    /* The wipe is already done, so a release the Registry refused is not a reason to keep anything
+       alive: the slot id stays, which is what lets the operator's destroy finish the release. */
+    if ((await this.releaseSlot(slot)) === 'refused') return;
+    /* The sockets were told the group ended a moment ago, so there is no caller left to report a
+       slot key that will not go: the row is free either way, and a later destroy finds the ledger
+       row already gone and clears the key then. */
+    await this.ctx.storage.delete(SLOT_KEY).catch(() => {});
   }
 
   /**
-   * Take this group off the air in one call: sockets, then storage, then the slot.
+   * Take this group off the air in one call: storage, then sockets, then the slot.
    *
-   * The order is the release-critical part. The Registry is told the slot is free only after every
-   * key is gone, so a wipe that dies part-way leaves a group that still exists, holding the slot
-   * the ledger still believes it holds — a state a caller can see and a retry can finish. A release
-   * the Registry refuses is answered with `released: false` rather than a claim the slot is free,
-   * because the ledger's row is the only truth about it.
+   * The order is the release-critical part. Every key goes first, so a wipe that dies part-way
+   * leaves a group that still exists, holding the slot the ledger still believes it holds — a state
+   * a caller can see and a retry can finish. The sockets are told only once the wipe has finished:
+   * `ended` is the frame that says the data is gone, and sending it before the rows were removed
+   * told every client the group ended while its records were still stored. A wipe that fails sends
+   * `wipe-failed` instead and leaves the sockets open, because the group they are attached to still
+   * exists.
+   *
+   * The slot is named by the id the create persisted, never derived from this instance: a retry
+   * after a wipe found no meta would otherwise resolve a slot the group never held. A release the
+   * Registry did not actually free a row for is answered `released: false` rather than a claim the
+   * slot is free, because the ledger's row is the only truth about it — and a ledger that answers
+   * `freed: 0` is a row that is already gone, which is a finished destroy, not a stuck one.
    *
    * There is no caller-side identity check: this route is reached by the Worker, not by a browser
    * socket, and the Worker is the only thing that can name this instance.
@@ -517,26 +628,55 @@ export class Group {
    * @returns {Promise<{ok: boolean, destroyed: boolean, released: boolean, closed: number, error?: string}>}
    */
   async destroy() {
+    /* Read before the wipe: it is the wipe that removes the meta, and a retried destroy has only
+       the persisted slot id to go on. */
     const meta = await this.ctx.storage.get(GROUP_KEY);
-    const closed = this.closeAll();
+    const slot = await this.persistedSlot(meta);
 
     try {
       await this.wipe();
     } catch {
-      return { ok: false, destroyed: false, released: false, closed, error: 'storage' };
+      this.notifyWipeFailed();
+      return { ok: false, destroyed: false, released: false, closed: 0, error: 'storage' };
     }
 
-    /* The id the slot was reserved under, then the DO's own name as the last resort: a group
-       written before `groupId` was stored still holds a slot under the name it was created with. */
-    const slot = meta?.groupId ?? this.ctx.id?.toString?.() ?? null;
-    if (typeof slot !== 'string' || slot === '') {
+    const closed = this.closeAll();
+
+    if (slot === null) {
       /* Nothing here ever held a slot, so there is none to give back. */
       return { ok: true, destroyed: true, released: false, closed };
     }
-    if (!(await this.releaseSlot(slot))) {
+    const outcome = await this.releaseSlot(slot);
+    if (outcome === 'refused') {
+      /* A genuine refusal: the ledger may still hold the row, so the id that names it stays and a
+         retry can still clear it. */
       return { ok: false, destroyed: true, released: false, closed, error: 'release' };
     }
-    return { ok: true, destroyed: true, released: true, closed };
+    /* The slot is free — deleted by this call, or already gone — so the id that named it is no
+       longer worth keeping, and a retry has nothing left to free. A storage that refuses this
+       delete therefore changes nothing about the group: it is wiped and its sockets are closed, so
+       the answer reports that, the ledger's own count, and the one key that stayed. */
+    try {
+      await this.ctx.storage.delete(SLOT_KEY);
+    } catch {
+      return { ok: false, destroyed: true, released: outcome === 'freed', closed, error: 'slot' };
+    }
+    return { ok: true, destroyed: true, released: outcome === 'freed', closed };
+  }
+
+  /**
+   * The Registry slot id this group was created under, or `null` when it never held one.
+   *
+   * The persisted key is read first, because the wipe removes the meta and a retried destroy has
+   * only that key to go on; a group written before the key existed kept the id in its meta. This
+   * instance's own id is never a candidate: it names a Durable Object, not a row in the ledger.
+   *
+   * @returns {Promise<string|null>}
+   */
+  async persistedSlot(meta) {
+    const storedSlot = await this.ctx.storage.get(SLOT_KEY);
+    if (typeof storedSlot === 'string') return storedSlot;
+    return isId(meta?.groupId) ? meta.groupId : null;
   }
 
   /**
@@ -546,19 +686,67 @@ export class Group {
    * leaves a group that is still there — and still holds its slot — instead of a half-group whose
    * ledger entry has already been handed back. Deleting key by key rather than with `deleteAll` is
    * what makes that ordering possible.
+   *
+   * The group is marked as wiping in the meta before the first key goes, and every write reads that
+   * mark: a frame already in flight when the host ended the group — a put, a join, an approval —
+   * is refused for the whole duration of the wipe instead of being stored behind it. The mark lives
+   * in the meta, the key that goes last, so it is still there when the wipe is half done, and it is
+   * removed again when the wipe fails: a group whose sockets were told it still exists must still
+   * take writes.
+   *
+   * A write that had already read the meta before the mark was set is the one case the read alone
+   * cannot catch, so such a write reads the meta again after storing its record and removes the
+   * record it just wrote: the window between a write's read and its put cannot leave a record in a
+   * group the wipe has already listed.
+   *
+   * The slot id is the one key the wipe leaves: it is what a destroy that could not free the slot
+   * needs on its retry, and it is removed by `destroy` once the release has actually freed a row.
    */
   async wipe() {
-    const keys = [...(await this.ctx.storage.list()).keys()];
-    const ordered = keys.filter((key) => key !== GROUP_KEY);
-    if (keys.includes(GROUP_KEY)) ordered.push(GROUP_KEY);
-    for (const key of ordered) await this.ctx.storage.delete(key);
-    /* No alarm is set anywhere in this Worker today; the guard is what keeps this call true if one
-       is ever added, instead of an unconditional call that would throw on a storage without it. */
-    if (typeof this.ctx.storage.deleteAlarm === 'function') await this.ctx.storage.deleteAlarm();
+    try {
+      const meta = await this.ctx.storage.get(GROUP_KEY);
+      if (meta) await this.ctx.storage.put(GROUP_KEY, { ...meta, wiping: true });
+
+      const keys = [...(await this.ctx.storage.list()).keys()];
+      const ordered = keys.filter((key) => key !== GROUP_KEY && key !== SLOT_KEY);
+      if (keys.includes(GROUP_KEY)) ordered.push(GROUP_KEY);
+      for (const key of ordered) await this.ctx.storage.delete(key);
+      /* No alarm is set anywhere in this Worker today; the guard is what keeps this call true if
+         one is ever added, instead of an unconditional call that would throw on a storage without
+         it. */
+      if (typeof this.ctx.storage.deleteAlarm === 'function') await this.ctx.storage.deleteAlarm();
+    } catch (error) {
+      /* The wipe stopped part-way, so the mark has to come off again. The failing storage is the
+         failure the caller reports; a clear that could not be written leaves the group marked, and
+         a retry of the wipe is what finishes it. */
+      await this.clearWipeMark().catch(() => {});
+      throw error;
+    }
   }
 
-  /** Tell every attached socket the group is gone, close it, forget it; answer how many there were. */
+  /**
+   * Take the wiping mark off a group whose wipe did not finish.
+   *
+   * The meta is read again rather than rewritten from the copy the wipe held: a join mode changed
+   * between the two would otherwise be undone by taking the mark off. A meta that is already gone
+   * needs nothing — the group does not exist to write to.
+   */
+  async clearWipeMark() {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta || meta.wiping !== true) return;
+    const cleared = { ...meta };
+    delete cleared.wiping;
+    await this.ctx.storage.put(GROUP_KEY, cleared);
+  }
+
+  /**
+   * Tell every attached socket the group is gone, close it, forget it; answer how many there were.
+   *
+   * The presence timer goes first: a group that has ended has no present set to announce, and a
+   * wake that fired after the wipe would tell sockets about a group that no longer exists.
+   */
   closeAll() {
+    this.stopHeartbeat();
     let closed = 0;
     for (const socket of this.sockets) {
       this.sendFrame(socket, { t: 'ended' });
@@ -571,16 +759,32 @@ export class Group {
     }
     this.sockets.clear();
     this.identities.clear();
+    this.lastSeen.clear();
     this.clientIps.clear();
     return closed;
   }
 
   /**
-   * Ask the Registry to drop the slot, and say whether it actually did.
+   * Tell every attached socket that the wipe failed, and leave all of them open.
    *
-   * `false` covers a refusal, a non-200 and an unreachable Registry alike: from here they are one
-   * answer — the slot is not known to be free — and reporting otherwise would tell the operator a
-   * slot came back that the ledger still holds.
+   * The group still exists — the wipe stopped before the meta — so the sockets still have a group
+   * to talk to. `ended` is not sent: it is the frame that says the data is gone, and sending it
+   * while the rows were still stored is the one lie this path must not tell.
+   */
+  notifyWipeFailed() {
+    for (const socket of this.sockets) this.sendFrame(socket, { t: 'wipe-failed' });
+  }
+
+  /**
+   * Ask the Registry to drop the slot, and say what its answer means.
+   *
+   * `freed` is what the ledger deleted, so `ok: true` alone is not the answer. Three outcomes:
+   * `freed` when a row went, `absent` when the ledger answered `ok: true, freed: 0` — the row is
+   * already gone, which is what a compensated or lost create leaves, and no retry could ever clear
+   * it — and `refused` for everything else: a non-200, an unreachable Registry or a body that is
+   * not the shape this call documents. Only `refused` means the ledger may still hold the row.
+   *
+   * @returns {Promise<'freed'|'absent'|'refused'>}
    */
   async releaseSlot(groupId) {
     try {
@@ -589,27 +793,53 @@ export class Group {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ groupId })
       });
-      if (!response.ok) return false;
+      if (!response.ok) return 'refused';
       const body = await response.json().catch(() => null);
-      return body?.ok === true;
+      if (body?.ok !== true || !Number.isSafeInteger(body.freed)) return 'refused';
+      return body.freed > 0 ? 'freed' : 'absent';
     } catch {
-      return false;
+      return 'refused';
     }
   }
 
-  /** One frame per change: the member ids with an approved socket right now. Ids only. */
-  presenceFrame() {
-    const here = new Set();
+  /**
+   * The presence frame: who is here, as ids and nothing else.
+   *
+   * The set is the approved roster intersected with the sockets that are still speaking. The
+   * roster read is what makes a member who left (or was removed) absent even while their other
+   * tab is still attached — their row is no longer approved — and the per-socket freshness is
+   * what makes a member absent once their last tab stops speaking, without a close. Two sockets
+   * for one member are one id: the ids are a Set.
+   *
+   * @returns {Promise<{t: 'here', ids: string[]}>}
+   */
+  async presenceFrame() {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    const approved = new Set();
+    if (meta) {
+      approved.add(meta.hostId);
+      for (const [key, entry] of await this.members()) {
+        if (entry?.status === 'approved') approved.add(key.slice(MEMBER_PREFIX.length));
+      }
+    }
+
+    const now = Date.now();
+    const silence = this.presenceSilenceMs();
+    const ids = new Set();
     for (const socket of this.sockets) {
       const identity = this.identities.get(socket);
-      if (!identity) continue;
-      if (identity.role === 'host' || identity.role === 'member') here.add(identity.memberId);
+      if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
+      if (!approved.has(identity.memberId)) continue;
+      const seen = this.lastSeen.get(socket);
+      if (!Number.isFinite(seen) || seen <= now - silence) continue;
+      ids.add(identity.memberId);
     }
-    return { t: 'presence', here: [...here] };
+    return { t: 'here', ids: [...ids] };
   }
 
-  broadcastPresence() {
-    const frame = JSON.stringify(this.presenceFrame());
+  /** One frame per change and per beat: the same shape, to every socket that may see it. */
+  async broadcastPresence() {
+    const frame = JSON.stringify(await this.presenceFrame());
     for (const socket of this.sockets) {
       const identity = this.identities.get(socket);
       if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
@@ -619,6 +849,81 @@ export class Group {
         /* a socket that is already gone is not a reason to stop telling the others */
       }
     }
+  }
+
+  /**
+   * Schedule the next presence wake.
+   *
+   * The timer is what tells the others that a socket has gone quiet, because nothing else happens
+   * when silence begins. It wakes at the next beat, or at the first present socket's silence
+   * deadline when that is sooner, so a departure is announced as it happens rather than at the end
+   * of a beat interval. The beat clock is kept apart from the deadline (`beatAt`): a frame arriving
+   * sooner only shortens this wait, it never postpones the beat, so steady traffic cannot starve
+   * the heartbeat. One timer per instance — rescheduling replaces it, never adds a second.
+   */
+  scheduleHeartbeat() {
+    if (this.heartbeatTimer !== null) clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+
+    if (this.sockets.size === 0) {
+      this.beatAt = null;
+      return;
+    }
+
+    const now = Date.now();
+    if (!Number.isFinite(this.beatAt) || this.beatAt <= now) this.beatAt = now + this.heartbeatMs();
+
+    const silence = this.presenceSilenceMs();
+    let wakeAt = this.beatAt;
+    for (const socket of this.sockets) {
+      const identity = this.identities.get(socket);
+      if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
+      const seen = this.lastSeen.get(socket);
+      if (!Number.isFinite(seen)) continue;
+      /* A millisecond past the deadline: waking at the instant itself could still see the socket
+         inside its window, and the next wake after that would be a whole beat away. */
+      const deadline = seen + silence + 1;
+      if (deadline > now && deadline < wakeAt) wakeAt = deadline;
+    }
+
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = null;
+      if (this.sockets.size === 0) {
+        this.beatAt = null;
+        return;
+      }
+      /* A wake at a silence deadline is not a beat, so the beat clock survives it. */
+      if (Date.now() >= this.beatAt) this.beatAt = null;
+      this.broadcastPresence()
+        .catch(() => {})
+        .finally(() => this.scheduleHeartbeat());
+    }, Math.max(1, wakeAt - now));
+  }
+
+  /** Stop the presence timer: a group with no sockets has nothing to announce. */
+  stopHeartbeat() {
+    if (this.heartbeatTimer !== null) clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+    this.beatAt = null;
+  }
+
+  /**
+   * Drop a socket's identity and freshness: on close, error, leave, removal and decline.
+   *
+   * Its source address goes with it, so a reconnect is counted as the new socket it is.
+   */
+  forget(socket) {
+    this.identities.delete(socket);
+    this.lastSeen.delete(socket);
+    this.clientIps.delete(socket);
+    this.sockets.delete(socket);
+  }
+
+  /** A socket left for any reason: forget it, tell whoever is left, and re-arm the timer. */
+  async socketGone(socket) {
+    this.forget(socket);
+    await this.broadcastPresence().catch(() => {});
+    this.scheduleHeartbeat();
   }
 
   /** A decision reaches the person waiting, if they still have a socket. */
@@ -643,6 +948,9 @@ export class Group {
       } catch {
         /* already gone */
       }
+      /* The decision is final for this socket: removed or declined, its identity goes, so no beat
+         can name it again while the close is still in flight. */
+      this.forget(socket);
     }
     return handled;
   }
@@ -660,11 +968,19 @@ export class Group {
       this.rejectSocket(socket, 'unknown_group');
       return;
     }
+    /* A group in the middle of its wipe takes no joins: the member entry a join writes would
+       otherwise be stored after the wipe read its key set. The socket is refused, not closed, so a
+       wipe that then fails leaves it attached to a group that still exists. */
+    if (meta.wiping === true) {
+      this.sendRefusal(socket, 'wiping');
+      return;
+    }
 
     if (frame.id === meta.hostId) {
       this.identities.set(socket, { memberId: frame.id, role: 'host' });
       socket.send(JSON.stringify(await this.rosterFrame(meta, frame.id, 'host')));
-      this.broadcastPresence();
+      await this.broadcastPresence();
+      this.scheduleHeartbeat();
       return;
     }
 
@@ -673,12 +989,14 @@ export class Group {
       if (entry.status === 'approved') {
         this.identities.set(socket, { memberId: frame.id, role: 'member' });
         socket.send(JSON.stringify(await this.rosterFrame(meta, frame.id, 'member')));
-        this.broadcastPresence();
+        await this.broadcastPresence();
+        this.scheduleHeartbeat();
         return;
       }
       if (entry.status === 'pending') {
         this.identities.set(socket, { memberId: frame.id, role: 'pending' });
         socket.send(JSON.stringify({ t: 'waiting', memberId: frame.id }));
+        this.scheduleHeartbeat();
         return;
       }
       this.rejectSocket(socket, 'removed');
@@ -738,7 +1056,8 @@ export class Group {
         })
       );
       await this.notifyState(meta, new Set([socket]));
-      this.broadcastPresence();
+      await this.broadcastPresence();
+      this.scheduleHeartbeat();
       return;
     }
 
@@ -751,6 +1070,7 @@ export class Group {
     this.identities.set(socket, { memberId: frame.id, role: 'pending' });
     socket.send(JSON.stringify({ t: 'waiting', memberId: frame.id }));
     await this.notifyHosts(meta);
+    this.scheduleHeartbeat();
   }
 
   /**
@@ -793,6 +1113,34 @@ export class Group {
       return;
     }
 
+    /* The group's own state is read before every accepted write, unlike the blind stamp below: a
+       group that is being wiped takes no records. A frame already in flight when the host ended the
+       group would otherwise be stored after the wipe read its key set, leaving a record and its
+       stamp behind in a group the wipe then reported as gone. The read is not written back, so
+       nothing here can put a stale meta in place of a join mode changed a moment earlier. */
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    if (!meta) {
+      this.sendFrame(socket, { t: 'refused', code: 'unknown_group', id: frame.id });
+      return;
+    }
+    if (meta.wiping === true) {
+      this.sendFrame(socket, { t: 'refused', code: 'wiping', id: frame.id });
+      return;
+    }
+
+    /* The socket's role was decided when it authenticated; the roster row is what decides it now.
+       A member who left or was removed is no longer approved, and their other tab is still holding
+       a socket that authenticated as a member — so the row is read before every accepted write,
+       and a write from a seat that is no longer approved is refused instead of stored and
+       broadcast. The host has no roster row: the meta names it. */
+    if (identity.memberId !== meta.hostId) {
+      const sender = await this.ctx.storage.get(memberKey(identity.memberId));
+      if (!sender || sender.status !== 'approved') {
+        this.sendFrame(socket, { t: 'refused', code: 'unapproved', id: frame.id });
+        return;
+      }
+    }
+
     const key = recordKey(frame.id);
     const existing = await this.ctx.storage.get(key);
     if (existing?.deleted) {
@@ -820,12 +1168,57 @@ export class Group {
       at: Date.now()
     };
 
-    await this.ctx.storage.put(key, record);
+    /* The record and the total that counts it are one change: the total is read, moved and written
+       in the queue, and the record is stored between the read and the write so the baseline is the
+       ledger as it stood before it. A Durable Object interleaves requests at every await, and two
+       writes accepted a moment apart would otherwise read the same baseline and drop each other's
+       bytes; queued, each sees the total the one before it left. The value is replaced rather than
+       added to when the key was already there, so a revision moves the bytes by the difference. */
+    await this.moveTotals(async () => {
+      const totals = await this.recordTotals({ backfill: false });
+      const prior = await this.ctx.storage.get(key);
+      await this.ctx.storage.put(key, record);
+      await this.ctx.storage.put(TOTALS_KEY, {
+        records: totals.records + (prior ? 0 : 1),
+        bytes: totals.bytes + storedBytes(record) - (prior ? storedBytes(prior) : 0)
+      });
+    });
+    /* The meta above was read before this write, so a wipe that set its mark in between listed its
+       keys without this record in them, and the record would outlive a wipe that reported success.
+       Read it again: a group that is being wiped now removes the record this write has just stored
+       and refuses it, so nothing is stored behind the wipe whatever order the two arrive in. The
+       stamp is not written in that case, for the same reason. */
+    const current = await this.ctx.storage.get(GROUP_KEY);
+    if (current?.wiping === true) {
+      /* The record goes, and the total that counted it goes with it: a group that is being wiped
+         takes no new key, and a total left behind would be a counter for records that are gone. A
+         wipe that then fails leaves a group with no total, which the next counters read repairs. */
+      await this.moveTotals(async () => {
+        await this.ctx.storage.delete(key);
+        await this.ctx.storage.delete(TOTALS_KEY);
+      });
+      this.sendFrame(socket, { t: 'refused', code: 'wiping', id: frame.id });
+      return;
+    }
     /* A blind put of the time alone: nothing here read the meta, so nothing here can write one back
        stale. A write rejected above never reaches this line, so the time is the last *accepted*
        write. */
     await this.ctx.storage.put(LAST_WRITE_KEY, { at: record.at });
     await this.broadcastRecord(record);
+  }
+
+  /**
+   * Run one change to the running total after the one before it has finished.
+   *
+   * The total is a read, a move and a write, and the Durable Object lets a second request in at
+   * every await: queued here, two accepted writes cannot both read the same baseline and lose one
+   * of them. A change that throws is skipped over by the next, so a storage fault costs one update
+   * and never wedges the queue.
+   */
+  moveTotals(change) {
+    const run = this.totalsChain.then(change);
+    this.totalsChain = run.catch(() => {});
+    return run;
   }
 
   /** Every accepted write reaches every approved socket, including the author's other tabs. */
@@ -878,8 +1271,15 @@ export class Group {
   /**
    * The frame a role may see: the host sees pending names because it must decide; an approved
    * member sees only the approved roster. A pending member never receives this frame at all.
+   *
+   * `ledger` decides whether the whole ledger travels with it. The frames that give a socket its
+   * state for the first time — auth, resume and admission — carry it, because that is the one
+   * moment a device may be holding nothing. A frame pushed after a roster or mode change does not:
+   * no record changed, every changed row already went out as its own `record` frame, and copying
+   * every stored row into every push made each one as large as the group. A client that needs the
+   * whole ledger again gets one by authenticating, which is always answered in full.
    */
-  async rosterFrame(meta, memberId, role) {
+  async rosterFrame(meta, memberId, role, { ledger = 'full' } = {}) {
     /* The host is the viewer here, not an entry in its own roster. The group name in meta is the
        group's, not a person's, and putting it in a member slot would name the organizer after the
        group. The host's own name is the one the page already holds. */
@@ -903,7 +1303,7 @@ export class Group {
       });
     }
     const records = [];
-    if (role === 'host' || role === 'member') {
+    if (ledger === 'full' && (role === 'host' || role === 'member')) {
       const stored = await this.ctx.storage.list({ prefix: RECORD_PREFIX });
       for (const [, record] of stored) records.push({ ...record });
       records.sort((left, right) => left.at - right.at || (left.id < right.id ? -1 : 1));
@@ -919,13 +1319,17 @@ export class Group {
       metaBlob: meta.metaBlob ?? null,
       hostId: meta.hostId,
       roster,
-      records
+      /* Absent, not empty: an empty list would say the group holds no records, and the client
+         must be able to tell "the ledger did not change" from "the ledger is gone". */
+      ...(ledger === 'full' ? { records } : {})
     };
   }
 
   /**
    * Send the state each socket is allowed to see: the host its full roster, an approved member the
    * approved one. Pending sockets receive nothing here — waiting is the only frame they may get.
+   *
+   * The roster is what changed on every path here, so the push is the roster without the ledger.
    */
   async notifyState(meta, skip = new Set()) {
     for (const socket of this.sockets) {
@@ -933,7 +1337,10 @@ export class Group {
       const identity = this.identities.get(socket);
       if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
       try {
-        socket.send(JSON.stringify(await this.rosterFrame(meta, identity.memberId, identity.role)));
+        const frame = await this.rosterFrame(meta, identity.memberId, identity.role, {
+          ledger: 'none'
+        });
+        socket.send(JSON.stringify(frame));
       } catch {
         /* a socket that is already gone is not a reason to stop telling the others */
       }
@@ -941,7 +1348,9 @@ export class Group {
   }
 
   async notifyHosts(meta) {
-    const frame = JSON.stringify(await this.rosterFrame(meta, meta.hostId, 'host'));
+    const frame = JSON.stringify(
+      await this.rosterFrame(meta, meta.hostId, 'host', { ledger: 'none' })
+    );
     for (const socket of this.sockets) {
       if (this.identities.get(socket)?.role !== 'host') continue;
       try {

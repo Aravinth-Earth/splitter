@@ -28,6 +28,12 @@ export const KEY_BITS = 256;
 export const IV_BYTES = 12;
 export const ID_BYTES = 16;
 export const ID_LENGTH = 22; /* 16 bytes, base64url, unpadded */
+/**
+ * The block a sealed value is measured in. Every record is padded to a whole number of these before
+ * it is encrypted, so the length of a frame says which bucket a record fell in and nothing about
+ * how big the record itself is.
+ */
+export const BUCKET_BYTES = 256;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -130,8 +136,8 @@ export async function groupIdFromCode(input) {
 
 /**
  * The group's AES-256-GCM key. Non-extractable: it exists to seal and open, never as bytes.
- * The salt is a hash of the group id, so it is deterministic per group and carries no secret
- * the server does not already have.
+ * The salt is sha256(`sp1:key:` + the group id), so it is deterministic per group, names the
+ * group the key belongs to and carries no secret the server does not already have.
  */
 export async function deriveGroupKey(input) {
   const code = normalizeCode(input);
@@ -166,6 +172,45 @@ export async function idFromSecret(secret) {
   return toBase64Url(digest.slice(0, ID_BYTES));
 }
 
+/* The shapes a stylesheet carries a rule for. Small on purpose: a shape is a border-radius, and a
+   list longer than a person can tell apart would be a list of the same dot. */
+const AVATAR_SHAPES = Object.freeze(['arch', 'circle', 'leaf', 'pill', 'squircle', 'square']);
+
+/**
+ * FNV-1a over the UTF-16 units of a string. 32 bits, no state, no dependency: the same text is the
+ * same number in every browser and under `node --test`, which is what makes an avatar a function of
+ * its inputs rather than a draw.
+ */
+function fnv1a(text) {
+  let hash = 0x811c9dc5;
+  for (let at = 0; at < text.length; at += 1) {
+    hash ^= text.charCodeAt(at);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * The avatar for one member: a shape, a fill and the ink drawn on it.
+ *
+ * The seed is the id *and* the name, so the same person keeps one avatar across reloads and two
+ * people cannot be handed the same one by accident. Two hashes, not two slices of one, so the
+ * shape does not walk in step with the colour. Nothing here is random and nothing is secret: an
+ * avatar is drawn locally and never leaves the page.
+ *
+ * @returns {{shape: string, background: string, ink: string}}
+ */
+export function avatarFor(id, name = '') {
+  const key = `${id ?? ''}\u0000${name ?? ''}`;
+  const shape = AVATAR_SHAPES[fnv1a(`splitter:avatar:${key}`) % AVATAR_SHAPES.length];
+  const hue = fnv1a(`splitter:avatar-hue:${key}`) % 360;
+  return {
+    shape,
+    background: `hsl(${hue} 46% 38%)`,
+    ink: `hsl(${hue} 90% 92%)`
+  };
+}
+
 /**
  * The GCM parameters for one frame. The associated data is authenticated and never encrypted: it
  * is what the record *is* — its kind, its group id, its record id — so a blob lifted into another
@@ -181,6 +226,21 @@ function gcmParams(iv, associated) {
   return params;
 }
 
+/**
+ * Copy `bytes` up to the smallest 256-byte bucket at or above its length, and fill the rest with
+ * spaces.
+ *
+ * JSON treats trailing whitespace as insignificant, so a padded frame parses to the value that went
+ * in and `open` needs no unpadding step of its own. A space (0x20) rather than a zero byte keeps the
+ * buffer valid UTF-8 as it stands; the input is never written through.
+ */
+export function padToBucket(bytes) {
+  const padded = new Uint8Array(Math.ceil(bytes.length / BUCKET_BYTES) * BUCKET_BYTES);
+  padded.set(bytes);
+  padded.fill(0x20, bytes.length);
+  return padded;
+}
+
 /** Seal a JSON value under a group key, with a fresh 12-byte IV every time. */
 export async function seal(key, value, associated) {
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
@@ -188,7 +248,7 @@ export async function seal(key, value, associated) {
   const ciphertext = await crypto.subtle.encrypt(
     params,
     key,
-    encoder.encode(JSON.stringify(value))
+    padToBucket(encoder.encode(JSON.stringify(value)))
   );
   return { iv: toBase64Url(iv), ct: toBase64Url(new Uint8Array(ciphertext)) };
 }
