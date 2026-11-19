@@ -2149,11 +2149,17 @@ export function init(doc = document, win = window) {
     removedMembers = nextRemoved;
     leftMembers = nextLeft;
 
+    /* A state frame is either the whole ledger — the answer to an authentication, the frame that
+       fills a device holding nothing — or the roster alone, which is what a push after a roster
+       change is. `records` absent therefore means the ledger on screen and in the cache is already
+       current: reading it as an empty snapshot would wipe both. */
+    const snapshot = Array.isArray(frame.records) ? frame.records : null;
+
     /* A state snapshot is merged into what is on screen, not swapped in: a broadcast that landed
        while the snapshot was being built is newer than the snapshot, and a dropped frame must not
        bring a deleted row back. Tombstones remove their row and keep the revision. */
     let learned = false;
-    for (const record of frame.records ?? []) {
+    for (const record of snapshot ?? []) {
       if (!recordGuard.accept(record)) continue;
       learned = true;
       if (record.deleted) {
@@ -2174,12 +2180,12 @@ export function init(doc = document, win = window) {
       joinMode: frame.joinMode === 'open' ? 'open' : 'approval',
       roster: frame.roster ?? []
     };
-    cachedRecords = new Map((frame.records ?? []).map((record) => [record.id, { ...record }]));
+    if (snapshot) cachedRecords = new Map(snapshot.map((record) => [record.id, { ...record }]));
     writeCacheNow(groupIdValue);
 
     const active = groupSocket();
     if (active) {
-      const known = new Set((frame.records ?? []).map((record) => record.id));
+      const known = new Set(cachedRecords.keys());
       for (const entry of active.queueEntries()) {
         if (entry.frame.base === 0 && known.has(entry.id)) active.ack(entry.id);
       }

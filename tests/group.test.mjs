@@ -1047,3 +1047,64 @@ test('group: presence defaults are 90 s of silence and a 30 s beat, and a socket
   assert.equal(later.ids.includes(quietId), false, 'a socket past the silence window stays absent');
 });
 
+/* --- State frames: a roster change is pushed as the roster, not as the whole ledger. --- */
+
+test('group: a pushed state frame carries the roster, and only a fresh authentication carries the ledger', async () => {
+  const { group, stored } = newGroup();
+  const hostId = id22();
+  const memberId = id22();
+  await post(group, { hostId, nameBlob: sealed(), hostNameBlob: sealed() });
+
+  const recordIds = [id22(), id22(), id22()];
+  recordIds.forEach((id, index) => {
+    stored.set(`record:${id}`, {
+      id,
+      rev: 1,
+      blob: sealed(),
+      deleted: false,
+      author: hostId,
+      creator: hostId,
+      at: index + 1
+    });
+  });
+  stored.set(`member:${memberId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 0 });
+
+  const meta = stored.get(GROUP_KEY);
+
+  /* The frame a socket is answered with when it authenticates: the whole ledger, because that is
+     the one moment a device may be holding nothing. */
+  const full = await group.rosterFrame(meta, hostId, 'host');
+  assert.deepEqual(
+    full.records.map((record) => record.id),
+    recordIds,
+    'authentication carries every stored row, in write order'
+  );
+
+  /* Every frame pushed after a roster change: the roster and the meta, no records key at all. The
+     ledger did not change, so the push has no business carrying it — and an empty list would read
+     as "this group holds nothing" to a client that merges it. */
+  const host = attach(group, { memberId: hostId, role: 'host', seen: Date.now() });
+  const member = attach(group, { memberId, role: 'member', seen: Date.now() });
+  await group.notifyState(meta);
+
+  for (const socket of [host, member]) {
+    assert.equal(socket.frames.length, 1, 'one state frame per attached socket');
+    const [pushed] = socket.frames;
+    assert.equal(pushed.t, 'state');
+    assert.equal('records' in pushed, false, 'a roster push must not serialise the ledger');
+    assert.equal(
+      pushed.roster.some((entry) => entry.id === memberId && entry.status === 'approved'),
+      true,
+      'the roster change still travels'
+    );
+    assert.equal(pushed.roster.some((entry) => entry.id === hostId), true, 'so does the sealed host name');
+  }
+
+  /* A join the host has to decide is answered the same way: the pending name travels, the ledger
+     does not. */
+  await group.notifyHosts(meta);
+  assert.equal(host.frames.length, 2, 'the host is told once more');
+  assert.equal('records' in host.frames[1], false, 'and that frame is a roster push too');
+  assert.equal(member.frames.length, 1, 'a member is not told about a host-only frame');
+});
+
