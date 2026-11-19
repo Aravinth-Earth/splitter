@@ -40,6 +40,11 @@ const LAST_WRITE_KEY = 'last-write';
    key a wipe removes last and the key that makes the group exist, so a destroy that wiped the group
    and then failed to free the slot would otherwise lose the only record of which slot to retry. */
 const SLOT_KEY = 'slot';
+/* The running total of record bytes and record keys, kept in its own key rather than in the meta: a
+   write moves it in one small read-and-put, so nothing there can write a meta read back stale.
+   Reading the total is what keeps `/counters` from walking every `record:` key, and the value is
+   repaired from the records when a group predates the key. */
+const TOTALS_KEY = 'totals';
 const DEFAULT_MAX_MEMBERS = 20;
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
 /* A socket is only here while it is speaking: the heartbeat re-announces the present set, and a
@@ -93,6 +98,9 @@ export class Group {
     /* The source address for the throttle, captured from Cloudflare at the upgrade and never from
        a field a client sends. One row per socket, because one DO can hold several sources. */
     this.clientIps = new Map();
+    /* The running total of record bytes is a read, a move and a write; this queue is what stops two
+       writes accepted in the same window from reading the same baseline and losing one of them. */
+    this.totalsChain = Promise.resolve();
   }
 
   /**
@@ -217,9 +225,11 @@ export class Group {
    * What this group holds, as counts: no name, no amount, no code.
    *
    * `records` is how many record keys are stored and `bytes` the UTF-8 size of their stored values,
-   * tombstones included — the same shape the write cap is measured on. Both times are `null` when
-   * this group predates them: a group created before they were stamped has no creation time to
-   * report, and a made-up one would be a claim the storage cannot support.
+   * tombstones included — the same shape the write cap is measured on. Both are answered from the
+   * running total the group keeps beside its records, so a read costs one small key instead of the
+   * whole ledger. Both times are `null` when this group predates them: a group created before they
+   * were stamped has no creation time to report, and a made-up one would be a claim the storage
+   * cannot support.
    *
    * @returns {Promise<null | {createdAt: number|null, lastWriteAt: number|null, records: number, bytes: number}>}
    */
@@ -228,16 +238,42 @@ export class Group {
     if (!meta) return null;
 
     const lastWrite = await this.ctx.storage.get(LAST_WRITE_KEY);
-    const records = await this.ctx.storage.list({ prefix: RECORD_PREFIX });
-    let bytes = 0;
-    for (const [, record] of records) bytes += storedBytes(record);
+    const totals = await this.recordTotals();
 
     return {
       createdAt: Number.isSafeInteger(meta.createdAt) ? meta.createdAt : null,
       lastWriteAt: Number.isSafeInteger(lastWrite?.at) ? lastWrite.at : null,
-      records: records.size,
-      bytes
+      records: totals.records,
+      bytes: totals.bytes
     };
+  }
+
+  /**
+   * The running total of record keys and their stored bytes.
+   *
+   * A group created before the total existed has no key to read, and neither has one whose wipe died
+   * part-way and took the key with it. Both are repaired here by summing the records once — the same
+   * sum `counters` used to do on every read — and, on the read route, the answer is stored so the
+   * next read is one key. A stored total that is not the shape this file writes is treated the same
+   * way as an absent one, because a value nobody can read is no better than no value.
+   *
+   * `backfill` is how the write route asks for the baseline without storing it: the total there is
+   * written once the write has been accepted, so a write refused during a wipe leaves no key behind.
+   *
+   * @returns {Promise<{records: number, bytes: number}>}
+   */
+  async recordTotals({ backfill = true } = {}) {
+    const stored = await this.ctx.storage.get(TOTALS_KEY);
+    if (stored && Number.isSafeInteger(stored.records) && Number.isSafeInteger(stored.bytes)) {
+      return { records: stored.records, bytes: stored.bytes };
+    }
+
+    const records = await this.ctx.storage.list({ prefix: RECORD_PREFIX });
+    let bytes = 0;
+    for (const [, record] of records) bytes += storedBytes(record);
+    const totals = { records: records.size, bytes };
+    if (backfill) await this.ctx.storage.put(TOTALS_KEY, totals);
+    return totals;
   }
 
   /**
@@ -1132,7 +1168,21 @@ export class Group {
       at: Date.now()
     };
 
-    await this.ctx.storage.put(key, record);
+    /* The record and the total that counts it are one change: the total is read, moved and written
+       in the queue, and the record is stored between the read and the write so the baseline is the
+       ledger as it stood before it. A Durable Object interleaves requests at every await, and two
+       writes accepted a moment apart would otherwise read the same baseline and drop each other's
+       bytes; queued, each sees the total the one before it left. The value is replaced rather than
+       added to when the key was already there, so a revision moves the bytes by the difference. */
+    await this.moveTotals(async () => {
+      const totals = await this.recordTotals({ backfill: false });
+      const prior = await this.ctx.storage.get(key);
+      await this.ctx.storage.put(key, record);
+      await this.ctx.storage.put(TOTALS_KEY, {
+        records: totals.records + (prior ? 0 : 1),
+        bytes: totals.bytes + storedBytes(record) - (prior ? storedBytes(prior) : 0)
+      });
+    });
     /* The meta above was read before this write, so a wipe that set its mark in between listed its
        keys without this record in them, and the record would outlive a wipe that reported success.
        Read it again: a group that is being wiped now removes the record this write has just stored
@@ -1140,7 +1190,13 @@ export class Group {
        stamp is not written in that case, for the same reason. */
     const current = await this.ctx.storage.get(GROUP_KEY);
     if (current?.wiping === true) {
-      await this.ctx.storage.delete(key);
+      /* The record goes, and the total that counted it goes with it: a group that is being wiped
+         takes no new key, and a total left behind would be a counter for records that are gone. A
+         wipe that then fails leaves a group with no total, which the next counters read repairs. */
+      await this.moveTotals(async () => {
+        await this.ctx.storage.delete(key);
+        await this.ctx.storage.delete(TOTALS_KEY);
+      });
       this.sendFrame(socket, { t: 'refused', code: 'wiping', id: frame.id });
       return;
     }
@@ -1149,6 +1205,20 @@ export class Group {
        write. */
     await this.ctx.storage.put(LAST_WRITE_KEY, { at: record.at });
     await this.broadcastRecord(record);
+  }
+
+  /**
+   * Run one change to the running total after the one before it has finished.
+   *
+   * The total is a read, a move and a write, and the Durable Object lets a second request in at
+   * every await: queued here, two accepted writes cannot both read the same baseline and lose one
+   * of them. A change that throws is skipped over by the next, so a storage fault costs one update
+   * and never wedges the queue.
+   */
+  moveTotals(change) {
+    const run = this.totalsChain.then(change);
+    this.totalsChain = run.catch(() => {});
+    return run;
   }
 
   /** Every accepted write reaches every approved socket, including the author's other tabs. */
