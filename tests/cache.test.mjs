@@ -123,6 +123,48 @@ test('cache: corrupt JSON and a full storage read as empty and refuse saves', ()
 });
 
 
+test('cache: a save rewrites only its own group and keeps the others', () => {
+  const local = fakeStorage();
+  saveCache(local, GROUP, state([]));
+  saveCache(local, OTHER, state([]));
+  const otherRow = local.dump()[`splitter:cache:${OTHER}`];
+
+  const writes = [];
+  const setItem = local.setItem;
+  local.setItem = (key, value) => {
+    writes.push(key);
+    setItem(key, value);
+  };
+
+  assert.equal(saveCache(local, GROUP, state([])), true);
+  assert.deepEqual(writes, [`splitter:cache:${GROUP}`]);
+  assert.equal(local.dump()[`splitter:cache:${OTHER}`], otherRow);
+  assert.equal(cacheFor(local, OTHER).schema, CACHE_SCHEMA);
+});
+
+test('cache: a row the old single-blob version wrote is still read', () => {
+  const local = fakeStorage({
+    'splitter:cache': JSON.stringify({
+      [GROUP]: {
+        schema: CACHE_SCHEMA,
+        savedAt: 1_700_000_000_000,
+        nameBlob: BLOB,
+        metaBlob: null,
+        hostId: ID,
+        memberId: ID,
+        role: 'host',
+        joinMode: 'approval',
+        roster: [{ id: ID, status: 'approved', nameBlob: BLOB }],
+        records: [{ id: ID, rev: 1, blob: BLOB, deleted: false, author: ID, creator: ID, at: 1 }]
+      }
+    })
+  });
+  const cached = cacheFor(local, GROUP);
+  assert.equal(cached.savedAt, 1_700_000_000_000);
+  assert.equal(cached.records.length, 1);
+});
+
+
 test('cache: leaving or ending drops both the outbox and the state for one group', () => {
   const local = fakeStorage();
   saveOutbox(local, GROUP, [put()]);
