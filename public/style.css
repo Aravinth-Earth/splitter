@@ -188,6 +188,8 @@ button {
 .primary:disabled {
   cursor: progress;
   opacity: 0.65;
+  /* A faded control is a control nobody can see; it must never be the target of a tap. */
+  pointer-events: none;
 }
 
 .secondary {
@@ -444,6 +446,26 @@ button {
 
 .expense-row.pending .expense-meta {
   color: var(--accent);
+}
+
+/*
+ * The row keeps its actions out of sight until they are asked for — but only where there is a
+ * pointer that can ask. A mouse reveals them by hovering the row, and the keyboard reveals them by
+ * focusing one, so `pointer-events` moves with the pixels: a control that is not painted is never
+ * the target of a tap. A device that reports no hover never receives this block at all, so a phone
+ * paints Edit and Delete from the first frame instead of leaving two invisible buttons over the row.
+ */
+@media (hover: hover) {
+  .expense-actions {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .expense-row:hover .expense-actions,
+  .expense-row:focus-within .expense-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 /* ------------------------------------------------------------ expense sheet */
