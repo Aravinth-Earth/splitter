@@ -24,6 +24,8 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  LEFT_MESSAGE,
+  REMOVED_MESSAGE,
   WIPE_FAILED_MESSAGE,
   WIPING_MESSAGE,
   init,
@@ -388,10 +390,33 @@ function fakeClock() {
   };
 }
 
-function fakeWindow({ fetch = async () => ({ ok: true, status: 200 }) } = {}) {
+/**
+ * A window whose address bar can be read and rewritten.
+ *
+ * The page strips a code it has consumed with `history.replaceState`, so the fake has one: writing
+ * the address is the same act a browser performs, and `hash`/`search` follow it so a boot reads
+ * what the bar actually holds.
+ */
+function fakeWindow({
+  fetch = async () => ({ ok: true, status: 200 }),
+  href = 'https://splitter.test/'
+} = {}) {
   const clock = fakeClock();
+  const location = { href };
+  const syncAddress = () => {
+    const here = new URL(location.href);
+    location.hash = here.hash;
+    location.search = here.search;
+  };
+  syncAddress();
   return {
-    location: { href: 'https://splitter.test/', hash: '', search: '' },
+    location,
+    history: {
+      replaceState(_state, _title, url) {
+        if (typeof url === 'string') location.href = new URL(url, location.href).toString();
+        syncAddress();
+      }
+    },
     navigator: { onLine: true },
     localStorage: fakeStorage(),
     sessionStorage: fakeStorage(),
@@ -405,6 +430,19 @@ function fakeWindow({ fetch = async () => ({ ok: true, status: 200 }) } = {}) {
     clearInterval: (id) => clock.clearInterval(id),
     clock
   };
+}
+
+/** Put a URL in the tab's address bar, exactly as a paste into it would leave it. */
+function setAddress(win, url) {
+  win.location.href = url;
+  const here = new URL(url);
+  win.location.hash = here.hash;
+  win.location.search = here.search;
+}
+
+/** Whether the address bar still carries a group code in its fragment or query. */
+function addressCarriesCode(win) {
+  return /[#?](?:code|c)=/i.test(`${win.location.hash}${win.location.search}`);
 }
 
 const wait = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -500,12 +538,23 @@ function seedSeat(win, seat, { cache = null, revs = null, outbox = null } = {}) 
   if (outbox) saveOutbox(win.localStorage, seat.groupId, outbox);
 }
 
-async function bootPage({ seed, fetch } = {}) {
+async function bootPage({ seed, fetch, href } = {}) {
   const doc = fakeDocument();
-  const win = fakeWindow({ fetch });
+  const win = fakeWindow({ fetch, href });
   seed?.(win);
   init(doc, win);
   return { doc, win, element: (id) => doc.getElementById(id) };
+}
+
+/**
+ * A reload of the same tab: a fresh document and a fresh script, the same two stores and the same
+ * address bar. Nothing from the old page survives except what the tab itself kept.
+ */
+async function reloadPage(page) {
+  FakeSocket.instances = [];
+  const doc = fakeDocument();
+  init(doc, page.win);
+  return { doc, win: page.win, element: (id) => doc.getElementById(id) };
 }
 
 function latestSocket() {
@@ -521,6 +570,7 @@ async function resumePage(seat, options = {}) {
   FakeSocket.instances = [];
   const page = await bootPage({
     fetch: options.fetch,
+    href: options.href,
     seed: (win) => seedSeat(win, seat, options.seed)
   });
   await until(() => FakeSocket.instances.length > 0, 'the resume socket');
@@ -921,4 +971,350 @@ test('a failed wipe and a wiping refusal leave the seat, the screen and the chip
     assert.equal(page.element('group-header').hidden, false, `${frame.t} keeps the screen`);
     assert.deepEqual(chipOf(page), before.chip, `${frame.t} changes no connection chip`);
   }
+});
+
+/* ------------------------------------------------- the session's last screen */
+
+/*
+ * A session ends in one of three ways: the organizer ends the group, this person leaves it, or the
+ * organizer removes them. Each one has a sentence of its own and each one ends in the same place —
+ * the landing screen, with that session's stores gone — and none of them reaches into another
+ * group the tab also holds a seat for.
+ */
+
+test('a left frame before any state clears the seat the stored last group names', async () => {
+  FakeSocket.instances = [];
+  const seat = await seatFor();
+  /* No cache: the group id is not on screen when the leave arrives, so the stored last group is
+     the only name this seat has. */
+  const page = await resumePage(seat, { seed: {} });
+  const socket = latestSocket();
+  socket.emit('open');
+  await settle();
+
+  socket.message({ t: 'left' });
+  await until(() => page.element('create-panel').hidden === false, 'the landing screen');
+
+  assert.equal(sessionFor(page.win.localStorage, seat.groupId), null, 'the seat is forgotten');
+  assert.equal(codeFor(page.win.sessionStorage, seat.groupId), null, 'the code is forgotten');
+  assert.equal(lastGroup(page.win.localStorage), null, 'the last-group pointer is cleared');
+  assert.equal(page.element('session-notice').textContent, LEFT_MESSAGE, 'the leave sentence is said');
+  assert.equal(page.element('join-panel').hidden, true, 'the landing screen, not the join sheet');
+});
+
+test('a removed frame on the resume path clears the seat and lands with the removal sentence', async () => {
+  FakeSocket.instances = [];
+  const seat = await seatFor();
+  const page = await resumePage(seat, { seed: { cache: await cachedState(seat) } });
+  const socket = latestSocket();
+  socket.emit('open');
+
+  socket.message({ t: 'removed' });
+  await until(() => page.element('create-panel').hidden === false, 'the landing screen');
+
+  assert.equal(sessionFor(page.win.localStorage, seat.groupId), null, 'the seat is forgotten');
+  assert.equal(codeFor(page.win.sessionStorage, seat.groupId), null, 'the code is forgotten');
+  assert.equal(lastGroup(page.win.localStorage), null, 'the last group is forgotten');
+  assert.equal(page.element('session-notice').textContent, REMOVED_MESSAGE, 'the removal sentence');
+  assert.equal(page.element('join-panel').hidden, true, 'the landing screen, not the join sheet');
+});
+
+test('a removed frame on the join path clears the seat and lands with the removal sentence', async () => {
+  FakeSocket.instances = [];
+  const seat = await seatFor('Chitra');
+  const page = await bootPage();
+  page.element('show-join').click();
+  page.element('join-code').value = formatCode(seat.code);
+  page.element('join-name').value = seat.displayName;
+  page.element('join-form').dispatch('submit');
+  await until(() => page.element('waiting-panel').hidden === false, 'the waiting panel');
+  await until(() => FakeSocket.instances.length > 0, 'the join socket');
+
+  const socket = latestSocket();
+  socket.emit('open');
+  socket.message({ t: 'waiting', memberId: seat.memberId });
+  await until(() => sessionFor(page.win.localStorage, seat.groupId) !== null, 'the saved seat');
+
+  socket.message({ t: 'removed' });
+  await until(() => page.element('create-panel').hidden === false, 'the landing screen');
+
+  assert.equal(sessionFor(page.win.localStorage, seat.groupId), null, 'the pending seat is forgotten');
+  assert.equal(codeFor(page.win.sessionStorage, seat.groupId), null, 'the code is forgotten');
+  assert.equal(lastGroup(page.win.localStorage), null, 'the last group is forgotten');
+  assert.equal(page.element('session-notice').textContent, REMOVED_MESSAGE, 'the removal sentence');
+  assert.equal(page.element('join-panel').hidden, true, 'the landing screen, not the join sheet');
+});
+
+test('an end, a leave and a removal each leave no group code in the address bar', async () => {
+  for (const reason of ['ended', 'left', 'removed']) {
+    FakeSocket.instances = [];
+    const seat = await seatFor();
+    const { page, socket } = await shownGroup(seat);
+
+    /* The bar carries the invite code at the instant the session ends — the state an invite link
+       opened in this tab leaves behind. */
+    setAddress(page.win, `https://splitter.test/#code=${seat.code}`);
+    assert.equal(addressCarriesCode(page.win), true, `${reason}: the setup carries a code`);
+
+    socket.message({ t: reason });
+    await until(() => page.element('create-panel').hidden === false, `the landing screen after ${reason}`);
+
+    assert.equal(
+      addressCarriesCode(page.win),
+      false,
+      `${reason} leaves no code in the address bar`
+    );
+  }
+});
+
+test('reloading the URL where a session ended resumes nothing, prefills nothing and says why', async () => {
+  FakeSocket.instances = [];
+  const seat = await seatFor();
+  const page = await resumePage(seat, {
+    href: `https://splitter.test/#code=${seat.code}`,
+    seed: { cache: await cachedState(seat) }
+  });
+  const socket = latestSocket();
+  socket.emit('open');
+  socket.message(await stateFrame(seat));
+  await until(() => page.element('group-header').hidden === false, 'the group screen');
+
+  socket.message({ t: 'ended' });
+  await until(() => page.element('create-panel').hidden === false, 'the landing screen');
+  assert.equal(addressCarriesCode(page.win), false, 'the code is gone before the reload');
+
+  const reloaded = await reloadPage(page);
+  await settle();
+
+  assert.equal(FakeSocket.instances.length, 0, 'a reload of that URL resumes nothing');
+  assert.equal(sessionFor(page.win.localStorage, seat.groupId), null, 'the seat is still gone');
+  assert.equal(codeFor(page.win.sessionStorage, seat.groupId), null, 'the code is still gone');
+  assert.equal(lastGroup(page.win.localStorage), null, 'no group is offered back');
+  assert.equal(reloaded.element('create-panel').hidden, false, 'the landing screen');
+  assert.equal(reloaded.element('join-panel').hidden, true, 'not the join sheet');
+  assert.equal(reloaded.element('join-code').value, '', 'nothing is prefilled');
+  assert.equal(
+    reloaded.element('session-notice').textContent,
+    ENDED,
+    'the sentence belongs to the session that ended'
+  );
+});
+
+test('a code consumed by a resume leaves the address bar and the tab still comes back to the seat', async () => {
+  FakeSocket.instances = [];
+  const seat = await seatFor();
+  const page = await resumePage(seat, {
+    href: `https://splitter.test/#code=${seat.code}`,
+    seed: { cache: await cachedState(seat) }
+  });
+
+  assert.equal(addressCarriesCode(page.win), false, 'the consumed code is out of the address bar');
+
+  const socket = latestSocket();
+  socket.emit('open');
+  socket.message(await stateFrame(seat));
+  await until(() => page.element('group-header').hidden === false, 'the group screen');
+  assert.equal(codeFor(page.win.sessionStorage, seat.groupId), seat.code, 'the tab still holds the code');
+  assert.equal(lastGroup(page.win.localStorage), seat.groupId, 'and the seat it names');
+
+  const reloaded = await reloadPage(page);
+  await until(() => FakeSocket.instances.length > 0, 'the resume socket after a reload');
+  const again = latestSocket();
+  again.emit('open');
+  again.message(await stateFrame(seat));
+  await until(() => reloaded.element('group-header').hidden === false, 'the seat after a reload');
+  assert.equal(addressCarriesCode(reloaded.win), false, 'and no code came back with it');
+});
+
+test('leaving or being removed from one group leaves another group untouched', async () => {
+  for (const reason of ['left', 'removed']) {
+    FakeSocket.instances = [];
+    const closedSeat = await seatFor('Asha');
+    const keptSeat = await seatFor('Balan');
+    const keptRecord = await expenseRecord(keptSeat);
+    const keptCache = await cachedState(keptSeat, { records: [keptRecord] });
+    const keptQueuedId = randomSecret();
+    const keptOutbox = [
+      {
+        id: keptQueuedId,
+        frame: { t: 'put', id: keptQueuedId, base: 0, deleted: false, blob: keptRecord.blob },
+        baseBlob: null
+      }
+    ];
+
+    const page = await resumePage(closedSeat, { seed: { cache: await cachedState(closedSeat) } });
+    const socket = latestSocket();
+    socket.emit('open');
+    socket.message(await stateFrame(closedSeat));
+    await until(() => page.element('group-header').hidden === false, 'the group screen');
+
+    /* A second seat, written after the first so it is the group this tab would go back to. */
+    seedSeat(page.win, keptSeat, {
+      cache: keptCache,
+      revs: { [keptRecord.id]: 4 },
+      outbox: keptOutbox
+    });
+    setLastGroup(page.win.localStorage, keptSeat.groupId);
+
+    socket.message({ t: reason });
+    await until(() => page.element('create-panel').hidden === false, `the landing screen after ${reason}`);
+
+    assert.equal(sessionFor(page.win.localStorage, closedSeat.groupId), null, `${reason}: the closed seat is gone`);
+    assert.equal(codeFor(page.win.sessionStorage, closedSeat.groupId), null, `${reason}: and its code`);
+
+    assert.equal(
+      sessionFor(page.win.localStorage, keptSeat.groupId)?.memberId,
+      keptSeat.memberId,
+      `${reason} keeps the other group's seat`
+    );
+    assert.equal(codeFor(page.win.sessionStorage, keptSeat.groupId), keptSeat.code, 'and its code');
+    assert.equal(
+      cacheFor(page.win.localStorage, keptSeat.groupId)?.memberId,
+      keptSeat.memberId,
+      'and its cached state'
+    );
+    assert.deepEqual(outboxFor(page.win.localStorage, keptSeat.groupId), keptOutbox, 'and its outbox');
+    assert.deepEqual(
+      revsFor(page.win.localStorage, keptSeat.groupId),
+      { [keptRecord.id]: 4 },
+      'and its revisions'
+    );
+    assert.equal(
+      lastGroup(page.win.localStorage),
+      keptSeat.groupId,
+      'the pointer to the other group is not cleared'
+    );
+  }
+});
+
+test('a code consumed by a join leaves the address bar and the seat is kept', async () => {
+  FakeSocket.instances = [];
+  const seat = await seatFor('Devi');
+  const page = await bootPage({ href: `https://splitter.test/#code=${seat.code}` });
+  await settle();
+  assert.equal(page.element('join-panel').hidden, false, 'the invite opens the join sheet');
+  assert.equal(page.element('join-code').value, formatCode(seat.code), 'with the code in the field');
+  assert.equal(addressCarriesCode(page.win), true, 'the setup carries the code');
+
+  page.element('join-name').value = seat.displayName;
+  page.element('join-form').dispatch('submit');
+  await until(() => page.element('waiting-panel').hidden === false, 'the waiting panel');
+  await until(() => FakeSocket.instances.length > 0, 'the join socket');
+
+  const socket = latestSocket();
+  socket.emit('open');
+  socket.message({ t: 'waiting', memberId: seat.memberId });
+  await until(() => sessionFor(page.win.localStorage, seat.groupId) !== null, 'the saved seat');
+
+  assert.equal(addressCarriesCode(page.win), false, 'the consumed code is out of the address bar');
+  assert.equal(codeFor(page.win.sessionStorage, seat.groupId), seat.code, 'the tab still holds it');
+});
+
+test('a re-join after a leave stores the seat again', async () => {
+  FakeSocket.instances = [];
+  const seat = await seatFor('Farah');
+  const { page, socket } = await shownGroup(seat);
+  socket.message({ t: 'left' });
+  await until(() => page.element('create-panel').hidden === false, 'the landing screen');
+  assert.equal(sessionFor(page.win.localStorage, seat.groupId), null, 'the leave forgot the seat');
+
+  page.element('show-join').click();
+  page.element('join-code').value = formatCode(seat.code);
+  page.element('join-name').value = seat.displayName;
+  page.element('join-form').dispatch('submit');
+  await until(() => page.element('waiting-panel').hidden === false, 'the waiting panel for the re-join');
+  await until(() => FakeSocket.instances.length > 1, 'the re-join socket');
+
+  const again = latestSocket();
+  again.emit('open');
+  again.message({ t: 'waiting', memberId: seat.memberId });
+  await until(
+    () => sessionFor(page.win.localStorage, seat.groupId) !== null,
+    'the seat stored by the re-join'
+  );
+
+  assert.equal(codeFor(page.win.sessionStorage, seat.groupId), seat.code, 'the re-join keeps the code');
+  assert.equal(lastGroup(page.win.localStorage), seat.groupId, 'and names the group');
+});
+
+test('a sentence for one session does not outlive it in the tab', async () => {
+  FakeSocket.instances = [];
+  const seat = await seatFor();
+  const { page, socket } = await shownGroup(seat);
+  socket.message({ t: 'ended' });
+  await until(() => page.element('create-panel').hidden === false, 'the landing screen');
+  assert.equal(page.element('session-notice').textContent, ENDED, 'the end is said');
+
+  /* Another session starts in the same tab: a join for a different group. */
+  const other = await seatFor('Gita');
+  page.element('show-join').click();
+  page.element('join-code').value = formatCode(other.code);
+  page.element('join-name').value = other.displayName;
+  page.element('join-form').dispatch('submit');
+  await until(() => page.element('waiting-panel').hidden === false, 'the waiting panel');
+  await until(() => FakeSocket.instances.length > 1, 'the join socket');
+
+  const joining = latestSocket();
+  joining.emit('open');
+  joining.message({ t: 'waiting', memberId: other.memberId });
+  await until(() => sessionFor(page.win.localStorage, other.groupId) !== null, 'the new seat');
+
+  /* The organizer declines: the new seat is forgotten, and a reload has nothing to resume. */
+  joining.message({ t: 'refused', code: 'declined' });
+  await settle();
+
+  const reloaded = await reloadPage(page);
+  await settle();
+  assert.equal(
+    reloaded.element('session-notice').textContent,
+    '',
+    'the sentence written for the ended session is not said for a later one'
+  );
+});
+
+test('an end leaves no reconnecting socket, no flushed write and no late copy', async () => {
+  FakeSocket.instances = [];
+  const seat = await seatFor();
+  const record = await expenseRecord(seat);
+  const firstQueued = randomSecret();
+  const secondQueued = randomSecret();
+  const queued = [
+    {
+      id: firstQueued,
+      frame: { t: 'put', id: firstQueued, base: 0, deleted: false, blob: record.blob },
+      baseBlob: null
+    },
+    {
+      id: secondQueued,
+      frame: { t: 'put', id: secondQueued, base: 0, deleted: false, blob: record.blob },
+      baseBlob: null
+    }
+  ];
+  const page = await resumePage(seat, {
+    seed: { cache: await cachedState(seat), outbox: queued }
+  });
+  const socket = latestSocket();
+  socket.emit('open');
+  /* The queue is paced: one write now, the second half a second later. */
+  await settle();
+  assert.equal(socket.sent.length, 2, 'the first write and the second are sent in turn');
+
+  socket.message({ t: 'ended' });
+  await until(() => page.element('create-panel').hidden === false, 'the landing screen');
+  const sentBefore = socket.sent.length;
+
+  page.win.clock.advance(10 * 60_000);
+  await settle();
+
+  assert.equal(FakeSocket.instances.length, 1, 'the clock opened no new connection');
+  assert.equal(socket.readyState, 3, 'the socket stays closed');
+  assert.equal(socket.sent.length, sentBefore, 'no queued write went out after the end');
+  assert.deepEqual(outboxFor(page.win.localStorage, seat.groupId), [], 'and none was written back');
+
+  /* A record frame in flight when the end arrived must not leave a revision or a cached copy
+     behind either: the group is gone, and its stores stay gone. */
+  socket.message({ t: 'record', ...record });
+  await settle();
+  assert.deepEqual(revsFor(page.win.localStorage, seat.groupId), {}, 'no revision is kept');
+  assert.equal(cacheFor(page.win.localStorage, seat.groupId), null, 'no cached state is kept');
 });
