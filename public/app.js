@@ -21,6 +21,7 @@
  */
 
 import {
+  avatarFor,
   deriveGroupKey,
   formatCode,
   generateCode,
@@ -81,6 +82,170 @@ export const OFFLINE_MESSAGE = 'Creating needs a connection.';
 export const OFFLINE_FIRST_MESSAGE =
   'Open this group once with a connection; after that it works offline.';
 export const RETRY_MESSAGE = 'The group was not created. Try again.';
+
+/* A wipe that stopped part-way is not an end, and it is not a whole group either: the keys are
+   deleted before the meta, so the records may already be gone while the group still exists. The copy
+   therefore claims only what the storage keeps — the group is still here, the delete failed, and
+   some or all of the data may be gone — and says what to do about it. */
+export const WIPE_FAILED_MESSAGE =
+  'The delete failed, so the group still exists. Some or all of its data may be gone. Try again.';
+
+/* A write that arrives while the group is being wiped is refused with the code `wiping`. The group
+   is still stored — the wipe may yet fail — so the page says what is happening and stays where it
+   is, rather than treating the refusal as the group's end. */
+export const WIPING_MESSAGE = 'This group is being deleted. Try again in a moment.';
+
+/* One sentence for the group's end, whichever way the page learns it: an `ended` frame, or a
+   stored seat whose room the probe can no longer find. Two spellings would read as two events. */
+export const ENDED_MESSAGE = 'This group has ended. It cannot be reopened.';
+
+/* The other two ways a session ends, one sentence each. The sentence is the last thing said about
+   the group the person was in, so each reason says its own thing rather than borrowing the end's. */
+export const LEFT_MESSAGE = 'You left the group. Your expenses stay in the group.';
+export const REMOVED_MESSAGE = 'Removed from this group.';
+
+/** The sentence a closed session's reason is said with; '' for a reason this page never records. */
+export function sessionEndMessage(reason) {
+  if (reason === 'ended') return ENDED_MESSAGE;
+  if (reason === 'left') return LEFT_MESSAGE;
+  if (reason === 'removed') return REMOVED_MESSAGE;
+  return '';
+}
+
+/* The tab's own note of why its last session ended. The code is out of the address bar by the time
+   a reload happens, and the seat is gone from the stores, so this note is the only thing left that
+   can say what the landing screen is doing there. */
+const SESSION_END_KEY = 'splitter:session-end';
+
+
+/**
+ * What a lifecycle frame means for this page.
+ *
+ * `ended` says the data is gone, so the page leaves the group. `wipe-failed` says the wipe stopped
+ * before the group was removed, so the page stays: the socket is still attached, and navigating away
+ * from it would tell the person their group ended while it did not. Every socket reads this one
+ * function, so the host, the member and the resume path cannot disagree about which frame means
+ * which. Anything else returns `null` and moves nothing.
+ *
+ * @returns {'leave'|'stay'|null}
+ */
+export function lifecycleFrameOutcome(frame) {
+  if (frame === null || typeof frame !== 'object') return null;
+  if (frame.t === 'ended') return 'leave';
+  if (frame.t === 'wipe-failed') return 'stay';
+  return null;
+}
+
+/**
+ * Whether a refusal says the group is being deleted, rather than that this one write was wrong.
+ *
+ * A wipe refuses every write while it runs, and the refusal arrives on the socket the page is
+ * already holding. Read as an end it would close that socket and forget a group that is still
+ * stored, so the code is named here and every socket reads it the same way. Each socket answers the
+ * refusals about a record first — those carry the `id` of the write — and this is the group-level
+ * reading that is left.
+ */
+export function isWipingRefusal(frame) {
+  return frame !== null && typeof frame === 'object' && frame.t === 'refused' && frame.code === 'wiping';
+}
+
+/**
+ * The ids in a presence frame, or `null` when the frame is not one.
+ *
+ * Presence is `{t:'here', ids:[...]}` — ids only, on a heartbeat. Reading it here, once, is what
+ * keeps the host, member and resume sockets from drifting apart: a frame of any other type moves no
+ * chip, and an id that is not a string is not an id. An empty list is a real answer — nobody is
+ * here — so it is a Set, not `null`.
+ *
+ * @returns {Set<string>|null}
+ */
+export function presenceIds(frame) {
+  if (frame === null || typeof frame !== 'object') return null;
+  if (frame.t !== 'here' || !Array.isArray(frame.ids)) return null;
+  return new Set(frame.ids.filter((id) => typeof id === 'string'));
+}
+
+/**
+ * The presence chip's text for a set of ids, or `''` when the chip should be hidden.
+ *
+ * The copy is the one the page already showed: "Just you here" when the only person present is the
+ * viewer, otherwise a count and the label each id resolves to. `label` is the page's own
+ * `memberLabel`, so a removed or departed member keeps whatever marker that gives them.
+ */
+export function presenceText(ids, selfId = null, label = () => 'Someone') {
+  if (!(ids instanceof Set) || ids.size === 0) return '';
+  if (ids.size === 1 && selfId && ids.has(selfId)) return 'Just you here';
+  return `${ids.size} here · ${[...ids].map((id) => label(id)).join(', ')}`;
+}
+
+/** The chip's hidden flag and text: nothing to say is the only reason to hide it. */
+export function presenceChip(text) {
+  const hidden = text === '';
+  return { hidden, text: hidden ? '' : text };
+}
+
+/**
+ * Draw the presence chip: one avatar per id, in the order the set holds them, then the sentence.
+ *
+ * The avatars are `aria-hidden`, so the chip's accessible name is exactly what `presenceText`
+ * writes and never a run of initials. `doc` and `element` are handed in rather than reached for, so
+ * this is a rule a test can run without a browser: it makes spans, writes their text, and fetches
+ * nothing. An empty set leaves the element hidden and empty.
+ */
+export function renderPresenceChip(
+  doc,
+  element,
+  ids,
+  selfId = null,
+  label = () => 'Someone',
+  name = () => ''
+) {
+  const here = ids instanceof Set ? ids : new Set();
+  const chip = presenceChip(presenceText(here, selfId, label));
+
+  element.replaceChildren();
+  element.hidden = chip.hidden;
+  if (chip.hidden) return chip;
+
+  for (const id of here) {
+    const person = name(id);
+    const avatar = avatarFor(id, person);
+
+    const face = doc.createElement('span');
+    face.className = `presence-avatar presence-avatar-${avatar.shape}`;
+    face.setAttribute('aria-hidden', 'true');
+    paintAvatar(face, avatar);
+    face.textContent = initialOf(person);
+    element.append(face);
+  }
+
+  const text = doc.createElement('span');
+  text.className = 'presence-text';
+  text.textContent = chip.text;
+  element.append(text);
+
+  return chip;
+}
+
+/**
+ * Put one avatar's colours on its node.
+ *
+ * The shape is a class, because the stylesheet owns it; the hue is per person, so it is written on
+ * the node instead. A stand-in document need not model `style` at all, and a here frame must never
+ * throw for a colour: a browser always has one, and where it is missing the shape class still
+ * draws the avatar.
+ */
+function paintAvatar(node, avatar) {
+  if (!node.style) return;
+  node.style.background = avatar.background;
+  node.style.color = avatar.ink;
+}
+
+/** The one character an avatar carries: the first code point of the name, in capitals. */
+function initialOf(name) {
+  const first = [...String(name ?? '').trim()][0];
+  return first ? first.toUpperCase() : '';
+}
 
 /* The app is the whole of its origin, so a relative path is the API on this origin and nothing
    else. */
@@ -470,6 +635,7 @@ export function init(doc = document, win = window) {
   let recordGuard = new RevGuard();
   let guardGroupId = null;
   let expenseSheetOpen = false;
+  let expenseSheetOpener = null;
   let expenseDraftId = null;
   let pendingExpenseId = null;
   let pendingExpenseEdit = false;
@@ -485,10 +651,15 @@ export function init(doc = document, win = window) {
   let cacheTimer = null;
   let cachedSavedAt = 0;
   let connectionStatus = 'offline';
+  /* Per connection: false until this exact socket's state frame arrives. A reconnect starts false
+     again, so an open socket that has not spoken is still waiting, not connected. */
+  let stateFrameSpoke = false;
   let queuedEditBases = new Map();
   let queuedEditRetries = new Set();
   let lifecycleAction = null;
-  let endedHandledFor = null;
+  /* The one group whose session this page has closed. Frames that were already in flight and a
+     cache or outbox timer that was already armed must not write to a group that is over. */
+  let closedGroupId = null;
   let pendingDeleteId = null;
   let editingExpense = null;
   let customSeed = null;
@@ -751,7 +922,9 @@ export function init(doc = document, win = window) {
   }
 
   function persistOutbox(entries) {
-    if (!groupId) return;
+    /* A socket that closed with the session can still report its queue on the way out; the group is
+       gone, and a queue written back into its slot is a copy of a group that ended. */
+    if (!groupId || groupId === closedGroupId) return;
     const items = entries.map((entry) => ({
       ...entry,
       baseBlob: queuedEditBases.get(entry.id)?.baseBlob ?? null
@@ -771,26 +944,36 @@ export function init(doc = document, win = window) {
     }
   }
 
+  /**
+   * The connection chip is derived, not assigned by each event: it is up while the group screen is
+   * up and this connection has not sent its state frame, and hidden and empty otherwise.
+   *
+   * An `open` socket is not a speaking one — the server has accepted the socket but not yet said
+   * what the group holds — so opening a reconnect does not clear the chip. Only the state frame
+   * does, and any status but `open` starts the next connection as unspeaking again.
+   */
+  function renderConnectionChip() {
+    if (!connection) return;
+    const shown = !groupHeader.hidden && !stateFrameSpoke;
+    connection.hidden = !shown;
+    connection.textContent = shown ? 'Reconnecting…' : '';
+  }
+
+  /** This connection has now said what the group holds; the chip has nothing left to wait for. */
+  function markStateFrame() {
+    stateFrameSpoke = true;
+    renderConnectionChip();
+  }
+
   function setConnection(status) {
     connectionStatus = status;
+    if (status !== 'open') stateFrameSpoke = false;
     if (status !== 'open' && presentIds.size > 0) {
       presentIds = new Set();
       renderPresence();
     }
     if (cachedBase) renderOfflineBanner(status);
-    if (!connection) return;
-    if (status === 'open' || status === 'closed') {
-      connection.hidden = true;
-      connection.textContent = '';
-    } else {
-      connection.hidden = false;
-      connection.textContent =
-        status === 'offline'
-          ? 'Offline — changes will sync when the connection returns.'
-          : status === 'reconnecting'
-            ? 'Reconnecting…'
-            : 'Connecting…';
-    }
+    renderConnectionChip();
 
     if (status !== 'open') toggleModeButton.disabled = true;
     if (!waitingPanel.hidden) {
@@ -854,7 +1037,8 @@ export function init(doc = document, win = window) {
     endGroupButton.hidden = role !== 'organizer';
     leaveGroupButton.hidden = role === 'organizer';
     closeLifecycle();
-    endedHandledFor = null;
+    closedGroupId = null;
+    clearSessionEnd();
     resetImport();
 
     groupNameDisplay.textContent = name;
@@ -877,6 +1061,7 @@ export function init(doc = document, win = window) {
     waitingPanel.hidden = true;
     groupHeader.hidden = false;
     emptyLedger.hidden = false;
+    renderConnectionChip();
 
     /* The hint is a one-time note: a copy dismisses it, and so does anything else done in the
        header. The listener is added now so the click that created the group does not count. */
@@ -923,6 +1108,8 @@ export function init(doc = document, win = window) {
 
   /** Keep the seat on this device: the secret locally, the code for this tab only. */
   function remember({ groupId, memberId, secret, displayName, code }) {
+    /* A state frame that was being applied when the session ended must not put the seat back. */
+    if (groupId === closedGroupId) return;
     saveSession(local, {
       groupId,
       memberId,
@@ -931,6 +1118,11 @@ export function init(doc = document, win = window) {
     });
     saveCode(tab, groupId, code);
     setLastGroup(local, groupId);
+    /* The seat now holds the code, so the address bar does not: an invite link that was joined,
+       like one that was resumed, leaves no key behind for a reload or a share. */
+    stripAddressCode();
+    /* A session started in this tab is not the one an earlier note was written about. */
+    clearSessionEnd();
   }
 
   function forget(groupId) {
@@ -986,6 +1178,7 @@ export function init(doc = document, win = window) {
 
     if (code && !resume) joinNameInput.focus();
     else joinCodeInput.focus();
+    renderConnectionChip();
   }
 
   function showCreate() {
@@ -993,6 +1186,7 @@ export function init(doc = document, win = window) {
     closeHostSocket();
     closeExpenseSheet();
     closeSettlementSheet();
+    closeLifecycle();
     hideNotice();
     group = null;
     resumeSession = null;
@@ -1009,6 +1203,7 @@ export function init(doc = document, win = window) {
     emptyLedger.hidden = true;
     createPanel.hidden = false;
     hideJoinError();
+    renderConnectionChip();
     nameInput.focus();
   }
 
@@ -1032,6 +1227,7 @@ export function init(doc = document, win = window) {
     waitingCopy.textContent =
       'The organizer has to let you in. Nothing from the group is shown until they do.';
     waitingBack.hidden = false;
+    renderConnectionChip();
     waitingTitle.focus();
   }
 
@@ -1223,6 +1419,8 @@ export function init(doc = document, win = window) {
     hideNotice();
     closeJoinSocket();
     closeHostSocket();
+    /* This tab is opening a session again: the group it closed before is not this one's guard. */
+    closedGroupId = null;
 
     const groupIdValue = await groupIdFromCode(code);
     if (groupIdValue !== session.groupId) {
@@ -1246,7 +1444,7 @@ export function init(doc = document, win = window) {
         dropGroupCache(groupIdValue);
         forget(groupIdValue);
         showCreate();
-        showNotice('This group has ended.');
+        showNotice(ENDED_MESSAGE);
         return;
       }
       if (reachable === 'offline') {
@@ -1300,6 +1498,7 @@ export function init(doc = document, win = window) {
         }
 
         if (frame.t === 'state') {
+          markStateFrame();
           const key = await groupKey;
           let name = 'Your group';
           try {
@@ -1352,7 +1551,7 @@ export function init(doc = document, win = window) {
           return;
         }
 
-        if (frame.t === 'presence') {
+        if (frame.t === 'here') {
           handlePresence(frame);
           return;
         }
@@ -1364,24 +1563,31 @@ export function init(doc = document, win = window) {
           handleExpenseConflict(frame);
           return;
         }
-        if (frame.t === 'ended') {
-          handleEnded();
+        const lifecycle = lifecycleFrameOutcome(frame);
+        if (lifecycle === 'leave') {
+          closeSession('ended', groupIdValue ?? lastGroup(local));
+          return;
+        }
+        if (lifecycle === 'stay') {
+          handleWipeFailed();
           return;
         }
         if (frame.t === 'left') {
-          handleLeft();
+          closeSession('left', groupIdValue ?? lastGroup(local));
           return;
         }
         if (frame.t === 'removed') {
-          dropGroupCache(groupIdValue);
-          forget(groupIdValue);
-          socket.close();
-          joinSocket = null;
-          showJoin({ code, error: 'Removed from this group.' });
+          closeSession('removed', groupIdValue ?? lastGroup(local));
           return;
         }
         if (frame.t === 'refused') {
           if (handleExpenseRefusal(frame)) return;
+          /* A wipe in progress is not an end: the group is still stored, and a wipe that fails
+             leaves a group this socket can talk to again. */
+          if (isWipingRefusal(frame)) {
+            handleWiping();
+            return;
+          }
           socket.close();
           joinSocket = null;
           if (frame.code === 'unknown_group') dropGroupCache(groupIdValue);
@@ -1402,6 +1608,8 @@ export function init(doc = document, win = window) {
 
   function openJoinSocket({ groupId, memberId, secret, nameBlob, code, displayName }) {
     closeJoinSocket();
+    /* This tab is opening a session again: the group it closed before is not this one's guard. */
+    closedGroupId = null;
 
     const url = new URL('api/ws', win.location.href);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1423,6 +1631,7 @@ export function init(doc = document, win = window) {
         }
 
         if (frame.t === 'state' && frame.role === 'member') {
+          markStateFrame();
           if (group) {
             applyMode(frame.joinMode, 'member');
             await applyGroupState(frame, groupKeyPromise);
@@ -1453,7 +1662,7 @@ export function init(doc = document, win = window) {
           return;
         }
 
-        if (frame.t === 'presence') {
+        if (frame.t === 'here') {
           handlePresence(frame);
           return;
         }
@@ -1465,24 +1674,31 @@ export function init(doc = document, win = window) {
           handleExpenseConflict(frame);
           return;
         }
-        if (frame.t === 'ended') {
-          handleEnded();
+        const lifecycle = lifecycleFrameOutcome(frame);
+        if (lifecycle === 'leave') {
+          closeSession('ended', groupId ?? lastGroup(local));
+          return;
+        }
+        if (lifecycle === 'stay') {
+          handleWipeFailed();
           return;
         }
         if (frame.t === 'left') {
-          handleLeft();
+          closeSession('left', groupId ?? lastGroup(local));
           return;
         }
         if (frame.t === 'removed') {
-          dropGroupCache(groupId);
-          forget(groupId);
-          socket.close();
-          joinSocket = null;
-          showJoin({ code, error: 'Removed from this group.' });
+          closeSession('removed', groupId ?? lastGroup(local));
           return;
         }
         if (frame.t === 'refused') {
           if (handleExpenseRefusal(frame)) return;
+          /* The same reading as the resume path: a refused join during a wipe leaves a socket that
+             is still attached to a group that still exists. */
+          if (isWipingRefusal(frame)) {
+            handleWiping();
+            return;
+          }
           socket.close();
           joinSocket = null;
           if (frame.code === 'unknown_group') dropGroupCache(groupId);
@@ -1547,11 +1763,12 @@ export function init(doc = document, win = window) {
       },
       onFrame: (frame) => {
         if (frame.t === 'state') {
+          markStateFrame();
           void renderRoster(frame, key);
           void applyGroupState(frame, key);
           return;
         }
-        if (frame.t === 'presence') {
+        if (frame.t === 'here') {
           handlePresence(frame);
           return;
         }
@@ -1559,12 +1776,17 @@ export function init(doc = document, win = window) {
           void handleRecordFrame(frame);
           return;
         }
-        if (frame.t === 'ended') {
-          handleEnded();
+        const lifecycle = lifecycleFrameOutcome(frame);
+        if (lifecycle === 'leave') {
+          closeSession('ended', groupId ?? lastGroup(local));
+          return;
+        }
+        if (lifecycle === 'stay') {
+          handleWipeFailed();
           return;
         }
         if (frame.t === 'left') {
-          handleLeft();
+          closeSession('left', groupId ?? lastGroup(local));
           return;
         }
         if (frame.t === 'import-members-ok') {
@@ -1578,6 +1800,13 @@ export function init(doc = document, win = window) {
         if (frame.t === 'refused') {
           if (handleImportRefusal(frame)) return;
           if (handleExpenseRefusal(frame)) return;
+          if (isWipingRefusal(frame)) {
+            handleWiping();
+            /* The toggle is disabled when it is clicked and re-armed by a state frame or by a
+               refusal; a wipe refuses its `mode` frame like any other write. */
+            toggleModeButton.disabled = false;
+            return;
+          }
           rosterEmpty.textContent = 'That request could not be completed.';
           rosterEmpty.hidden = false;
           toggleModeButton.disabled = false;
@@ -1749,26 +1978,26 @@ export function init(doc = document, win = window) {
     return splitModes.find((radio) => radio.checked)?.value ?? 'equal';
   }
 
-  /** A name as the whole page should show it; a removed member keeps their name and gets a marker. */
+  /**
+   * The presence chip, from the ids the last here frame carried.
+   *
+   * The text comes from `presenceText`, which is the copy this chip always showed; the ids come
+   * from `presenceIds`, which is the one reader of a here frame on this page. `renderPresenceChip`
+   * draws one avatar per id from the member's own name, so the suffix `memberLabel` adds for a
+   * member who left does not move their avatar.
+   */
   function renderPresence() {
-    if (presentIds.size === 0) {
-      presence.hidden = true;
-      presence.textContent = '';
-      return;
-    }
-    if (presentIds.size === 1 && selfId && presentIds.has(selfId)) {
-      presence.hidden = false;
-      presence.textContent = 'Just you here';
-      return;
-    }
-    presence.hidden = false;
-    presence.textContent = `${presentIds.size} here · ${[...presentIds]
-      .map((id) => memberLabel(id))
-      .join(', ')}`;
+    renderPresenceChip(doc, presence, presentIds, selfId, memberLabel, memberName);
+  }
+
+  /** The name an avatar is seeded with: the member's own, without the label's suffix. */
+  function memberName(id) {
+    return members.get(id) ?? '';
   }
 
   function handlePresence(frame) {
-    const ids = new Set((frame.here ?? []).filter((id) => typeof id === 'string'));
+    const ids = presenceIds(frame);
+    if (ids === null) return;
     if (groupHeader.hidden) {
       pendingPresence = ids;
       return;
@@ -1866,6 +2095,7 @@ export function init(doc = document, win = window) {
   }
 
   function writeCacheNow(groupIdValue) {
+    if (groupIdValue === closedGroupId) return;
     const payload = cachePayload();
     if (groupIdValue && payload && saveCache(local, groupIdValue, payload)) {
       cachedSavedAt = Date.now();
@@ -1873,6 +2103,7 @@ export function init(doc = document, win = window) {
   }
 
   function scheduleCacheWrite(groupIdValue) {
+    if (groupIdValue === closedGroupId) return;
     if (cacheTimer !== null) return;
     cacheTimer = win.setTimeout(() => {
       cacheTimer = null;
@@ -1933,7 +2164,7 @@ export function init(doc = document, win = window) {
       const value = await decryptRecord(key, record, groupIdValue);
       if (value) ledger.set(record.id, { ...record, value });
     }
-    if (learned) saveRevs(local, groupIdValue, recordGuard.snapshot());
+    if (learned && groupIdValue !== closedGroupId) saveRevs(local, groupIdValue, recordGuard.snapshot());
 
     cachedBase = {
       nameBlob: frame.nameBlob,
@@ -2557,6 +2788,10 @@ export function init(doc = document, win = window) {
   function openExpenseSheet(record = null) {
     if (!group || record?.deleted) return;
 
+    if (!expenseSheetOpen) {
+      const opener = doc.activeElement;
+      expenseSheetOpener = opener && opener !== doc.body ? opener : null;
+    }
     closeSettlementSheet();
     expenseSheetOpen = true;
     editingExpense = record;
@@ -2613,6 +2848,7 @@ export function init(doc = document, win = window) {
   }
 
   function closeExpenseSheet() {
+    const wasOpen = expenseSheetOpen;
     expenseSheetOpen = false;
     expensePanel.hidden = true;
     expenseError.hidden = true;
@@ -2642,6 +2878,13 @@ export function init(doc = document, win = window) {
     payerSingle.hidden = false;
     addPayerButton.parentElement.hidden = false;
     renderLedger();
+    const opener = expenseSheetOpener;
+    expenseSheetOpener = null;
+    if (!wasOpen) return;
+    const target = opener?.isConnected !== false && typeof opener?.focus === 'function'
+      ? opener
+      : addExpenseButton;
+    target?.focus?.();
   }
 
   function settlementPeople() {
@@ -3008,7 +3251,9 @@ export function init(doc = document, win = window) {
       noteImportFailure(frame.id);
       return;
     }
-    if (groupIdValue) saveRevs(local, groupIdValue, recordGuard.snapshot());
+    if (groupIdValue && groupIdValue !== closedGroupId) {
+      saveRevs(local, groupIdValue, recordGuard.snapshot());
+    }
     groupSocket()?.ack(frame.id);
 
     if (frame.deleted) {
@@ -3495,28 +3740,96 @@ export function init(doc = document, win = window) {
     importJob = null;
   }
 
-  /** The organizer ended the group: forget it before navigating, so no cache can resume it. */
-  function handleEnded() {
-    const current = groupId;
-    if (current && endedHandledFor === current) return;
-    endedHandledFor = current;
-    dropGroupCache(current);
-    if (current) forget(current);
+  /**
+   * The one ending this page performs, whichever frame or click brought it here: the organizer ended
+   * the group, this person left it, or the organizer removed them.
+   *
+   * The socket goes first, so a close event cannot arm a reconnect for a group that is over and no
+   * flush can put a queued write on the wire afterwards. Then this group's stores go — its seat, its
+   * code, the last-group pointer when it names this group, its revisions, its cached state and its
+   * outbox — and only this group's: a tab that holds another seat keeps it. A code the tab has
+   * consumed leaves the address bar, the reason is written down for the reload that will follow the
+   * landing screen, and the landing screen says that reason's own sentence.
+   */
+  function closeSession(reason, id) {
+    /* A socket that has not spoken yet may not know the group's id; the stored last group is the
+       only name this seat has. */
+    const current = id ?? groupId ?? lastGroup(local);
+    if (current && closedGroupId === current) return;
+    if (current) closedGroupId = current;
+
     closeHostSocket();
     closeJoinSocket();
+
+    if (current) {
+      dropGroupCache(current);
+      forget(current);
+    }
+    stripAddressCode();
+    recordSessionEnd(reason);
+
     showCreate();
-    showNotice('This group has ended. It cannot be reopened.');
+    showNotice(sessionEndMessage(reason));
   }
 
-  /** This device left: the group is forgotten here; its entries remain on every other screen. */
-  function handleLeft() {
-    const current = groupId;
-    dropGroupCache(current);
-    if (current) forget(current);
-    closeHostSocket();
-    closeJoinSocket();
-    showCreate();
-    showNotice('You left the group. Your expenses stay in the group.');
+  /** The code has been read and the seat holds it; it does not belong in the address bar. */
+  function stripAddressCode() {
+    if (!/[#?](?:code|c)=/i.test(`${win.location.hash}${win.location.search}`)) return;
+    try {
+      win.history.replaceState({}, '', pageBase());
+    } catch {
+      /* a bar this browser will not rewrite is not a reason to leave the session standing */
+    }
+  }
+
+  function recordSessionEnd(reason) {
+    try {
+      tab?.setItem(SESSION_END_KEY, reason);
+    } catch {
+      /* a tab that cannot keep the note still lands on the right screen */
+    }
+  }
+
+  /** A session beginning in this tab takes the note with it: it is not that session's sentence. */
+  function clearSessionEnd() {
+    try {
+      tab?.removeItem(SESSION_END_KEY);
+    } catch {
+      /* a tab that cannot keep the note has nothing to clear */
+    }
+  }
+
+  /** Read the reason once: the sentence is said for the session that ended, not forever after. */
+  function takeSessionEnd() {
+    try {
+      const reason = tab?.getItem(SESSION_END_KEY) ?? null;
+      tab?.removeItem(SESSION_END_KEY);
+      return reason;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * A wipe that stopped part-way: the group is still stored and still hosted, so this view stays —
+   * the same sockets, the same records on screen — and the status line says what happened. Nothing
+   * here closes a socket or navigates, because both would tell the person the group ended.
+   */
+  function handleWipeFailed() {
+    setStatus(WIPE_FAILED_MESSAGE);
+  }
+
+  /**
+   * A refusal that says the group is being deleted. The socket is not closed here and the group is
+   * not forgotten: the group is still stored, an `ended` frame is what ends the view, and the seat
+   * this device holds is what makes the next attempt land on the same group once the wipe has
+   * failed or is over.
+   */
+  function handleWiping() {
+    setStatus(WIPING_MESSAGE);
+    /* A refused auth arrives while the waiting panel is the one on screen, so the sentence goes
+       there as well: the status line is a four-second toast. */
+    waitingCopy.textContent = WIPING_MESSAGE;
   }
 
   /** Build the readable copy and hand it to the browser's download flow. */
@@ -3861,6 +4174,9 @@ export function init(doc = document, win = window) {
       if (stored) {
         saveCode(tab, groupId, invited.code);
         setLastGroup(local, groupId);
+        /* The code has been read and the seat now holds it: a reload of this URL and a share of it
+           must not carry the key along. */
+        stripAddressCode();
         await resumeStored(stored, invited.code);
         return;
       }
@@ -3881,6 +4197,14 @@ export function init(doc = document, win = window) {
     const groupId = lastGroup(local);
     const stored = groupId ? sessionFor(local, groupId) : null;
     if (!stored) {
+      /* This tab closed a session: nothing is left to resume, and the landing screen says which
+         of the three endings brought the tab here. */
+      const ended = sessionEndMessage(takeSessionEnd());
+      if (ended) {
+        showCreate();
+        showNotice(ended);
+        return;
+      }
       if (win.navigator?.onLine === false) showNotice(OFFLINE_FIRST_MESSAGE);
       return;
     }

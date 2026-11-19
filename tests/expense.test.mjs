@@ -23,6 +23,7 @@ import {
   validateNote,
   validateTime
 } from '../public/expense.js';
+import { percent } from '../public/calc.js';
 
 test('expense: a typed amount becomes integer paise, and the edges are refused', () => {
   assert.deepEqual(parseAmount('1,234.56'), { ok: true, paise: 123_456 });
@@ -72,13 +73,88 @@ test('expense: the preview and the saved map are one call', () => {
 });
 
 test('expense: default percentages are one decimal and sum to 100 for any group size', () => {
-  for (let count = 1; count <= 10; count += 1) {
+  for (let count = 1; count <= 25; count += 1) {
     const ids = Array.from({ length: count }, (_, at) => `m${at}`);
     const percentages = defaultPercentages(ids);
     const total = Object.values(percentages).reduce((sum, value) => sum + value, 0);
-    assert.equal(Math.round(total * 10), 1_000, `${count} members`);
+    assert.ok(Math.abs(total - 100) <= 1e-9, `${count} members total ${total}`);
     for (const value of Object.values(percentages)) {
       assert.equal(Math.round(value * 10), value * 10, 'one decimal');
+    }
+
+    /* The defaults are a real split, not just a set of numbers that add up: the guard accepts
+       them and the parts fit the amount. */
+    const at = `${count} members`;
+    const shares = percent(10_000, percentages);
+    const paid = Object.values(shares).reduce((sum, paise) => sum + paise, 0);
+    assert.equal(Object.keys(shares).length, count, at);
+    assert.equal(paid, 10_000, at);
+    for (const paise of Object.values(shares)) {
+      assert.ok(Number.isSafeInteger(paise) && paise >= 0 && paise <= 10_000, at);
+    }
+  }
+});
+
+test('expense: a percent split that does not total 100 is refused, and 100 % is one member', () => {
+  const over = splitFor({
+    mode: 'percent',
+    amountPaise: 1_000,
+    percentages: { a: 50.01, b: 50.01 }
+  });
+  assert.equal(over.ok, false);
+  assert.match(over.message, /total 100/);
+
+  const short = splitFor({ mode: 'percent', amountPaise: 1_000, percentages: { a: 49.96, b: 50 } });
+  assert.equal(short.ok, false);
+  assert.match(short.message, /total 100/);
+
+  const onlyRounds = splitFor({
+    mode: 'percent',
+    amountPaise: 1_000,
+    percentages: { a: 33.34, b: 33.34, c: 33.34 }
+  });
+  assert.equal(onlyRounds.ok, false);
+
+  assert.deepEqual(
+    splitFor({ mode: 'percent', amountPaise: 1_000, percentages: { a: 100.02 } }),
+    { ok: false, message: 'Percentages must total 100 %.' },
+    'one member at 100.02 % is refused with the sentence the sheet shows'
+  );
+
+  assert.deepEqual(splitFor({ mode: 'percent', amountPaise: 1_000, percentages: { a: 100 } }), {
+    ok: true,
+    shares: { a: 1_000 }
+  });
+  assert.deepEqual(
+    splitFor({ mode: 'percent', amountPaise: 1_000, percentages: { a: 100, b: 0 } }),
+    { ok: true, shares: { a: 1_000 } },
+    '100 % is one member; the zero is left out'
+  );
+});
+
+test('expense: every mode that reports ok splits the amount exactly', () => {
+  const memberIds = ['a', 'b', 'c'];
+
+  for (const amountPaise of [1, 2, 7, 100, 101, 999, 1_000, 12_345, 99_999, MAX_PAISE]) {
+    const attempts = [
+      { mode: 'equal', memberIds },
+      { mode: 'chosen', chosenIds: ['b', 'c'] },
+      { mode: 'percent', percentages: defaultPercentages(memberIds) },
+      { mode: 'percent', percentages: { a: 50, b: 25, c: 25 } },
+      { mode: 'shares', shareWeights: { a: 3, b: 2, c: 0 } },
+      { mode: 'custom', amounts: { a: amountPaise, b: 0, c: 0 } }
+    ];
+
+    for (const attempt of attempts) {
+      const at = `${attempt.mode} at ${amountPaise} paise`;
+      const result = splitFor({ amountPaise, ...attempt });
+      assert.equal(result.ok, true, at);
+
+      const total = Object.values(result.shares).reduce((sum, paise) => sum + paise, 0);
+      assert.equal(total, amountPaise, at);
+      for (const paise of Object.values(result.shares)) {
+        assert.ok(Number.isSafeInteger(paise) && paise >= 0, at);
+      }
     }
   }
 });

@@ -64,6 +64,46 @@ li { margin: 0.4rem 0; }
 
 .muted { color: var(--muted); font-size: 0.95rem; }
 
+/* ------------------------------------------------------------------- presence */
+
+/* The presence chip: a row of avatars and the sentence beside them. It wraps rather than widens, so
+   a group of twelve on a phone stays inside the page instead of pushing the layout sideways. */
+.presence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  max-width: 100%;
+}
+
+/* A fixed square is the one size an avatar cannot give up: it is what the shape is drawn in, while
+   everything else on the row may shrink and wrap. */
+.presence-avatar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* A long name breaks rather than holding the row wider than the column it sits in. */
+.presence-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* A shape is a border-radius, so the initial inside it stays upright and readable. */
+.presence-avatar-circle { border-radius: 50%; }
+.presence-avatar-square { border-radius: 0.3rem; }
+.presence-avatar-squircle { border-radius: 38%; }
+.presence-avatar-arch { border-radius: 50% 50% 0.3rem 0.3rem; }
+.presence-avatar-leaf { border-radius: 50% 0.3rem; }
+.presence-avatar-pill { border-radius: 999px; width: 2.2rem; }
+
 a { color: var(--accent); }
 
 :focus-visible {
@@ -148,6 +188,8 @@ button {
 .primary:disabled {
   cursor: progress;
   opacity: 0.65;
+  /* A faded control is a control nobody can see; it must never be the target of a tap. */
+  pointer-events: none;
 }
 
 .secondary {
@@ -404,6 +446,26 @@ button {
 
 .expense-row.pending .expense-meta {
   color: var(--accent);
+}
+
+/*
+ * The row keeps its actions out of sight until they are asked for — but only where there is a
+ * pointer that can ask. A mouse reveals them by hovering the row, and the keyboard reveals them by
+ * focusing one, so `pointer-events` moves with the pixels: a control that is not painted is never
+ * the target of a tap. A device that reports no hover never receives this block at all, so a phone
+ * paints Edit and Delete from the first frame instead of leaving two invisible buttons over the row.
+ */
+@media (hover: hover) {
+  .expense-actions {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .expense-row:hover .expense-actions,
+  .expense-row:focus-within .expense-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 /* ------------------------------------------------------------ expense sheet */

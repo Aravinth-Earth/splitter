@@ -75,11 +75,13 @@ function connect(url) {
           closed() {
             return closed;
           },
-          async next(timeoutMs = 5_000, includePresence = false) {
+          /* `includeHere` asks for the presence heartbeat frames as well as the rest: a test that
+             is not about presence has no business failing because one arrived. */
+          async next(timeoutMs = 5_000, includeHere = false) {
             for (;;) {
               if (frames.length) {
                 const frame = frames.shift();
-                if (!includePresence && frame.t === 'presence') continue;
+                if (!includeHere && frame.t === 'here') continue;
                 return frame;
               }
               const frame = await new Promise((done, fail) => {
@@ -95,20 +97,29 @@ function connect(url) {
                   }
                 });
               });
-              if (!includePresence && frame.t === 'presence') continue;
+              if (!includeHere && frame.t === 'here') continue;
               return frame;
             }
           },
           async silence(ms = 400) {
-            const keep = frames.filter((frame) => frame.t !== 'presence');
+            const keep = frames.filter((frame) => frame.t !== 'here');
             frames.length = 0;
             frames.push(...keep);
             if (frames.length) throw new Error(`unexpected frame: ${JSON.stringify(frames[0])}`);
             await new Promise((done) => setTimeout(done, ms));
-            const later = frames.filter((frame) => frame.t !== 'presence');
+            const later = frames.filter((frame) => frame.t !== 'here');
             frames.length = 0;
             frames.push(...later);
             if (frames.length) throw new Error(`unexpected frame: ${JSON.stringify(frames[0])}`);
+          },
+          /* Every frame that arrives in the next `ms`, raw and unfiltered — including the presence
+             frames `next` skips. This is how a test says "not one of these reached this socket":
+             draining first means the window holds only what arrived inside it. */
+          async window(ms = 400) {
+            const seen = frames.splice(0, frames.length);
+            await new Promise((done) => setTimeout(done, ms));
+            seen.push(...frames.splice(0, frames.length));
+            return seen;
           },
           async waitClosed(timeoutMs = 5_000) {
             if (closed) return closed;
@@ -285,16 +296,36 @@ test('an unknown room, a bad origin and a non-upgrade request are refused before
     headers: { origin: 'https://evil.example' }
   });
   assert.equal(origin.status, 403);
+  assert.deepEqual(await origin.json(), { error: 'origin' }, 'the refusal names the origin, not a room');
 
   const upgrade = await fetch(`${worker.baseUrl}/api/ws?room=${group.groupId}`, {
     headers: { origin: worker.baseUrl }
   });
   assert.equal(upgrade.status, 426);
+  /* `Upgrade` is hop-by-hop and the HTTP client strips it, so the observable proof is the answer's
+     shape: a JSON refusal, not an attempted handshake. */
+  assert.match(
+    upgrade.headers.get('content-type') ?? '',
+    /^application\/json/,
+    'a refused upgrade is a JSON answer, not a socket'
+  );
+  assert.deepEqual(await upgrade.json(), { error: 'upgrade' });
 
   const room = await fetch(`${worker.baseUrl}/api/ws?room=not-a-group`, {
     headers: { origin: worker.baseUrl }
   });
   assert.equal(room.status, 400);
+  assert.deepEqual(await room.json(), { error: 'room' }, 'the refusal names the room, not the origin');
+
+  /* The socket route is a GET. A wrong method is answered before any handshake, with the method
+     the route takes — the same 405 contract the other routes keep. */
+  const wsMethod = await fetch(`${worker.baseUrl}/api/ws?room=${group.groupId}`, {
+    method: 'POST',
+    headers: { origin: worker.baseUrl }
+  });
+  assert.equal(wsMethod.status, 405, 'a socket is opened with GET');
+  assert.equal(wsMethod.headers.get('allow'), 'GET', 'a 405 must carry Allow: GET');
+  assert.deepEqual(await wsMethod.json(), { error: 'method' });
 
   const known = await fetch(`${worker.baseUrl}/api/room?room=${group.groupId}`);
   assert.equal(known.status, 200);
@@ -459,7 +490,272 @@ test('a sealed expense leaves no description or amount on the wire', async (t) =
   assert.equal(typeof record.blob.ct, 'string');
 });
 
-test('presence carries approved ids once, ignores pending, and drops on close', async (t) => {
+/** The next `here` frame that satisfies `wanted`; every other frame it passes is dropped. */
+async function hereWhere(socket, wanted = () => true, timeoutMs = 5_000) {
+  for (;;) {
+    const frame = await socket.next(timeoutMs, true);
+    if (frame.t === 'here' && wanted(frame)) return frame;
+  }
+}
+
+/** A member who joined and was approved, so a here frame can name them. */
+async function approveMember(worker, group, host, { name = 'Here' } = {}) {
+  const secret = randomSecret();
+  const id = await idFromSecret(secret);
+  const socket = await connect(socketUrl(worker.baseUrl, group.groupId));
+  socket.send({ t: 'auth', id, secret, mode: 'join', nameBlob: await seal(group.key, { name }) });
+  assert.equal((await socket.next()).t, 'waiting');
+  await host.next();
+  host.send({ t: 'approve', memberId: id });
+  assert.equal((await socket.next()).role, 'member');
+  await host.next();
+  return { socket, id, secret };
+}
+
+/**
+ * The next `here` frame that satisfies `wanted`, plus every frame passed on the way to it.
+ *
+ * `seen` is unfiltered — the matching frame included — so a test can say what the wire never
+ * carried as well as what it did. `elapsed` is how long the matching frame took: on the unset 30 s
+ * heartbeat, a frame inside 1.5 s is the change and not the timer.
+ */
+async function hereWithin(socket, wanted, timeoutMs = 1_500) {
+  const started = Date.now();
+  const seen = [];
+  for (;;) {
+    const left = timeoutMs - (Date.now() - started);
+    if (left <= 0) throw new Error(`no matching here frame within ${timeoutMs} ms`);
+    const frame = await socket.next(left, true);
+    seen.push(frame);
+    if (frame.t === 'here' && wanted(frame)) return { frame, seen, elapsed: Date.now() - started };
+  }
+}
+
+/** A here frame as the wire promises it: the two keys, and ids that are strings. */
+function assertHereFrame(frame) {
+  assert.deepEqual(
+    Object.keys(frame).sort(),
+    ['ids', 't'],
+    'a here frame has these two keys and nothing else'
+  );
+  assert.equal(Array.isArray(frame.ids), true, 'ids is a list');
+  for (const id of frame.ids) assert.equal(typeof id, 'string', 'every id is a string');
+}
+
+/** Presence has one spelling on the wire: no legacy `presence` frame and no top-level `here` key. */
+function assertPresenceOnly(frames) {
+  for (const frame of frames) {
+    assert.notEqual(frame.t, 'presence', 'the legacy presence frame is not on the wire');
+    assert.equal(Object.hasOwn(frame, 'here'), false, 'presence is not a top-level here key');
+  }
+}
+
+/* ------------------------------------------------------- presence: a heartbeat, ids only */
+
+test('a here frame carries the two keys and nothing else, and every heartbeat sends one', async (t) => {
+  const worker = await startWorker({ vars: { HEARTBEAT_MS: '400' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  assert.equal((await host.next()).t, 'state');
+
+  /* The frame the host's own arrival sent, so the two that follow are beats and nothing else:
+     with no traffic between them, each one is the timer firing. */
+  const arrival = await host.next(3_000, true);
+  assert.equal(arrival.t, 'here');
+
+  for (let beat = 1; beat <= 2; beat += 1) {
+    const frame = await host.next(3_000, true);
+    assert.equal(frame.t, 'here', `beat ${beat} is a here frame`);
+    assert.deepEqual(
+      Object.keys(frame).sort(),
+      ['ids', 't'],
+      'a here frame has these two keys and nothing else'
+    );
+    assert.equal(Array.isArray(frame.ids), true, 'ids is a list');
+    for (const id of frame.ids) assert.equal(typeof id, 'string', 'every id is a string');
+    assert.deepEqual(frame.ids, [group.hostId], 'the host alone is here');
+  }
+});
+
+test('a here frame arrives on every heartbeat, and no heartbeat is invented on the default', async (t) => {
+  const beating = await startWorker({ vars: { HEARTBEAT_MS: '400' } });
+  t.after(() => beating.stop());
+
+  const group = await createGroup(beating.baseUrl);
+  const host = await connect(socketUrl(beating.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+  await hereWhere(host, () => true); // the arrival frame
+
+  /* Twice in succession, with no traffic in between and no close: the frames can only be beats. */
+  assert.equal((await hereWhere(host, () => true)).t, 'here');
+  assert.equal((await hereWhere(host, () => true)).t, 'here');
+
+  /* The same page with no heartbeat var: the timer is 30 s, so 1.5 s of silence is the proof
+     that the beats above came from the var and not from something that always ticks. */
+  const quiet = await startWorker();
+  t.after(() => quiet.stop());
+
+  const quietGroup = await createGroup(quiet.baseUrl);
+  const quietHost = await connect(socketUrl(quiet.baseUrl, quietGroup.groupId));
+  t.after(() => quietHost.close());
+  quietHost.send({ t: 'auth', id: quietGroup.hostId, secret: quietGroup.hostSecret, mode: 'resume' });
+  assert.equal((await quietHost.next()).t, 'state');
+  await quietHost.next(3_000, true); // the arrival frame
+
+  const frames = await quietHost.window(1_500);
+  assert.deepEqual(frames, [], 'no heartbeat inside 1.5 s on the 30 s default');
+});
+
+test('a member who leaves is gone from ids while their other tab is still attached', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const member = await approveMember(worker, group, host);
+  t.after(() => member.socket.close());
+
+  const second = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => second.close());
+  second.send({ t: 'auth', id: member.id, secret: member.secret, mode: 'resume' });
+  assert.equal((await second.next()).t, 'state');
+
+  const both = await hereWhere(host, (frame) => frame.ids.includes(member.id));
+  assert.equal(
+    both.ids.filter((id) => id === member.id).length,
+    1,
+    'two tabs are one id'
+  );
+
+  /* One tab leaves. The roster row becomes `left`, so the other tab — still attached — can no
+     longer put the member in a here frame. */
+  member.socket.send({ t: 'leave' });
+  assert.deepEqual(await member.socket.next(), { t: 'left' });
+  assert.equal((await member.socket.waitClosed()).code, 1000);
+
+  const gone = await hereWhere(host, (frame) => !frame.ids.includes(member.id));
+  assert.deepEqual(gone.ids, [group.hostId], 'a member who left is not here');
+  assert.equal(second.closed(), null, 'their other tab is still attached');
+});
+
+test('a second socket for one member is one id, and stays while either speaks', async (t) => {
+  const worker = await startWorker({ vars: { SILENCE_MS: '400', HEARTBEAT_MS: '200' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const member = await approveMember(worker, group, host);
+  t.after(() => member.socket.close());
+
+  const second = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => second.close());
+  second.send({ t: 'auth', id: member.id, secret: member.secret, mode: 'resume' });
+  assert.equal((await second.next()).t, 'state');
+
+  /* The first tab says nothing at all; the second speaks often enough to stay inside the
+     silence window. The member is present because one of their sockets is. */
+  const tab = setInterval(() => second.send({ t: 'ping' }), 120);
+  const self = setInterval(() => host.send({ t: 'ping' }), 120);
+  t.after(() => clearInterval(tab));
+  t.after(() => clearInterval(self));
+
+  const beats = (await host.window(900)).filter((frame) => frame.t === 'here');
+  assert.ok(beats.length >= 2, 'the heartbeat ran while the tab spoke');
+  for (const frame of beats) {
+    assert.ok(frame.ids.includes(member.id), 'the member stays while one tab speaks');
+    assert.ok(frame.ids.includes(group.hostId), 'and the host stays while it speaks');
+    assert.equal(
+      frame.ids.filter((id) => id === member.id).length,
+      1,
+      'two sockets for one member are one id'
+    );
+  }
+
+  clearInterval(tab);
+  clearInterval(self);
+
+  const gone = await hereWhere(host, (frame) => !frame.ids.includes(member.id));
+  assert.ok(Array.isArray(gone.ids), 'both tabs went quiet, so the member left ids');
+  assert.equal(second.closed(), null, 'and the socket is still open');
+});
+
+test('a member that stops sending leaves ids without a close, and their socket stays open', async (t) => {
+  const worker = await startWorker({ vars: { SILENCE_MS: '700', HEARTBEAT_MS: '200' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  /* The host keeps talking, so the only silence in the group is the member's. */
+  const speaking = setInterval(() => host.send({ t: 'ping' }), 150);
+  t.after(() => clearInterval(speaking));
+
+  const member = await approveMember(worker, group, host);
+  t.after(() => member.socket.close());
+
+  /* One last frame from the member, inside the window, so the here frame that names them is a
+     frame about this socket speaking and not a leftover from the approval. */
+  member.socket.send({ t: 'ping' });
+  const present = await hereWhere(host, (frame) => frame.ids.includes(member.id), 3_000);
+  assert.deepEqual([...present.ids].sort(), [group.hostId, member.id].sort());
+
+  /* Nothing closes the member's socket. The one thing that changed is that it stopped speaking,
+     and that is enough for the next beat to leave them out. */
+  const gone = await hereWhere(host, (frame) => !frame.ids.includes(member.id), 3_000);
+  assert.deepEqual(gone.ids, [group.hostId], 'a socket that stopped speaking is no longer here');
+  assert.equal(member.socket.closed(), null, 'and its socket was never closed');
+});
+
+test('a socket that only pings stays in ids past the silence timeout', async (t) => {
+  const worker = await startWorker({ vars: { SILENCE_MS: '600', HEARTBEAT_MS: '200' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  /* A silent member, so the window is shown to be live: the pinging socket is not kept merely
+     because presence never drops anyone. */
+  const member = await approveMember(worker, group, host);
+  t.after(() => member.socket.close());
+
+  /* Pings are all this socket says, and none of them is about presence. It stays here anyway,
+     across more than two silence windows. */
+  const pinging = setInterval(() => host.send({ t: 'ping' }), 150);
+  t.after(() => clearInterval(pinging));
+
+  const beats = (await host.window(1_500)).filter((frame) => frame.t === 'here');
+  assert.ok(beats.length >= 4, 'the heartbeat ran across more than two silence windows');
+  for (const frame of beats) {
+    assert.ok(frame.ids.includes(group.hostId), 'a socket that only pings is still here');
+  }
+  assert.ok(
+    beats.some((frame) => !frame.ids.includes(member.id)),
+    'the member that went silent is gone, so the silence window is doing the work'
+  );
+  assert.equal(member.socket.closed(), null, 'and the silent socket is still attached');
+});
+
+test('every change to the present set sends a here frame at once on the default heartbeat', async (t) => {
   const worker = await startWorker();
   t.after(() => worker.stop());
 
@@ -468,60 +764,359 @@ test('presence carries approved ids once, ignores pending, and drops on close', 
   t.after(() => host.close());
   host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
   assert.equal((await host.next()).t, 'state');
-  const alone = await host.next(5_000, true);
-  assert.equal(alone.t, 'presence');
-  assert.deepEqual(Object.keys(alone).sort(), ['here', 't'], 'presence carries ids only');
-  assert.deepEqual(alone.here, [group.hostId]);
+  assert.deepEqual((await hereWhere(host, () => true)).ids, [group.hostId], 'the host arrives alone');
 
-  const memberSecret = randomSecret();
-  const memberId = await idFromSecret(memberSecret);
-  const member = await connect(socketUrl(worker.baseUrl, group.groupId));
-  t.after(() => member.close());
-  member.send({
+  /* 30 s between beats means a frame inside 1.5 s is the change, not the timer. */
+  const member = await approveMember(worker, group, host);
+  t.after(() => member.socket.close());
+
+  const joined = await hereWhere(host, (frame) => frame.ids.includes(member.id), 1_500);
+  assert.deepEqual([...joined.ids].sort(), [group.hostId, member.id].sort());
+
+  member.socket.close();
+  const left = await hereWhere(host, (frame) => !frame.ids.includes(member.id), 1_500);
+  assert.deepEqual(left.ids, [group.hostId], 'a close reaches the others at once');
+});
+
+test('member authentication, open admission, removal and leave each send a here frame at once', async (t) => {
+  /* No HEARTBEAT_MS: the default is 30 s, so a frame inside 1.5 s of a change is that change. */
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  assert.equal((await host.next()).t, 'state');
+  assert.deepEqual((await hereWhere(host, () => true)).ids, [group.hostId], 'the host arrives alone');
+
+  const member = await approveMember(worker, group, host);
+  t.after(() => member.socket.close());
+  await hereWhere(host, (frame) => frame.ids.includes(member.id));
+
+  /* 1. A member authenticating on a second socket: the host hears it without a beat to wait for. */
+  member.socket.close();
+  await hereWhere(host, (frame) => !frame.ids.includes(member.id));
+
+  const resumed = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => resumed.close());
+  resumed.send({ t: 'auth', id: member.id, secret: member.secret, mode: 'resume' });
+  const authenticated = await hereWithin(host, (frame) => frame.ids.includes(member.id));
+  assert.ok(authenticated.elapsed <= 1_500, 'authentication is announced at once');
+  assertHereFrame(authenticated.frame);
+  assert.deepEqual([...authenticated.frame.ids].sort(), [group.hostId, member.id].sort());
+  assertPresenceOnly(authenticated.seen);
+  assert.equal((await resumed.next()).t, 'state', 'the member is told who it is');
+
+  /* 2. Open admission: nobody approves, so the only thing that can tell the host is the change. */
+  host.send({ t: 'mode', mode: 'open' });
+  assert.equal((await host.next()).t, 'state', 'the mode change is acknowledged');
+
+  const openedSecret = randomSecret();
+  const openedId = await idFromSecret(openedSecret);
+  const opened = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => opened.close());
+  opened.send({
     t: 'auth',
-    id: memberId,
-    secret: memberSecret,
+    id: openedId,
+    secret: openedSecret,
     mode: 'join',
-    nameBlob: await seal(group.key, { name: 'Here' })
+    nameBlob: await seal(group.key, { name: 'Walk-in' })
   });
-  assert.equal((await member.next()).t, 'waiting');
-  await host.next();
-  await host.silence(300);
+  const admitted = await hereWithin(host, (frame) => frame.ids.includes(openedId));
+  assert.ok(admitted.elapsed <= 1_500, 'open admission is announced at once');
+  assertHereFrame(admitted.frame);
+  assert.deepEqual(
+    [...admitted.frame.ids].sort(),
+    [group.hostId, member.id, openedId].sort(),
+    'the walk-in is here alongside the two who were'
+  );
+  assertPresenceOnly(admitted.seen);
+  assert.equal((await opened.next()).t, 'state', 'open admission admits without a decision');
 
-  host.send({ t: 'approve', memberId });
-  assert.equal((await member.next()).t, 'state');
-  const memberPresence = await member.next(5_000, true);
-  assert.equal(memberPresence.t, 'presence');
-  assert.deepEqual([...memberPresence.here].sort(), [group.hostId, memberId].sort());
-  await host.next();
-  assert.equal((await host.next(5_000, true)).t, 'presence');
+  /* 3. Removal: the removed id leaves ids on the same act, not on the next beat. */
+  host.send({ t: 'remove', memberId: openedId });
+  assert.deepEqual(await opened.next(), { t: 'removed' });
+  const removed = await hereWithin(host, (frame) => !frame.ids.includes(openedId));
+  assert.ok(removed.elapsed <= 1_500, 'a removal is announced at once');
+  assertHereFrame(removed.frame);
+  assert.deepEqual([...removed.frame.ids].sort(), [group.hostId, member.id].sort());
+  assertPresenceOnly(removed.seen);
 
-  /* Two tabs of one member count once. */
-  const second = await connect(socketUrl(worker.baseUrl, group.groupId));
-  t.after(() => second.close());
-  second.send({ t: 'auth', id: memberId, secret: memberSecret, mode: 'resume' });
-  assert.equal((await second.next()).t, 'state');
-  const twoTabs = await second.next(5_000, true);
-  assert.equal(twoTabs.t, 'presence');
-  assert.equal(twoTabs.here.filter((id) => id === memberId).length, 1);
-  await host.next(5_000, true);
+  /* 4. Leave: the leaving socket says so itself, and the host hears the same change. */
+  /* Drain the state broadcasts the mode change, the admission and the removal sent this socket,
+     so the next frame it receives is the answer to the leave. */
+  await resumed.window(50);
+  resumed.send({ t: 'leave' });
+  assert.deepEqual(await resumed.next(), { t: 'left' });
+  const left = await hereWithin(host, (frame) => !frame.ids.includes(member.id));
+  assert.ok(left.elapsed <= 1_500, 'a leave is announced at once');
+  assertHereFrame(left.frame);
+  assert.deepEqual(left.frame.ids, [group.hostId]);
+  assertPresenceOnly(left.seen);
+  assert.equal((await resumed.waitClosed()).code, 1000, 'the leaving socket is closed normally');
+});
 
-  second.close();
-  const stillHere = await host.next(5_000, true);
-  assert.equal(stillHere.t, 'presence');
-  assert.ok(stillHere.here.includes(memberId), 'one tab closing does not remove the member');
+test('the host ids names no unauthenticated, pending, refused or just-removed id', async (t) => {
+  const worker = await startWorker({ vars: { HEARTBEAT_MS: '300', MAX_MEMBERS: '2' } });
+  t.after(() => worker.stop());
 
-  member.close();
-  let gone = null;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const frame = await host.next(5_000, true);
-    if (!frame.here.includes(memberId)) {
-      gone = frame;
-      break;
-    }
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  assert.equal((await host.next()).t, 'state');
+  assert.deepEqual((await hereWhere(host, () => true)).ids, [group.hostId], 'the host arrives alone');
+
+  /* Attached and not yet anybody: a socket with no identity has no id to be named. */
+  const anonymous = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => anonymous.close());
+
+  /* A pending join holds the group's last seat; its id is a real member id and it is not here. */
+  const secret = randomSecret();
+  const id = await idFromSecret(secret);
+  const pending = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => pending.close());
+  pending.send({
+    t: 'auth',
+    id,
+    secret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Waiting' })
+  });
+  assert.equal((await pending.next()).t, 'waiting');
+  await host.next(); // the host's pending notification
+
+  const waiting = (await host.window(900)).filter((frame) => frame.t === 'here');
+  assert.ok(waiting.length >= 2, 'the heartbeat ran while the pending socket waited');
+  for (const frame of waiting) {
+    assertHereFrame(frame);
+    assert.deepEqual(
+      frame.ids,
+      [group.hostId],
+      'a pending id is not here, and an unauthenticated socket has no id'
+    );
   }
-  assert.equal(gone.t, 'presence');
-  assert.deepEqual(gone.here, [group.hostId]);
+  assertPresenceOnly(waiting);
+
+  /* The group is full, so this join is refused and its socket closed: its id is never named. */
+  const refusedSecret = randomSecret();
+  const refusedId = await idFromSecret(refusedSecret);
+  const refused = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => refused.close());
+  refused.send({
+    t: 'auth',
+    id: refusedId,
+    secret: refusedSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Too Many' })
+  });
+  assert.deepEqual(await refused.next(), { t: 'refused', code: 'group_full' });
+  await refused.waitClosed();
+
+  const stillWaiting = (await host.window(600)).filter((frame) => frame.t === 'here');
+  assert.ok(stillWaiting.length >= 1, 'the heartbeat ran while the refused id was kept out');
+  for (const frame of stillWaiting) {
+    assert.equal(frame.ids.includes(refusedId), false, 'a refused id is not here');
+  }
+
+  /* Admitted, so the capture is not vacuous: an approved socket is named on the same act. */
+  host.send({ t: 'approve', memberId: id });
+  assert.equal((await pending.next()).role, 'member');
+  await host.next(); // the roster frame the approval sends the host
+  const admitted = await hereWhere(host, (frame) => frame.ids.includes(id));
+  assert.deepEqual([...admitted.ids].sort(), [group.hostId, id].sort(), 'the approved socket is here');
+
+  /* Removed: `ids` drops the id on the removal itself, and no later beat brings it back. */
+  host.send({ t: 'remove', memberId: id });
+  assert.deepEqual(await pending.next(), { t: 'removed' });
+  const gone = await hereWhere(host, (frame) => !frame.ids.includes(id));
+  assert.deepEqual(gone.ids, [group.hostId], 'a removed id leaves ids at once');
+
+  const after = (await host.window(900)).filter((frame) => frame.t === 'here');
+  assert.ok(after.length >= 2, 'the heartbeat ran after the removal');
+  for (const frame of after) {
+    assertHereFrame(frame);
+    assert.deepEqual(frame.ids, [group.hostId], 'a just-removed id is named by no later beat');
+  }
+  assertPresenceOnly(after);
+});
+
+test('no here frame reaches a pending, refused or removed socket', async (t) => {
+  const worker = await startWorker({ vars: { HEARTBEAT_MS: '400', MAX_MEMBERS: '2' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  /* A pending socket: it holds the group's last seat while it waits. */
+  const pendingSecret = randomSecret();
+  const pendingId = await idFromSecret(pendingSecret);
+  const pending = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => pending.close());
+  pending.send({
+    t: 'auth',
+    id: pendingId,
+    secret: pendingSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Waiting' })
+  });
+  assert.equal((await pending.next()).t, 'waiting');
+  await host.next();
+
+  const pendingFrames = await pending.window(900);
+  assert.equal(
+    pendingFrames.some((frame) => frame.t === 'here'),
+    false,
+    'a pending socket gets no presence'
+  );
+
+  /* The refused socket: the group is full, so this join is told so and closed. */
+  const refusedSecret = randomSecret();
+  const refused = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => refused.close());
+  refused.send({
+    t: 'auth',
+    id: await idFromSecret(refusedSecret),
+    secret: refusedSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Too Many' })
+  });
+  assert.deepEqual(await refused.next(), { t: 'refused', code: 'group_full' });
+  const refusedFrames = await refused.window(900);
+  assert.equal(refusedFrames.some((frame) => frame.t === 'here'), false, 'a refused socket gets no presence');
+
+  /* The removed socket: approved, then removed, so its close is not the only thing that must
+     have kept presence off it. */
+  host.send({ t: 'approve', memberId: pendingId });
+  assert.equal((await pending.next()).t, 'state');
+  await hereWhere(pending, (frame) => frame.ids.includes(pendingId));
+  host.send({ t: 'remove', memberId: pendingId });
+  assert.deepEqual(await pending.next(), { t: 'removed' });
+  const removedFrames = await pending.window(900);
+  assert.equal(removedFrames.some((frame) => frame.t === 'here'), false, 'a removed socket gets no presence');
+
+  /* None of those windows is vacuous: the host, which may see presence, saw beats throughout. */
+  const hostHeres = (await host.window(900)).filter((frame) => frame.t === 'here');
+  assert.ok(hostHeres.length >= 1, 'the heartbeat was running while those sockets got nothing');
+});
+
+test('every ping gets exactly one pong, and presence never stands in for one', async (t) => {
+  const worker = await startWorker({ vars: { HEARTBEAT_MS: '300' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  assert.equal((await host.next()).t, 'state');
+
+  await host.window(60); // a clean buffer: the window below holds only this test's answers
+
+  for (let ping = 0; ping < 3; ping += 1) {
+    host.send({ t: 'ping' });
+    await new Promise((done) => setTimeout(done, 60));
+  }
+
+  const frames = await host.window(600);
+  const pongs = frames.filter((frame) => frame.t === 'pong');
+  assert.equal(pongs.length, 3, 'three pings, three pongs');
+  assert.ok(
+    frames.some((frame) => frame.t === 'here'),
+    'the heartbeat ran alongside, and did not replace a pong'
+  );
+});
+
+test('presence leaves the group expiry clock alone', async (t) => {
+  const token = 'operator-presence-clock';
+  const worker = await startWorker({ vars: { OPERATOR_TOKEN: token, HEARTBEAT_MS: '400' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  async function counters() {
+    const response = await fetch(`${worker.baseUrl}/api/counters`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ groupId: group.groupId })
+    });
+    assert.equal(response.status, 200, 'the group answers its counters');
+    return response.json();
+  }
+
+  const before = await counters();
+  const beats = (await host.window(900)).filter((frame) => frame.t === 'here');
+  assert.ok(beats.length >= 2, 'two beats passed between the two reads');
+  const after = await counters();
+  assert.deepEqual(after, before, 'hearing from a socket moves no counter');
+
+  /* The same read, moved by the only thing allowed to move it: an accepted write. */
+  host.send({
+    t: 'put',
+    id: randomSecret(),
+    base: 0,
+    blob: await seal(group.key, { amount: 100 }, 'sp1:rec:test'),
+    deleted: false
+  });
+  assert.equal((await host.next()).t, 'record');
+
+  const written = await counters();
+  assert.equal(written.records, before.records + 1);
+  assert.ok(written.bytes > before.bytes, 'the record is counted');
+  assert.ok(Number.isSafeInteger(written.lastWriteAt), 'and the write stamps the clock');
+});
+
+test('no here frame after the group ends or is destroyed', async (t) => {
+  const token = 'operator-presence-end';
+  const worker = await startWorker({ vars: { OPERATOR_TOKEN: token, HEARTBEAT_MS: '300' } });
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const member = await approveMember(worker, group, host);
+  t.after(() => member.socket.close());
+
+  /* Beats arrive before the end, so "no here frame" afterwards is a claim about the end and not
+     about a heartbeat that never ran. */
+  const before = await member.socket.window(700);
+  assert.ok(before.some((frame) => frame.t === 'here'), 'the heartbeat was running before the end');
+  host.send({ t: 'end' });
+  const ended = await member.socket.window(900);
+  assert.equal(ended.some((frame) => frame.t === 'ended'), true, 'the end frame is what arrives');
+  assert.equal(ended.some((frame) => frame.t === 'here'), false, 'and no presence follows the end');
+
+  /* The same guarantee from the operator's wipe: a destroyed group sends no presence. */
+  const second = await createGroup(worker.baseUrl);
+  const secondHost = await connect(socketUrl(worker.baseUrl, second.groupId));
+  t.after(() => secondHost.close());
+  secondHost.send({ t: 'auth', id: second.hostId, secret: second.hostSecret, mode: 'resume' });
+  assert.equal((await secondHost.next()).t, 'state');
+
+  await secondHost.window(50);
+  /* The same proof as the end above: the heartbeat was running when the wipe arrived. */
+  const beforeDestroy = await secondHost.window(700);
+  assert.ok(beforeDestroy.some((frame) => frame.t === 'here'), 'the heartbeat was running before the destroy');
+  const destroyed = await fetch(`${worker.baseUrl}/api/destroy`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ groupId: second.groupId })
+  });
+  assert.equal(destroyed.status, 200, 'the operator destroyed the group');
+
+  const after = await secondHost.window(900);
+  assert.equal(after.some((frame) => frame.t === 'ended'), true, 'its sockets are told it ended');
+  assert.equal(after.some((frame) => frame.t === 'here'), false, 'a destroyed group sends no presence');
 });
 
 test('the host imports participants as roster entries with no seats', async (t) => {
@@ -758,6 +1353,87 @@ test('a member leaves and their entries stay, attributed', async (t) => {
   assert.equal(again.frames.length, 0);
 });
 
+test('a put from a member\'s other socket is refused once their row is left', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+
+  /* Two tabs of one person: the seat is proved once, and the second socket is the other tab. */
+  const first = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => first.close());
+  first.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Two Tabs' })
+  });
+  assert.equal((await first.next()).t, 'waiting');
+  await host.next();
+
+  host.send({ t: 'approve', memberId });
+  assert.equal((await first.next()).t, 'state');
+  await host.next();
+
+  const second = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => second.close());
+  second.send({ t: 'auth', id: memberId, secret: memberSecret, mode: 'resume' });
+  assert.equal((await second.next()).t, 'state');
+
+  first.send({ t: 'leave' });
+  assert.deepEqual(await first.next(), { t: 'left' });
+  const afterLeave = await host.next();
+  assert.equal(
+    afterLeave.roster.find((entry) => entry.id === memberId).status,
+    'left',
+    'the row the seat was left from is no longer approved'
+  );
+  /* The remaining tab is told the new state as well; drain it so the next frame is the answer to
+     the write below. */
+  await second.window(400);
+
+  const recordId = randomSecret();
+  second.send({
+    t: 'put',
+    id: recordId,
+    base: 0,
+    deleted: false,
+    blob: await seal(group.key, { description: 'After leaving', amountPaise: 100 }, 'sp1:rec:test')
+  });
+  assert.deepEqual(
+    await second.next(),
+    { t: 'refused', code: 'unapproved', id: recordId },
+    'a socket whose row is no longer approved cannot write, even though it authenticated as a member'
+  );
+
+  const broadcast = await host.window(400);
+  assert.equal(
+    broadcast.some((frame) => frame.t === 'record'),
+    false,
+    'no record reached the other sockets'
+  );
+
+  /* Nothing was stored either: a fresh seat reads the ledger the group actually holds. */
+  const reader = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => reader.close());
+  reader.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  const state = await reader.next();
+  assert.equal(state.t, 'state');
+  assert.equal(
+    state.records.some((record) => record.id === recordId),
+    false,
+    'the refused write left no record behind'
+  );
+});
+
 test('the organizer cannot leave: the group must be ended', async (t) => {
   const worker = await startWorker();
   t.after(() => worker.stop());
@@ -791,6 +1467,56 @@ test('ending wipes the group, tells every socket and frees the slot', async (t) 
 
   const next = await createGroup(worker.baseUrl);
   assert.notEqual(next.groupId, group.groupId);
+});
+
+test('an ended group answers no room, refuses the upgrade and sends no state', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+  const member = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => member.close());
+  member.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Still Here' })
+  });
+  assert.equal((await member.next()).t, 'waiting');
+  await host.next();
+  host.send({ t: 'approve', memberId });
+  assert.equal((await member.next()).t, 'state');
+  await host.next();
+
+  host.send({ t: 'end' });
+  assert.deepEqual(await host.next(), { t: 'ended' });
+  assert.deepEqual(await member.next(), { t: 'ended' }, 'every attached socket is told once');
+  await member.waitClosed();
+
+  const room = await fetch(`${worker.baseUrl}/api/room?room=${group.groupId}`);
+  assert.equal(room.status, 404, 'the room no longer answers');
+
+  /* The upgrade itself is refused: a reconnect for an ended group cannot reach a state or a
+     record, because there is no socket to reach them on. */
+  await assert.rejects(
+    connect(socketUrl(worker.baseUrl, group.groupId)),
+    /could not connect/,
+    'no socket is accepted for a group that ended'
+  );
+  assert.equal(member.frames.filter((frame) => frame.t === 'record').length, 0);
+
+  /* An unauthenticated reader for the ended room has no route in either. */
+  const retry = await fetch(`${worker.baseUrl}/api/room?room=${group.groupId}`);
+  assert.equal(retry.status, 404);
 });
 
 test('the organizer cannot remove themselves, and only the host can remove', async (t) => {
