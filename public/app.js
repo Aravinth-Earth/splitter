@@ -99,6 +99,25 @@ export const WIPING_MESSAGE = 'This group is being deleted. Try again in a momen
    stored seat whose room the probe can no longer find. Two spellings would read as two events. */
 export const ENDED_MESSAGE = 'This group has ended. It cannot be reopened.';
 
+/* The other two ways a session ends, one sentence each. The sentence is the last thing said about
+   the group the person was in, so each reason says its own thing rather than borrowing the end's. */
+export const LEFT_MESSAGE = 'You left the group. Your expenses stay in the group.';
+export const REMOVED_MESSAGE = 'Removed from this group.';
+
+/** The sentence a closed session's reason is said with; '' for a reason this page never records. */
+export function sessionEndMessage(reason) {
+  if (reason === 'ended') return ENDED_MESSAGE;
+  if (reason === 'left') return LEFT_MESSAGE;
+  if (reason === 'removed') return REMOVED_MESSAGE;
+  return '';
+}
+
+/* The tab's own note of why its last session ended. The code is out of the address bar by the time
+   a reload happens, and the seat is gone from the stores, so this note is the only thing left that
+   can say what the landing screen is doing there. */
+const SESSION_END_KEY = 'splitter:session-end';
+
+
 /**
  * What a lifecycle frame means for this page.
  *
@@ -637,7 +656,9 @@ export function init(doc = document, win = window) {
   let queuedEditBases = new Map();
   let queuedEditRetries = new Set();
   let lifecycleAction = null;
-  let endedHandledFor = null;
+  /* The one group whose session this page has closed. Frames that were already in flight and a
+     cache or outbox timer that was already armed must not write to a group that is over. */
+  let closedGroupId = null;
   let pendingDeleteId = null;
   let editingExpense = null;
   let customSeed = null;
@@ -900,7 +921,9 @@ export function init(doc = document, win = window) {
   }
 
   function persistOutbox(entries) {
-    if (!groupId) return;
+    /* A socket that closed with the session can still report its queue on the way out; the group is
+       gone, and a queue written back into its slot is a copy of a group that ended. */
+    if (!groupId || groupId === closedGroupId) return;
     const items = entries.map((entry) => ({
       ...entry,
       baseBlob: queuedEditBases.get(entry.id)?.baseBlob ?? null
@@ -1013,7 +1036,8 @@ export function init(doc = document, win = window) {
     endGroupButton.hidden = role !== 'organizer';
     leaveGroupButton.hidden = role === 'organizer';
     closeLifecycle();
-    endedHandledFor = null;
+    closedGroupId = null;
+    clearSessionEnd();
     resetImport();
 
     groupNameDisplay.textContent = name;
@@ -1083,6 +1107,8 @@ export function init(doc = document, win = window) {
 
   /** Keep the seat on this device: the secret locally, the code for this tab only. */
   function remember({ groupId, memberId, secret, displayName, code }) {
+    /* A state frame that was being applied when the session ended must not put the seat back. */
+    if (groupId === closedGroupId) return;
     saveSession(local, {
       groupId,
       memberId,
@@ -1091,6 +1117,11 @@ export function init(doc = document, win = window) {
     });
     saveCode(tab, groupId, code);
     setLastGroup(local, groupId);
+    /* The seat now holds the code, so the address bar does not: an invite link that was joined,
+       like one that was resumed, leaves no key behind for a reload or a share. */
+    stripAddressCode();
+    /* A session started in this tab is not the one an earlier note was written about. */
+    clearSessionEnd();
   }
 
   function forget(groupId) {
@@ -1387,6 +1418,8 @@ export function init(doc = document, win = window) {
     hideNotice();
     closeJoinSocket();
     closeHostSocket();
+    /* This tab is opening a session again: the group it closed before is not this one's guard. */
+    closedGroupId = null;
 
     const groupIdValue = await groupIdFromCode(code);
     if (groupIdValue !== session.groupId) {
@@ -1531,7 +1564,7 @@ export function init(doc = document, win = window) {
         }
         const lifecycle = lifecycleFrameOutcome(frame);
         if (lifecycle === 'leave') {
-          handleEnded();
+          closeSession('ended', groupIdValue ?? lastGroup(local));
           return;
         }
         if (lifecycle === 'stay') {
@@ -1539,15 +1572,11 @@ export function init(doc = document, win = window) {
           return;
         }
         if (frame.t === 'left') {
-          handleLeft();
+          closeSession('left', groupIdValue ?? lastGroup(local));
           return;
         }
         if (frame.t === 'removed') {
-          dropGroupCache(groupIdValue);
-          forget(groupIdValue);
-          socket.close();
-          joinSocket = null;
-          showJoin({ code, error: 'Removed from this group.' });
+          closeSession('removed', groupIdValue ?? lastGroup(local));
           return;
         }
         if (frame.t === 'refused') {
@@ -1578,6 +1607,8 @@ export function init(doc = document, win = window) {
 
   function openJoinSocket({ groupId, memberId, secret, nameBlob, code, displayName }) {
     closeJoinSocket();
+    /* This tab is opening a session again: the group it closed before is not this one's guard. */
+    closedGroupId = null;
 
     const url = new URL('api/ws', win.location.href);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1644,7 +1675,7 @@ export function init(doc = document, win = window) {
         }
         const lifecycle = lifecycleFrameOutcome(frame);
         if (lifecycle === 'leave') {
-          handleEnded();
+          closeSession('ended', groupId ?? lastGroup(local));
           return;
         }
         if (lifecycle === 'stay') {
@@ -1652,15 +1683,11 @@ export function init(doc = document, win = window) {
           return;
         }
         if (frame.t === 'left') {
-          handleLeft();
+          closeSession('left', groupId ?? lastGroup(local));
           return;
         }
         if (frame.t === 'removed') {
-          dropGroupCache(groupId);
-          forget(groupId);
-          socket.close();
-          joinSocket = null;
-          showJoin({ code, error: 'Removed from this group.' });
+          closeSession('removed', groupId ?? lastGroup(local));
           return;
         }
         if (frame.t === 'refused') {
@@ -1750,7 +1777,7 @@ export function init(doc = document, win = window) {
         }
         const lifecycle = lifecycleFrameOutcome(frame);
         if (lifecycle === 'leave') {
-          handleEnded();
+          closeSession('ended', groupId ?? lastGroup(local));
           return;
         }
         if (lifecycle === 'stay') {
@@ -1758,7 +1785,7 @@ export function init(doc = document, win = window) {
           return;
         }
         if (frame.t === 'left') {
-          handleLeft();
+          closeSession('left', groupId ?? lastGroup(local));
           return;
         }
         if (frame.t === 'import-members-ok') {
@@ -2067,6 +2094,7 @@ export function init(doc = document, win = window) {
   }
 
   function writeCacheNow(groupIdValue) {
+    if (groupIdValue === closedGroupId) return;
     const payload = cachePayload();
     if (groupIdValue && payload && saveCache(local, groupIdValue, payload)) {
       cachedSavedAt = Date.now();
@@ -2074,6 +2102,7 @@ export function init(doc = document, win = window) {
   }
 
   function scheduleCacheWrite(groupIdValue) {
+    if (groupIdValue === closedGroupId) return;
     if (cacheTimer !== null) return;
     cacheTimer = win.setTimeout(() => {
       cacheTimer = null;
@@ -2134,7 +2163,7 @@ export function init(doc = document, win = window) {
       const value = await decryptRecord(key, record, groupIdValue);
       if (value) ledger.set(record.id, { ...record, value });
     }
-    if (learned) saveRevs(local, groupIdValue, recordGuard.snapshot());
+    if (learned && groupIdValue !== closedGroupId) saveRevs(local, groupIdValue, recordGuard.snapshot());
 
     cachedBase = {
       nameBlob: frame.nameBlob,
@@ -3209,7 +3238,9 @@ export function init(doc = document, win = window) {
       noteImportFailure(frame.id);
       return;
     }
-    if (groupIdValue) saveRevs(local, groupIdValue, recordGuard.snapshot());
+    if (groupIdValue && groupIdValue !== closedGroupId) {
+      saveRevs(local, groupIdValue, recordGuard.snapshot());
+    }
     groupSocket()?.ack(frame.id);
 
     if (frame.deleted) {
@@ -3696,19 +3727,74 @@ export function init(doc = document, win = window) {
     importJob = null;
   }
 
-  /** The organizer ended the group: forget it before navigating, so no cache can resume it. */
-  function handleEnded() {
-    /* Before any state frame the page may not know the group id; the stored last group is the
-       seat's only name, and leaving it stored would offer a group that no longer exists. */
-    const current = groupId ?? lastGroup(local);
-    if (current && endedHandledFor === current) return;
-    endedHandledFor = current;
-    dropGroupCache(current);
-    if (current) forget(current);
+  /**
+   * The one ending this page performs, whichever frame or click brought it here: the organizer ended
+   * the group, this person left it, or the organizer removed them.
+   *
+   * The socket goes first, so a close event cannot arm a reconnect for a group that is over and no
+   * flush can put a queued write on the wire afterwards. Then this group's stores go — its seat, its
+   * code, the last-group pointer when it names this group, its revisions, its cached state and its
+   * outbox — and only this group's: a tab that holds another seat keeps it. A code the tab has
+   * consumed leaves the address bar, the reason is written down for the reload that will follow the
+   * landing screen, and the landing screen says that reason's own sentence.
+   */
+  function closeSession(reason, id) {
+    /* A socket that has not spoken yet may not know the group's id; the stored last group is the
+       only name this seat has. */
+    const current = id ?? groupId ?? lastGroup(local);
+    if (current && closedGroupId === current) return;
+    if (current) closedGroupId = current;
+
     closeHostSocket();
     closeJoinSocket();
+
+    if (current) {
+      dropGroupCache(current);
+      forget(current);
+    }
+    stripAddressCode();
+    recordSessionEnd(reason);
+
     showCreate();
-    showNotice(ENDED_MESSAGE);
+    showNotice(sessionEndMessage(reason));
+  }
+
+  /** The code has been read and the seat holds it; it does not belong in the address bar. */
+  function stripAddressCode() {
+    if (!/[#?](?:code|c)=/i.test(`${win.location.hash}${win.location.search}`)) return;
+    try {
+      win.history.replaceState({}, '', pageBase());
+    } catch {
+      /* a bar this browser will not rewrite is not a reason to leave the session standing */
+    }
+  }
+
+  function recordSessionEnd(reason) {
+    try {
+      tab?.setItem(SESSION_END_KEY, reason);
+    } catch {
+      /* a tab that cannot keep the note still lands on the right screen */
+    }
+  }
+
+  /** A session beginning in this tab takes the note with it: it is not that session's sentence. */
+  function clearSessionEnd() {
+    try {
+      tab?.removeItem(SESSION_END_KEY);
+    } catch {
+      /* a tab that cannot keep the note has nothing to clear */
+    }
+  }
+
+  /** Read the reason once: the sentence is said for the session that ended, not forever after. */
+  function takeSessionEnd() {
+    try {
+      const reason = tab?.getItem(SESSION_END_KEY) ?? null;
+      tab?.removeItem(SESSION_END_KEY);
+      return reason;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -3731,17 +3817,6 @@ export function init(doc = document, win = window) {
     /* A refused auth arrives while the waiting panel is the one on screen, so the sentence goes
        there as well: the status line is a four-second toast. */
     waitingCopy.textContent = WIPING_MESSAGE;
-  }
-
-  /** This device left: the group is forgotten here; its entries remain on every other screen. */
-  function handleLeft() {
-    const current = groupId;
-    dropGroupCache(current);
-    if (current) forget(current);
-    closeHostSocket();
-    closeJoinSocket();
-    showCreate();
-    showNotice('You left the group. Your expenses stay in the group.');
   }
 
   /** Build the readable copy and hand it to the browser's download flow. */
@@ -4086,6 +4161,9 @@ export function init(doc = document, win = window) {
       if (stored) {
         saveCode(tab, groupId, invited.code);
         setLastGroup(local, groupId);
+        /* The code has been read and the seat now holds it: a reload of this URL and a share of it
+           must not carry the key along. */
+        stripAddressCode();
         await resumeStored(stored, invited.code);
         return;
       }
@@ -4106,6 +4184,14 @@ export function init(doc = document, win = window) {
     const groupId = lastGroup(local);
     const stored = groupId ? sessionFor(local, groupId) : null;
     if (!stored) {
+      /* This tab closed a session: nothing is left to resume, and the landing screen says which
+         of the three endings brought the tab here. */
+      const ended = sessionEndMessage(takeSessionEnd());
+      if (ended) {
+        showCreate();
+        showNotice(ended);
+        return;
+      }
       if (win.navigator?.onLine === false) showNotice(OFFLINE_FIRST_MESSAGE);
       return;
     }

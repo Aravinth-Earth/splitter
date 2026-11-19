@@ -1092,6 +1092,19 @@ export class Group {
       return;
     }
 
+    /* The socket's role was decided when it authenticated; the roster row is what decides it now.
+       A member who left or was removed is no longer approved, and their other tab is still holding
+       a socket that authenticated as a member — so the row is read before every accepted write,
+       and a write from a seat that is no longer approved is refused instead of stored and
+       broadcast. The host has no roster row: the meta names it. */
+    if (identity.memberId !== meta.hostId) {
+      const sender = await this.ctx.storage.get(memberKey(identity.memberId));
+      if (!sender || sender.status !== 'approved') {
+        this.sendFrame(socket, { t: 'refused', code: 'unapproved', id: frame.id });
+        return;
+      }
+    }
+
     const key = recordKey(frame.id);
     const existing = await this.ctx.storage.get(key);
     if (existing?.deleted) {

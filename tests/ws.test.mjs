@@ -1353,6 +1353,87 @@ test('a member leaves and their entries stay, attributed', async (t) => {
   assert.equal(again.frames.length, 0);
 });
 
+test('a put from a member\'s other socket is refused once their row is left', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+
+  /* Two tabs of one person: the seat is proved once, and the second socket is the other tab. */
+  const first = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => first.close());
+  first.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Two Tabs' })
+  });
+  assert.equal((await first.next()).t, 'waiting');
+  await host.next();
+
+  host.send({ t: 'approve', memberId });
+  assert.equal((await first.next()).t, 'state');
+  await host.next();
+
+  const second = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => second.close());
+  second.send({ t: 'auth', id: memberId, secret: memberSecret, mode: 'resume' });
+  assert.equal((await second.next()).t, 'state');
+
+  first.send({ t: 'leave' });
+  assert.deepEqual(await first.next(), { t: 'left' });
+  const afterLeave = await host.next();
+  assert.equal(
+    afterLeave.roster.find((entry) => entry.id === memberId).status,
+    'left',
+    'the row the seat was left from is no longer approved'
+  );
+  /* The remaining tab is told the new state as well; drain it so the next frame is the answer to
+     the write below. */
+  await second.window(400);
+
+  const recordId = randomSecret();
+  second.send({
+    t: 'put',
+    id: recordId,
+    base: 0,
+    deleted: false,
+    blob: await seal(group.key, { description: 'After leaving', amountPaise: 100 }, 'sp1:rec:test')
+  });
+  assert.deepEqual(
+    await second.next(),
+    { t: 'refused', code: 'unapproved', id: recordId },
+    'a socket whose row is no longer approved cannot write, even though it authenticated as a member'
+  );
+
+  const broadcast = await host.window(400);
+  assert.equal(
+    broadcast.some((frame) => frame.t === 'record'),
+    false,
+    'no record reached the other sockets'
+  );
+
+  /* Nothing was stored either: a fresh seat reads the ledger the group actually holds. */
+  const reader = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => reader.close());
+  reader.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  const state = await reader.next();
+  assert.equal(state.t, 'state');
+  assert.equal(
+    state.records.some((record) => record.id === recordId),
+    false,
+    'the refused write left no record behind'
+  );
+});
+
 test('the organizer cannot leave: the group must be ended', async (t) => {
   const worker = await startWorker();
   t.after(() => worker.stop());
@@ -1386,6 +1467,56 @@ test('ending wipes the group, tells every socket and frees the slot', async (t) 
 
   const next = await createGroup(worker.baseUrl);
   assert.notEqual(next.groupId, group.groupId);
+});
+
+test('an ended group answers no room, refuses the upgrade and sends no state', async (t) => {
+  const worker = await startWorker();
+  t.after(() => worker.stop());
+
+  const group = await createGroup(worker.baseUrl);
+
+  const host = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => host.close());
+  host.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  await host.next();
+
+  const memberSecret = randomSecret();
+  const memberId = await idFromSecret(memberSecret);
+  const member = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => member.close());
+  member.send({
+    t: 'auth',
+    id: memberId,
+    secret: memberSecret,
+    mode: 'join',
+    nameBlob: await seal(group.key, { name: 'Still Here' })
+  });
+  assert.equal((await member.next()).t, 'waiting');
+  await host.next();
+  host.send({ t: 'approve', memberId });
+  assert.equal((await member.next()).t, 'state');
+  await host.next();
+
+  host.send({ t: 'end' });
+  assert.deepEqual(await host.next(), { t: 'ended' });
+  assert.deepEqual(await member.next(), { t: 'ended' }, 'every attached socket is told once');
+  await member.waitClosed();
+
+  const room = await fetch(`${worker.baseUrl}/api/room?room=${group.groupId}`);
+  assert.equal(room.status, 404, 'the room no longer answers');
+
+  /* The upgrade itself is refused: a reconnect for an ended group cannot reach a state or a
+     record, because there is no socket to reach them on. */
+  await assert.rejects(
+    connect(socketUrl(worker.baseUrl, group.groupId)),
+    /could not connect/,
+    'no socket is accepted for a group that ended'
+  );
+  assert.equal(member.frames.filter((frame) => frame.t === 'record').length, 0);
+
+  /* An unauthenticated reader for the ended room has no route in either. */
+  const retry = await fetch(`${worker.baseUrl}/api/room?room=${group.groupId}`);
+  assert.equal(retry.status, 404);
 });
 
 test('the organizer cannot remove themselves, and only the host can remove', async (t) => {
