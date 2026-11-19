@@ -660,6 +660,7 @@ export function init(doc = document, win = window) {
      cache or outbox timer that was already armed must not write to a group that is over. */
   let closedGroupId = null;
   let pendingDeleteId = null;
+  let pendingDeleteButton = null;
   let editingExpense = null;
   let customSeed = null;
   let lastBalances = {};
@@ -2488,6 +2489,20 @@ export function init(doc = document, win = window) {
     armedDeleteButton = null;
   }
 
+  /**
+   * Retire the delete in flight and put its button back. Idempotent: every settle path — ack,
+   * refusal, conflict, or a sheet opening over it — may call this, and a second call does nothing.
+   */
+  function settlePendingDelete() {
+    pendingDeleteId = null;
+    const button = pendingDeleteButton;
+    pendingDeleteButton = null;
+    if (!button) return;
+    button.disabled = false;
+    button.textContent = 'Delete';
+    button.classList.remove('is-armed');
+  }
+
   function armDelete(record, button) {
     if (armedDeleteId !== record.id) {
       disarmDelete();
@@ -2506,6 +2521,7 @@ export function init(doc = document, win = window) {
       return;
     }
     pendingDeleteId = record.id;
+    pendingDeleteButton = button;
     button.disabled = true;
     socket.send(
       { t: 'put', id: record.id, base: record.rev, blob: null, deleted: true },
@@ -2799,7 +2815,7 @@ export function init(doc = document, win = window) {
     mergeNotice = null;
     mergeNoticeFields = [];
     mergeRetryId = null;
-    pendingDeleteId = null;
+    settlePendingDelete();
     savingExpense = false;
     expenseError.hidden = true;
     expenseError.textContent = '';
@@ -3257,7 +3273,7 @@ export function init(doc = document, win = window) {
       });
       scheduleCacheWrite(groupIdValue);
       renderLedger();
-      if (frame.id === pendingDeleteId) pendingDeleteId = null;
+      if (frame.id === pendingDeleteId) settlePendingDelete();
       if (editingExpense?.id === frame.id) closeExpenseSheet();
       setStatus(deletionStatus(frame, previous));
       return;
@@ -3329,11 +3345,15 @@ export function init(doc = document, win = window) {
 
     /* A queued delete or edit outlives the sheet that made it; a permanent refusal retires it. */
     if (frame.id && groupSocket()?.queueEntries().some((entry) => entry.id === frame.id)) {
+      const refusedDelete = frame.id === pendingDeleteId;
+      if (refusedDelete) settlePendingDelete();
       groupSocket().ack(frame.id);
       if (frame.code === 'deleted') {
         ledger.delete(frame.id);
         renderLedger();
         setStatus('Someone deleted this expense.');
+      } else if (refusedDelete) {
+        setStatus('The expense could not be deleted. Try again.');
       } else {
         setStatus('The change could not be saved.');
       }
@@ -3341,7 +3361,7 @@ export function init(doc = document, win = window) {
     }
 
     if (frame.id === pendingDeleteId) {
-      pendingDeleteId = null;
+      settlePendingDelete();
       if (frame.code === 'deleted') {
         ledger.delete(frame.id);
         renderLedger();
@@ -3504,7 +3524,7 @@ export function init(doc = document, win = window) {
       ledger.delete(frame.id);
       renderLedger();
       if (editing) closeExpenseSheet();
-      if (deleting) pendingDeleteId = null;
+      if (deleting) settlePendingDelete();
       setStatus(deletionStatus(frame.current, previous));
       return true;
     }
@@ -3533,7 +3553,7 @@ export function init(doc = document, win = window) {
       );
     }
     if (deleting) {
-      pendingDeleteId = null;
+      settlePendingDelete();
       setStatus('This expense changed elsewhere. Check it and try again.');
     }
     return true;
