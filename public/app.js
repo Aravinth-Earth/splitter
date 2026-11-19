@@ -675,6 +675,9 @@ export function init(doc = document, win = window) {
   let armedDeleteId = null;
   let armedDeleteButton = null;
   let deleteTimer = null;
+  /* Each painted ledger row carries the patch that repaints it, so a frame can update one row
+     without touching the others. */
+  const ledgerPainters = new WeakMap();
 
   form.addEventListener('submit', (event) => {
     /* A form with no action would still navigate, and a navigation is a lost create. */
@@ -2206,8 +2209,8 @@ export function init(doc = document, win = window) {
     );
 
     disarmDelete();
-    ledgerList.textContent = '';
     if (groupHeader.hidden) {
+      ledgerList.textContent = '';
       ledgerPanel.hidden = true;
       balancesPanel.hidden = true;
       return;
@@ -2215,54 +2218,82 @@ export function init(doc = document, win = window) {
     ledgerPanel.hidden = rows.length === 0;
     emptyLedger.hidden = rows.length !== 0;
 
-    for (const record of rows) {
-      const value = record.value;
-      const row = doc.createElement('li');
-      row.className = 'expense-row';
+    /* Rows are keyed by record id and patched where a value moved. This runs on every frame, and
+       replacing the list would drop the pointer's hover, the armed Delete and the reader's place;
+       only a row whose shape changed (pending → synced) is built again. */
+    const kept = new Map();
+    for (const node of [...ledgerList.childNodes]) {
+      const id = node.dataset?.rowId;
+      if (id && !kept.has(id)) kept.set(id, node);
+      else node.remove();
+    }
 
-      const left = doc.createElement('div');
-      const title = doc.createElement('h3');
-      title.textContent = value.description;
-      const meta = doc.createElement('p');
-      meta.className = 'expense-meta';
-      if (record.pending) {
-        meta.textContent = 'Waiting to sync';
-        left.append(title, meta);
-        const side = doc.createElement('div');
-        side.className = 'expense-side';
-        const amount = doc.createElement('span');
-        amount.className = 'expense-amount';
-        amount.textContent = formatPaise(value.amountPaise, groupCurrency);
-        side.append(amount);
-        row.classList.add('pending');
-        row.append(left, side);
-        ledgerList.append(row);
-        continue;
+    const next = rows.map((record) => {
+      const shape = record.pending ? 'pending' : 'expense';
+      const current = kept.get(record.id);
+      if (current && current.dataset.shape === shape) {
+        paintLedgerRow(current, record);
+        return current;
       }
+      return makeLedgerRow(record, shape);
+    });
 
-      const payers = Array.isArray(value.paidBy)
-        ? value.paidBy
-        : [{ memberId: value.paidBy, amountPaise: value.amountPaise }];
-      const payer = payers.map((entry) => memberLabel(entry.memberId)).join(' + ');
-      const detail =
-        payers.length > 1
-          ? ` (${payers.map((entry) => formatPaise(entry.amountPaise, groupCurrency)).join(' + ')})`
-          : '';
-      const creator = record.creator ?? record.author;
-      const edited = creator && creator !== record.author;
-      const editor = memberLabel(record.author);
-      meta.textContent =
-        `Paid by ${payer}${detail} · ${value.date} ${value.time}` +
-        (edited ? ` · edited by ${editor}` : '');
-      left.append(title, meta);
+    const inPlace =
+      next.length === ledgerList.childNodes.length &&
+      next.every((node, index) => ledgerList.childNodes[index] === node);
+    if (!inPlace) ledgerList.replaceChildren(...next);
 
-      const side = doc.createElement('div');
-      side.className = 'expense-side';
+    renderBalances();
+  }
 
-      const amount = doc.createElement('span');
-      amount.className = 'expense-amount';
-      amount.textContent = formatPaise(value.amountPaise, groupCurrency);
+  function setText(node, text) {
+    if (node.textContent !== text) node.textContent = text;
+  }
 
+  /* The meta line of a synced expense: who paid, how much each payer put in, when, and who edited. */
+  function ledgerMeta(record) {
+    const value = record.value;
+    const payers = Array.isArray(value.paidBy)
+      ? value.paidBy
+      : [{ memberId: value.paidBy, amountPaise: value.amountPaise }];
+    const payer = payers.map((entry) => memberLabel(entry.memberId)).join(' + ');
+    const detail =
+      payers.length > 1
+        ? ` (${payers.map((entry) => formatPaise(entry.amountPaise, groupCurrency)).join(' + ')})`
+        : '';
+    const creator = record.creator ?? record.author;
+    const edited = creator && creator !== record.author;
+    const editor = memberLabel(record.author);
+    return (
+      `Paid by ${payer}${detail} · ${value.date} ${value.time}` +
+      (edited ? ` · edited by ${editor}` : '')
+    );
+  }
+
+  /* One row, built once. The painter moves only the text that changed and keeps the listeners, so
+     the node stays put while the record under it is replaced. */
+  function makeLedgerRow(record, shape) {
+    const row = doc.createElement('li');
+    row.className = shape === 'pending' ? 'expense-row pending' : 'expense-row';
+
+    const left = doc.createElement('div');
+    const title = doc.createElement('h3');
+    const meta = doc.createElement('p');
+    meta.className = 'expense-meta';
+    left.append(title, meta);
+
+    const side = doc.createElement('div');
+    side.className = 'expense-side';
+    const amount = doc.createElement('span');
+    amount.className = 'expense-amount';
+    side.append(amount);
+    row.append(left, side);
+
+    /* The buttons outlive the record they act on, so they read the latest one through `live`. */
+    let live = record;
+    let remove = null;
+
+    if (shape === 'expense') {
       const actions = doc.createElement('div');
       actions.className = 'expense-actions';
 
@@ -2270,21 +2301,39 @@ export function init(doc = document, win = window) {
       edit.type = 'button';
       edit.className = 'secondary';
       edit.textContent = 'Edit';
-      edit.addEventListener('click', () => openExpenseSheet(record));
+      edit.addEventListener('click', () => openExpenseSheet(live));
 
-      const remove = doc.createElement('button');
+      remove = doc.createElement('button');
       remove.type = 'button';
       remove.className = 'secondary';
       remove.textContent = 'Delete';
-      remove.addEventListener('click', () => armDelete(record, remove));
+      remove.addEventListener('click', () => armDelete(live, remove));
 
       actions.append(edit, remove);
-      side.append(amount, actions);
-      row.append(left, side);
-      ledgerList.append(row);
+      side.append(actions);
     }
 
-    renderBalances();
+    ledgerPainters.set(row, (next) => {
+      live = next;
+      setText(title, next.value.description);
+      setText(amount, formatPaise(next.value.amountPaise, groupCurrency));
+      if (shape === 'pending') {
+        setText(meta, 'Waiting to sync');
+        return;
+      }
+      setText(meta, ledgerMeta(next));
+      /* A tombstone that never reached the group leaves a disabled button behind; a repaint is a
+         fresh read of the record, so the control starts from enabled again. */
+      remove.disabled = false;
+    });
+    row.dataset.rowId = record.id;
+    row.dataset.shape = shape;
+    paintLedgerRow(row, record);
+    return row;
+  }
+
+  function paintLedgerRow(row, record) {
+    ledgerPainters.get(row)?.(record);
   }
 
   function chartMode() {
