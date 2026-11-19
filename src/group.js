@@ -1271,8 +1271,15 @@ export class Group {
   /**
    * The frame a role may see: the host sees pending names because it must decide; an approved
    * member sees only the approved roster. A pending member never receives this frame at all.
+   *
+   * `ledger` decides whether the whole ledger travels with it. The frames that give a socket its
+   * state for the first time — auth, resume and admission — carry it, because that is the one
+   * moment a device may be holding nothing. A frame pushed after a roster or mode change does not:
+   * no record changed, every changed row already went out as its own `record` frame, and copying
+   * every stored row into every push made each one as large as the group. A client that needs the
+   * whole ledger again gets one by authenticating, which is always answered in full.
    */
-  async rosterFrame(meta, memberId, role) {
+  async rosterFrame(meta, memberId, role, { ledger = 'full' } = {}) {
     /* The host is the viewer here, not an entry in its own roster. The group name in meta is the
        group's, not a person's, and putting it in a member slot would name the organizer after the
        group. The host's own name is the one the page already holds. */
@@ -1296,7 +1303,7 @@ export class Group {
       });
     }
     const records = [];
-    if (role === 'host' || role === 'member') {
+    if (ledger === 'full' && (role === 'host' || role === 'member')) {
       const stored = await this.ctx.storage.list({ prefix: RECORD_PREFIX });
       for (const [, record] of stored) records.push({ ...record });
       records.sort((left, right) => left.at - right.at || (left.id < right.id ? -1 : 1));
@@ -1312,13 +1319,17 @@ export class Group {
       metaBlob: meta.metaBlob ?? null,
       hostId: meta.hostId,
       roster,
-      records
+      /* Absent, not empty: an empty list would say the group holds no records, and the client
+         must be able to tell "the ledger did not change" from "the ledger is gone". */
+      ...(ledger === 'full' ? { records } : {})
     };
   }
 
   /**
    * Send the state each socket is allowed to see: the host its full roster, an approved member the
    * approved one. Pending sockets receive nothing here — waiting is the only frame they may get.
+   *
+   * The roster is what changed on every path here, so the push is the roster without the ledger.
    */
   async notifyState(meta, skip = new Set()) {
     for (const socket of this.sockets) {
@@ -1326,7 +1337,10 @@ export class Group {
       const identity = this.identities.get(socket);
       if (!identity || (identity.role !== 'host' && identity.role !== 'member')) continue;
       try {
-        socket.send(JSON.stringify(await this.rosterFrame(meta, identity.memberId, identity.role)));
+        const frame = await this.rosterFrame(meta, identity.memberId, identity.role, {
+          ledger: 'none'
+        });
+        socket.send(JSON.stringify(frame));
       } catch {
         /* a socket that is already gone is not a reason to stop telling the others */
       }
@@ -1334,7 +1348,9 @@ export class Group {
   }
 
   async notifyHosts(meta) {
-    const frame = JSON.stringify(await this.rosterFrame(meta, meta.hostId, 'host'));
+    const frame = JSON.stringify(
+      await this.rosterFrame(meta, meta.hostId, 'host', { ledger: 'none' })
+    );
     for (const socket of this.sockets) {
       if (this.identities.get(socket)?.role !== 'host') continue;
       try {

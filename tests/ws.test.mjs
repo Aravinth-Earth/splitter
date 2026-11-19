@@ -1276,8 +1276,15 @@ test('an approved member can be removed, and cannot return with the same secret'
   assert.ok(removed, 'a removed member still travels in state for attribution');
   assert.equal(removed.status, 'removed');
   assert.deepEqual(removed.nameBlob, nameBlob, 'the sealed name is kept byte-identical');
+  assert.equal('records' in after, false, 'a roster push does not repeat the ledger');
+
+  /* The expense itself is untouched: the frame that fills a device still carries every row. */
+  const reader = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => reader.close());
+  reader.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  const reloaded = await reader.next();
   assert.ok(
-    after.records.some((record) => record.id === recordId),
+    reloaded.records.some((record) => record.id === recordId),
     'the removed member\'s expense stays in state'
   );
 
@@ -1344,7 +1351,13 @@ test('a member leaves and their entries stay, attributed', async (t) => {
   const left = after.roster.find((entry) => entry.id === memberId);
   assert.equal(left.status, 'left');
   assert.deepEqual(left.nameBlob, nameBlob);
-  assert.ok(after.records.some((record) => record.id === recordId));
+  assert.equal('records' in after, false, 'a roster push does not repeat the ledger');
+
+  const reader = await connect(socketUrl(worker.baseUrl, group.groupId));
+  t.after(() => reader.close());
+  reader.send({ t: 'auth', id: group.hostId, secret: group.hostSecret, mode: 'resume' });
+  const reloaded = await reader.next();
+  assert.ok(reloaded.records.some((record) => record.id === recordId));
 
   const again = await connect(socketUrl(worker.baseUrl, group.groupId));
   t.after(() => again.close());
