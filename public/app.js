@@ -635,6 +635,7 @@ export function init(doc = document, win = window) {
   let recordGuard = new RevGuard();
   let guardGroupId = null;
   let expenseSheetOpen = false;
+  let expenseSheetOpener = null;
   let expenseDraftId = null;
   let pendingExpenseId = null;
   let pendingExpenseEdit = false;
@@ -2787,6 +2788,10 @@ export function init(doc = document, win = window) {
   function openExpenseSheet(record = null) {
     if (!group || record?.deleted) return;
 
+    if (!expenseSheetOpen) {
+      const opener = doc.activeElement;
+      expenseSheetOpener = opener && opener !== doc.body ? opener : null;
+    }
     closeSettlementSheet();
     expenseSheetOpen = true;
     editingExpense = record;
@@ -2843,6 +2848,7 @@ export function init(doc = document, win = window) {
   }
 
   function closeExpenseSheet() {
+    const wasOpen = expenseSheetOpen;
     expenseSheetOpen = false;
     expensePanel.hidden = true;
     expenseError.hidden = true;
@@ -2872,6 +2878,13 @@ export function init(doc = document, win = window) {
     payerSingle.hidden = false;
     addPayerButton.parentElement.hidden = false;
     renderLedger();
+    const opener = expenseSheetOpener;
+    expenseSheetOpener = null;
+    if (!wasOpen) return;
+    const target = opener?.isConnected !== false && typeof opener?.focus === 'function'
+      ? opener
+      : addExpenseButton;
+    target?.focus?.();
   }
 
   function settlementPeople() {
