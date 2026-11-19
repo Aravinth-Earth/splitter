@@ -12,7 +12,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { DEFAULT_MAX_GROUPS, JOIN_LIMIT, JOIN_WINDOW_MS, Registry } from '../src/registry.js';
+import { Group, GROUP_KEY } from '../src/group.js';
+
+import {
+  DEFAULT_MAX_GROUPS,
+  JOIN_LIMIT,
+  JOIN_WINDOW_MS,
+  LIST_PAGE_LIMIT,
+  Registry
+} from '../src/registry.js';
 
 /** A Registry ctx backed by one Map, plus the three statements reserve and release use. */
 function fakeContext() {
@@ -25,6 +33,13 @@ function fakeContext() {
     if (text.startsWith('CREATE TABLE IF NOT EXISTS join_failures')) return { toArray: () => [] };
     if (text.startsWith('SELECT 1 FROM slots')) return { toArray: () => (rows.has(params[0]) ? [{}] : []) };
     if (text.startsWith('SELECT COUNT(*) AS held FROM slots')) return { toArray: () => [{ held: rows.size }] };
+    /* The listing's walk: `ORDER BY group_id` with the page bound as a parameter, so the fake
+       answers exactly what the query asks for — a listing that ignored its bound would be handed
+       the whole ledger here and fail the bound test. */
+    if (text.startsWith('SELECT group_id FROM slots ORDER BY group_id LIMIT ?')) {
+      const page = [...rows.keys()].sort().slice(0, params[0]);
+      return { toArray: () => page.map((group_id) => ({ group_id })) };
+    }
     if (text.startsWith('INSERT INTO slots')) {
       rows.set(params[0], true);
       return { toArray: () => [] };
@@ -155,6 +170,294 @@ test('registry: a release without a group id is a bad request, not a no-op succe
   assert.equal(rows.size, 1, 'the held slot must survive a malformed release');
 });
 
+
+test('registry: stats names the cap in force and the slots free', async () => {
+  const { ctx, rows } = fakeContext();
+  const registry = new Registry(ctx, { MAX_GROUPS: '3' });
+
+  registry.reserve(id(1));
+  registry.reserve(id(2));
+
+  const response = await post(registry, {}, { path: '/stats' });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { cap: 3, reserved: 2, free: 1 });
+  assert.equal(rows.size, 2, 'stats must neither take nor free a slot');
+
+  /* The third reserve fills the ledger, and the next read says zero free — the number the create
+     path compares and the number this route reports are one number. */
+  registry.reserve(id(3));
+  assert.deepEqual(await (await post(registry, {}, { path: '/stats' })).json(), {
+    cap: 3,
+    reserved: 3,
+    free: 0
+  });
+  assert.deepEqual(registry.reserve(id(4)), { ok: false, reserved: false }, 'free 0 is a full ledger');
+
+  /* A deploy that lowers the cap under what is already reserved must not report negative room. */
+  const narrower = new Registry(ctx, { MAX_GROUPS: '2' });
+  assert.deepEqual(await (await post(narrower, {}, { path: '/stats' })).json(), {
+    cap: 2,
+    reserved: 3,
+    free: 0
+  });
+  assert.deepEqual(narrower.reserve(id(5)), { ok: false, reserved: false });
+});
+
+test('registry: a malformed MAX_GROUPS falls back to 25 and says so', async () => {
+  for (const value of ['many', '0', '-4', '']) {
+    const { ctx } = fakeContext();
+    const registry = new Registry(ctx, { MAX_GROUPS: value });
+
+    const response = await post(registry, {}, { path: '/stats' });
+    assert.equal(response.status, 200);
+    assert.deepEqual(
+      await response.json(),
+      { cap: DEFAULT_MAX_GROUPS, reserved: 0, free: DEFAULT_MAX_GROUPS },
+      `MAX_GROUPS=${JSON.stringify(value)}`
+    );
+  }
+
+  assert.equal(DEFAULT_MAX_GROUPS, 25, 'the cap in force is the documented default, never zero');
+});
+
+test('registry: stats by GET is refused with allow: POST', async () => {
+  const { ctx, rows } = fakeContext();
+  const registry = new Registry(ctx, { MAX_GROUPS: '2' });
+  registry.reserve(id(1));
+
+  for (const method of ['GET', 'PUT', 'DELETE']) {
+    const response = await post(registry, null, { path: '/stats', method });
+    assert.equal(response.status, 405, `${method} /stats must be refused`);
+    assert.equal(response.headers.get('allow'), 'POST', 'a 405 must carry Allow: POST');
+    assert.deepEqual(await response.json(), { error: 'method' });
+  }
+
+  assert.equal(rows.size, 1, 'a refused method must not touch the ledger');
+});
+
+/* ---------------------------------------------------------------- the read-only listing */
+
+/**
+ * The GROUPS binding, over a table of answers keyed by group id.
+ *
+ * `asked` records every group the ledger reads, in order, so "the list stopped at its bound" can be
+ * asserted on the calls that were made rather than on the answer alone. An id with no entry throws,
+ * which is the shape of a binding that cannot reach the object at all.
+ */
+function fakeGroups(answers = {}) {
+  const asked = [];
+  return {
+    asked,
+    env: {
+      GROUPS: {
+        idFromName: (name) => name,
+        get: (name) => ({
+          fetch: async (url, init) => {
+            asked.push({ id: name, path: new URL(url).pathname, method: init?.method });
+            const answer = answers[name];
+            if (typeof answer !== 'function') throw new Error(`fake groups: no answer for ${name}`);
+            const { status = 200, body } = answer();
+            return new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
+          }
+        })
+      }
+    }
+  };
+}
+
+/** The counters one group answers, as `src/group.js` writes them. */
+const counters = (createdAt, lastWriteAt, records, bytes) => ({
+  ok: true,
+  createdAt,
+  lastWriteAt,
+  records,
+  bytes
+});
+
+test('registry: a list of three groups reports the counters each group answered', async () => {
+  const { ctx } = fakeContext();
+  const groups = fakeGroups({
+    [id(1)]: () => ({ body: counters(1000, 2000, 2, 300) }),
+    [id(2)]: () => ({ body: counters(1500, null, 0, 0) }),
+    [id(3)]: () => ({ body: counters(1700, 1800, 5, 900) })
+  });
+  const registry = new Registry(ctx, { MAX_GROUPS: '5', ...groups.env });
+
+  for (const n of [3, 1, 2]) assert.deepEqual(registry.reserve(id(n)), { ok: true, reserved: true });
+
+  const response = await post(registry, {}, { path: '/list' });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    limit: LIST_PAGE_LIMIT,
+    total: 3,
+    groups: [
+      { id: id(1), readable: true, createdAt: 1000, lastWriteAt: 2000, records: 2, bytes: 300 },
+      { id: id(2), readable: true, createdAt: 1500, lastWriteAt: null, records: 0, bytes: 0 },
+      { id: id(3), readable: true, createdAt: 1700, lastWriteAt: 1800, records: 5, bytes: 900 }
+    ]
+  });
+  assert.deepEqual(
+    groups.asked.map((call) => call.id),
+    [id(1), id(2), id(3)],
+    'every live group is asked once, in the ledger order, and only its counters'
+  );
+  assert.deepEqual(
+    groups.asked.map((call) => call.path),
+    ['/counters', '/counters', '/counters']
+  );
+});
+
+test('registry: the list stops at its bound and answers in a stable order', async () => {
+  const { ctx } = fakeContext();
+  const live = LIST_PAGE_LIMIT + 2;
+  const answers = {};
+  for (let n = 1; n <= live; n += 1) answers[id(n)] = () => ({ body: counters(n, null, 0, 0) });
+  const groups = fakeGroups(answers);
+  const registry = new Registry(ctx, { MAX_GROUPS: '25', ...groups.env });
+
+  /* Reserved out of order on purpose: the ledger's rows come back in insertion order, so a listing
+     that walked them as stored would answer a different page for the same ledger. */
+  for (const n of [7, 3, 11, 1, 9, 5, 12, 2, 10, 4, 8, 6]) registry.reserve(id(n));
+
+  const body = await (await post(registry, {}, { path: '/list' })).json();
+  const expected = Array.from({ length: LIST_PAGE_LIMIT }, (_, index) => id(index + 1));
+
+  assert.equal(body.limit, LIST_PAGE_LIMIT);
+  assert.equal(body.total, live, 'the total is the whole ledger, not the page');
+  assert.deepEqual(body.groups.map((entry) => entry.id), expected, 'the page is ordered by id');
+  assert.equal(body.groups.length, LIST_PAGE_LIMIT, 'a page never reads more than its bound');
+  assert.equal(groups.asked.length, LIST_PAGE_LIMIT, 'no group past the bound is even asked');
+
+  /* The same ledger answers the same page: the order is the ledger's, not the groups'. */
+  assert.deepEqual(await (await post(registry, {}, { path: '/list' })).json(), body);
+});
+
+test('registry: a group that throws is reported unreadable, not as zero', async () => {
+  const { ctx } = fakeContext();
+  const groups = fakeGroups({
+    [id(1)]: () => ({ body: counters(1000, 1000, 1, 10) }),
+    [id(2)]: () => {
+      throw new Error('unreachable');
+    },
+    [id(3)]: () => ({ status: 500, body: { error: 'internal' } }),
+    [id(4)]: () => ({ body: '<html>not json</html>' }),
+    /* A 200 that is JSON but not counters is a bad answer too, not a group holding nothing. */
+    [id(5)]: () => ({ body: { ok: true } })
+  });
+  const registry = new Registry(ctx, { MAX_GROUPS: '9', ...groups.env });
+  for (const n of [1, 2, 3, 4, 5]) registry.reserve(id(n));
+
+  const body = await (await post(registry, {}, { path: '/list' })).json();
+  assert.deepEqual(body.groups, [
+    { id: id(1), readable: true, createdAt: 1000, lastWriteAt: 1000, records: 1, bytes: 10 },
+    { id: id(2), readable: false },
+    { id: id(3), readable: false },
+    { id: id(4), readable: false },
+    { id: id(5), readable: false }
+  ]);
+  for (const entry of body.groups.slice(1)) {
+    assert.equal('records' in entry, false, 'an unreadable group must not answer a record count');
+    assert.equal('bytes' in entry, false, 'an unreadable group must not answer a byte count');
+    assert.equal('createdAt' in entry, false, 'nor a creation time');
+  }
+  assert.equal(body.total, 5, 'an unreadable group is still a live slot');
+});
+
+test('registry: a group with no timestamp is listed as unknown, never as a number', async () => {
+  const { ctx } = fakeContext();
+  const groups = fakeGroups({ [id(1)]: () => ({ body: counters(null, null, 3, 42) }) });
+  const registry = new Registry(ctx, { MAX_GROUPS: '2', ...groups.env });
+  registry.reserve(id(1));
+
+  const body = await (await post(registry, {}, { path: '/list' })).json();
+  const [entry] = body.groups;
+
+  assert.equal(entry.readable, true, 'a group created before timestamps existed is still readable');
+  assert.equal(entry.createdAt, null, 'an unknown creation time is answered as unknown');
+  assert.equal(entry.lastWriteAt, null, 'and so is an unknown last write');
+  assert.equal(entry.records, 3, 'the counters that are known still travel');
+  assert.equal(entry.bytes, 42);
+  assert.notEqual(typeof entry.createdAt, 'number', 'an absence is never invented as a time');
+});
+
+test('registry: a list of real groups matches the counters their own API created', async () => {
+  const { ctx } = fakeContext();
+  const instances = new Map();
+
+  /* A GROUPS binding over real Group instances: the ledger's reading of a counters answer is only
+     proven against the file that writes that answer this way. A key the two files disagreed on —
+     the name of a counter, or the key the last write lives under — fails here. */
+  const env = {
+    GROUPS: {
+      idFromName: (name) => name,
+      get: (name) => {
+        if (!instances.has(name)) {
+          const stored = new Map();
+          const api = {
+            get: async (key) => stored.get(key),
+            put: async (key, value) => {
+              stored.set(key, value);
+            },
+            list: async ({ prefix } = {}) => {
+              const found = new Map();
+              for (const [key, value] of stored) {
+                if (prefix === undefined || key.startsWith(prefix)) found.set(key, value);
+              }
+              return found;
+            },
+            delete: async (key) => stored.delete(key),
+            deleteAll: async () => stored.clear()
+          };
+          instances.set(name, { group: new Group({ storage: api }, {}), stored });
+        }
+        const instance = instances.get(name);
+        return { fetch: (url, init) => instance.group.fetch(new Request(url, init)) };
+      }
+    }
+  };
+  const registry = new Registry(ctx, { MAX_GROUPS: '9', ...env });
+
+  const blob = { iv: 'A'.repeat(16), ct: 'B'.repeat(24) };
+  const groups = [1, 2, 3].map((n) => ({
+    id: id(n),
+    hostId: id(100 + n),
+    recordId: id(200 + n)
+  }));
+
+  for (const entry of groups) {
+    registry.reserve(entry.id);
+    const created = await env.GROUPS.get(entry.id).fetch('https://group/init', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ groupId: entry.id, hostId: entry.hostId, nameBlob: blob })
+    });
+    assert.deepEqual(await created.json(), { ok: true, created: true });
+
+    /* One accepted write each, so no group here can be read as one that was never written. */
+    const { group } = instances.get(entry.id);
+    const socket = { send() {}, close() {} };
+    group.sockets.add(socket);
+    group.identities.set(socket, { memberId: entry.hostId, role: 'host' });
+    await group.writeRecord(socket, { id: entry.recordId, base: 0, blob, deleted: false });
+  }
+
+  const body = await (await post(registry, {}, { path: '/list' })).json();
+  assert.equal(body.total, 3);
+  assert.equal(body.groups.length, 3);
+
+  for (const [index, entry] of groups.entries()) {
+    const { stored } = instances.get(entry.id);
+    const listed = body.groups[index];
+    const record = stored.get(`record:${entry.recordId}`);
+
+    assert.equal(listed.id, entry.id);
+    assert.equal(listed.readable, true, 'a created group is readable through the ledger');
+    assert.equal(listed.createdAt, stored.get(GROUP_KEY).createdAt, 'the time the group stamped');
+    assert.equal(listed.lastWriteAt, stored.get('last-write').at, 'the time of its one write');
+    assert.equal(listed.records, 1);
+    assert.equal(listed.bytes, new TextEncoder().encode(JSON.stringify(record)).length);
+  }
+});
 
 test('registry: twelve failed joins from one address block it, and the window clears', () => {
   const { ctx, joinRows } = fakeContext();
