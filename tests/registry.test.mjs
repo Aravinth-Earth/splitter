@@ -324,7 +324,7 @@ function fakeGroups(answers = {}) {
             asked.push({ id: name, path: new URL(url).pathname, method: init?.method });
             const answer = answers[name];
             if (typeof answer !== 'function') throw new Error(`fake groups: no answer for ${name}`);
-            const { status = 200, body } = answer();
+            const { status = 200, body } = await answer();
             return new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
           }
         })
@@ -373,6 +373,41 @@ test('registry: a list of three groups reports the counters each group answered'
   assert.deepEqual(
     groups.asked.map((call) => call.path),
     ['/counters', '/counters', '/counters']
+  );
+});
+
+test('registry: a page reads its counters together, not one row at a time', async () => {
+  const { ctx } = fakeContext();
+  let inFlight = 0;
+  let peak = 0;
+  const answers = {};
+  for (const n of [1, 2, 3, 4]) {
+    answers[id(n)] = async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      /* The first id answers slowest, so an answer that listed groups as their counters came back
+         rather than in ledger order would be wrong here. */
+      await new Promise((resolve) => setTimeout(resolve, 5 - n));
+      inFlight -= 1;
+      return { body: counters(n, null, n, 10 * n) };
+    };
+  }
+  const groups = fakeGroups(answers);
+  const registry = new Registry(ctx, { MAX_GROUPS: '5', ...groups.env });
+
+  for (const n of [4, 2, 1, 3]) registry.reserve(id(n));
+
+  const body = await (await post(registry, {}, { path: '/list' })).json();
+
+  assert.equal(peak, 4, 'the page asks every group before it waits on any answer');
+  assert.deepEqual(
+    body.groups.map((entry) => entry.id),
+    [id(1), id(2), id(3), id(4)],
+    'the page keeps the ledger order however the answers arrive'
+  );
+  assert.deepEqual(
+    body.groups.map((entry) => entry.records),
+    [1, 2, 3, 4]
   );
 });
 

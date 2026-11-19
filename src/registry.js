@@ -136,15 +136,18 @@ export class Registry {
     const page = rows.slice(0, LIST_PAGE_LIMIT);
     const next = rows.length > LIST_PAGE_LIMIT ? page[page.length - 1].group_id : null;
 
-    const groups = [];
-    for (const row of page) {
-      const counters = await this.readCounters(row.group_id);
-      groups.push(
-        counters === null
+    /* A page is at most `LIST_PAGE_LIMIT` groups, and they are asked together: the page costs one
+       round of calls rather than one call per row waited on in turn. `Promise.all` keeps the page's
+       order, and `readCounters` answers `null` instead of throwing, so a group that cannot be read
+       still lands where its row is. */
+    const groups = await Promise.all(
+      page.map(async (row) => {
+        const counters = await this.readCounters(row.group_id);
+        return counters === null
           ? { id: row.group_id, readable: false }
-          : { id: row.group_id, readable: true, ...counters }
-      );
-    }
+          : { id: row.group_id, readable: true, ...counters };
+      })
+    );
 
     return { limit: LIST_PAGE_LIMIT, total: this.slotsHeld(), next, groups };
   }
