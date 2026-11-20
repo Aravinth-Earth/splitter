@@ -51,7 +51,7 @@
             autocomplete="off"
             placeholder="Your name"
             aria-describedby="display-name-help" />
-          <p id="display-name-help" class="hint">2 to 30 characters. It is not sent to the server.</p>
+          <p id="display-name-help" class="hint">2 to 30 characters. It is not sent as text: it travels sealed with the group.</p>
         </div>
 
         <p id="form-error" class="form-error" role="alert" hidden></p>
@@ -60,6 +60,9 @@
       </form>
       <p class="switch">
         <button id="show-join" class="link-button" type="button">Have a code? Join a group</button>
+      </p>
+      <p class="switch">
+        <a class="link-button" href="#how-it-works">How this works — what the server can and cannot see</a>
       </p>
     </section>
 
@@ -138,6 +141,10 @@
         <p>The code is the key. Anyone holding it can ask to join, so share it only with the people you are splitting with.</p>
         <button id="dismiss-hint" class="link-button" type="button">Got it</button>
       </div>
+
+      <p class="mode-row">
+        <a class="link-button" href="#how-it-works">How this works</a>
+      </p>
 
       <p class="group-actions">
         <button id="leave-group" class="secondary" type="button" hidden>Leave group…</button>
@@ -344,22 +351,56 @@
       </form>
     </section>
 
-    <section class="panel" aria-labelledby="server-title">
-      <h2 id="server-title">What the server can and cannot see</h2>
+    <section id="how-it-works" class="panel" aria-labelledby="how-title">
+      <h2 id="how-title">How this works</h2>
       <p>
         The code is the key, and it is made in this browser. The browser turns it into an
-        AES-256-GCM key and seals the group name and its currency before anything is sent, so the
-        request carries a hash of the code, a hash of a secret the browser makes, and two sealed blobs.
+        AES-256-GCM key, so the same sixteen characters open the same group on any device, and the
+        code itself is never sent: the request carries a hash of it as the group id, a hash of this
+        member's secret, and blobs sealed with the key.
       </p>
       <p>
-        The server holds those ids and blobs, a join mode and a revision number. It cannot read the
-        group name or the currency, and it cannot read anything added to the ledger later. The code
-        itself never reaches it.
+        The organizer decides who is in. A new group asks the organizer to approve each person
+        before letting them past the door, and the organizer can switch it to open joining, where
+        the code alone is enough. Each person who joins gets their own secret, and the server only
+        ever sees its hash.
       </p>
-      <p class="muted">
-        Honest limits: a code that leaks cannot be revoked, a device's own cache is plaintext, and the
-        server cannot check that a split adds up because it cannot read either number.
+      <p>
+        What the server holds: the group id, the member ids, each sealed blob — its IV and its
+        ciphertext — one revision number per record, which member wrote it, and the timestamps of
+        when the group was made, when each person asked to join, and when each write arrived. It
+        cannot read the group name, a member name, a description, an amount, a payer or a split,
+        because every one of those travels sealed. It cannot check that a split adds up either, for
+        the same reason.
       </p>
+      <h3 class="eyebrow">What it cannot promise</h3>
+      <ul id="how-limits" class="how-limits">
+        <li>
+          <strong>A code that leaks cannot be revoked.</strong> There is no list to cancel it from:
+          anyone holding it can open the group, and the only way to take it out of use is to end the
+          group and start again.
+        </li>
+        <li>
+          <strong>A malicious server can withhold or replay.</strong> It can hold back a write, or
+          answer a device that never saw the newer version with the older one, and the ledger has no
+          signature chain to catch it.
+        </li>
+        <li>
+          <strong>The copy this browser keeps is not encrypted.</strong> The cache holds only sealed
+          blobs, but the code that opens them sits in this tab's storage in the clear, so anyone who
+          can reach this browser while the tab is open can open the group.
+        </li>
+        <li>
+          <strong>Cloudflare is the only copy.</strong> There is no second replica and no backup to
+          ask for: if the group's storage is lost, the ledger is gone. Export a JSON file if you need
+          a copy of your own.
+        </li>
+        <li>
+          <strong>There are no accounts.</strong> No email, no password, no reset — lose the code and
+          the link, and nothing on this page can recover your access: not the organizer, not the
+          operator.
+        </li>
+      </ul>
     </section>
 
     <noscript>
