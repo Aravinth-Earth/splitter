@@ -67,8 +67,18 @@ const bannedHosts = [
   'fonts.googleapis.com',
   'fonts.gstatic.com'
 ];
-/* Copy that would be a lie: ciphertext does go to our own Worker. */
-const bannedCopy = ['no data sent anywhere', 'no data ever leaves', 'only ever holds ciphertext'];
+/* Copy that would be a lie: ciphertext does go to our own Worker. An honest page names the request
+   it makes; these phrases deny there is one, and "only ever holds ciphertext" denies the ids and
+   timestamps the same page has to admit to. */
+const bannedCopy = [
+  'no data sent anywhere',
+  'no data ever leaves',
+  'no data leaves',
+  'nothing leaves your device',
+  'data never leaves',
+  'nothing is sent to the server',
+  'only ever holds ciphertext'
+];
 /* Nothing personal belongs in a page strangers load. */
 const personal = ['aravinth', '@332321.xyz', 'simplelogin'];
 
@@ -109,6 +119,20 @@ for (const file of assets) {
     const inline = text.match(/\son[a-z]+\s*=/gi);
     if (inline) problems.push(`${relative(root, file)}: inline event handler ${inline[0].trim()}`);
   }
+}
+
+/* 3. The honesty panel is the page's account of its own trust model, so its disappearance would
+   leave every scan here passing while the reader is told nothing. Require the panel, and the five
+   limits it has to name: no more (a sixth would be a limit nobody described) and no fewer. */
+const pagePath = join(publicDir, 'index.html');
+const page = readFileSync(pagePath, 'utf8');
+if (!/id="how-it-works"/.test(page)) {
+  problems.push('public/index.html: the "How this works" panel is missing');
+}
+const limits = /<ul\b[^>]*id="how-limits"[^>]*>([\s\S]*?)<\/ul>/.exec(page);
+const limitCount = limits ? (limits[1].match(/<li\b/gi) ?? []).length : 0;
+if (limitCount !== 5) {
+  problems.push(`public/index.html: the limits list must carry five items, found ${limitCount}`);
 }
 
 /* 4. Every Worker route is one Cloudflare accepts. Wildcards are allowed only at the beginning of
