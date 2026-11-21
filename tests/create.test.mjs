@@ -122,7 +122,7 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
     assert.equal(results.length, 26);
     assert.equal(ok.length, 25, `25 creates must be accepted, got ${ok.length}`);
     assert.equal(limited.length, 1, `exactly one create must be refused for the cap, got ${limited.length}`);
-    for (const result of ok) assert.deepEqual(result.body, { ok: true });
+    for (const result of ok) assert.deepEqual(result.body, { ok: true, created: true });
     for (const result of limited) assert.deepEqual(result.body, { error: 'limit' });
 
     /* A refusal is not a slot: re-sending the refused id while the ledger is still full is
@@ -130,14 +130,16 @@ test('create: twenty-six creates against a cap of twenty-five leave twenty-five 
     const refusedId = ids[results.findIndex((result) => result.status === 429)];
     assert.equal((await createGroup(worker.baseUrl, createBody(refusedId))).status, 429);
 
-    /* Idempotency: a retry of an accepted id is ok, and it does not make a slot appear. */
+    /* Idempotency: a retry of an accepted id is ok, and it does not make a slot appear. `created`
+       is false because the group was already there — the answer the page uses to tell a retry of
+       its own create from a code that names somebody else's group. */
     const retried = await createGroup(worker.baseUrl, createBody(ids[0]));
     assert.equal(retried.status, 200);
-    assert.deepEqual(retried.body, { ok: true });
+    assert.deepEqual(retried.body, { ok: true, created: false });
 
     const again = await createGroup(worker.baseUrl, createBody(ids[1]));
     assert.equal(again.status, 200);
-    assert.deepEqual(again.body, { ok: true });
+    assert.deepEqual(again.body, { ok: true, created: false });
 
     const fresh = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
     assert.equal(fresh.status, 429, 'a retry must not free or add a slot');
@@ -221,7 +223,7 @@ test('create: a bad groupId is refused before any slot is taken', async (t) => {
   /* The only slot is still there to take: a refusal neither took one nor bypassed the cap. */
   const accepted = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
   assert.equal(accepted.status, 200, 'the only slot must still be free after every bad groupId');
-  assert.deepEqual(accepted.body, { ok: true });
+  assert.deepEqual(accepted.body, { ok: true, created: true });
 });
 
 /* --------------------------------------------------------------- the media type */
@@ -245,7 +247,7 @@ test('create: only application/json may reach a slot, and a refused type spends 
     type: 'application/json; charset=utf-8'
   });
   assert.equal(accepted.status, 200, 'application/json with a charset is accepted, and the slot was free');
-  assert.deepEqual(accepted.body, { ok: true });
+  assert.deepEqual(accepted.body, { ok: true, created: true });
 
   /* The ledger is now full, so a request that reached it answers 429 and one refused before it
      answers 400. Each of these is a type this API does not speak. */
@@ -375,8 +377,12 @@ test('create: a successful create reserves, initialises, and releases nothing', 
   const { calls, env } = fakeBindings();
 
   const response = await worker.fetch(createRequest(body), env);
-  assert.equal(response.status, 200, 'the success body is unchanged: {ok:true} on 200');
-  assert.deepEqual(await response.json(), { ok: true });
+  assert.equal(response.status, 200, 'the success body keeps its ok');
+  assert.deepEqual(
+    await response.json(),
+    { ok: true, created: true },
+    'a create that initialised the group says so, so the page knows it is the organizer'
+  );
   assert.deepEqual(
     calls.map((call) => call.pathname),
     ['/reserve', '/init'],
@@ -412,7 +418,7 @@ test('create: an id derived by crypto.js is accepted, and the cap comes from the
     nameBlob: sealed()
   });
   assert.equal(created.status, 200, 'the id crypto.js derives must be accepted');
-  assert.deepEqual(created.body, { ok: true });
+  assert.deepEqual(created.body, { ok: true, created: true });
 
   /* One slot, already taken: the cap is the number in the environment, not a constant. */
   const limited = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
@@ -426,7 +432,11 @@ test('create: an id derived by crypto.js is accepted, and the cap comes from the
     nameBlob: sealed()
   });
   assert.equal(retried.status, 200);
-  assert.deepEqual(retried.body, { ok: true });
+  assert.deepEqual(
+    retried.body,
+    { ok: true, created: false },
+    'the second create of a live id says the group was already there, which is what a collision looks like'
+  );
 });
 
 /* ------------------------------------------------- storage, without the network */
@@ -494,7 +504,7 @@ test('create: a body over the cap is refused without a content-length to check',
   /* A refused body is not a create: the only slot is still free. */
   const created = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
   assert.equal(created.status, 200, 'an oversized body must not have taken the only slot');
-  assert.deepEqual(created.body, { ok: true });
+  assert.deepEqual(created.body, { ok: true, created: true });
 });
 
 test('create: the body cap is a threshold, not a wall', async (t) => {
@@ -521,7 +531,7 @@ test('create: the body cap is a threshold, not a wall', async (t) => {
   assert.ok(size > 32 * 1024 && size < 64 * 1024, `the fixture must sit under the cap, got ${size} bytes`);
   const accepted = await createGroup(worker.baseUrl, large);
   assert.equal(accepted.status, 200, `a ${size}-byte body is under 64 KiB and must be accepted`);
-  assert.deepEqual(accepted.body, { ok: true });
+  assert.deepEqual(accepted.body, { ok: true, created: true });
 
   /* The oversized body spent nothing and the legal one spent the one slot: hence the refusal. */
   const next = await createGroup(worker.baseUrl, createBody(groupFixtureId()));
