@@ -83,6 +83,11 @@ export const OFFLINE_FIRST_MESSAGE =
   'Open this group once with a connection; after that it works offline.';
 export const RETRY_MESSAGE = 'The group was not created. Try again.';
 
+/* A generated code can name a group that already exists — vanishingly unlikely, but the answer to
+   it must not be "land in someone else's group". One fresh code is tried, and then the page stops:
+   a loop would spend slots on a code space that has already failed twice. */
+export const COLLISION_MESSAGE = 'That group code is already in use. Try again.';
+
 /* A wipe that stopped part-way is not an end, and it is not a whole group either: the keys are
    deleted before the meta, so the records may already be gone while the group still exists. The copy
    therefore claims only what the storage keeps — the group is still here, the delete failed, and
@@ -548,6 +553,7 @@ export function init(doc = document, win = window) {
   const settleSave = doc.getElementById('settle-save');
   const settleCancel = doc.getElementById('settle-cancel');
   const addExpenseButton = doc.getElementById('add-expense');
+  const emptyAddExpenseButton = doc.getElementById('empty-add-expense');
   const expensePanel = doc.getElementById('expense-panel');
   const expenseForm = doc.getElementById('expense-form');
   const expenseDescription = doc.getElementById('expense-description');
@@ -718,6 +724,7 @@ export function init(doc = document, win = window) {
   });
 
   addExpenseButton.addEventListener('click', () => openExpenseSheet());
+  emptyAddExpenseButton.addEventListener('click', () => openExpenseSheet());
   expenseForm.addEventListener('submit', (event) => {
     void saveExpense(event);
   });
@@ -794,50 +801,77 @@ export function init(doc = document, win = window) {
     setBusy(true);
 
     try {
-      const code = generateCode();
-      const secret = randomSecret();
-      const payload = await createPayload({
-        code,
-        secret,
-        name: fields.name,
-        displayName: fields.displayName,
-        currency: fields.currency
-      });
+      /* A code already in use is regenerated once. `created: false` is the only thing that says so:
+         the Worker answers `ok` for a retry of its own id as well, so the page cannot tell the two
+         apart by status alone — and it never has an id of its own to retry, because every attempt
+         presses Create with a new one. */
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const code = generateCode();
+        const secret = randomSecret();
+        const payload = await createPayload({
+          code,
+          secret,
+          name: fields.name,
+          displayName: fields.displayName,
+          currency: fields.currency
+        });
 
-      const response = await win.fetch(createUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+        const response = await win.fetch(createUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
 
-      if (!response.ok) {
-        /* The form and its values stay exactly as they were: a full ledger frees up later, and a
-           fault may not repeat. */
-        showError(createErrorMessage(response.status));
-        return;
+        if (!response.ok) {
+          /* The form and its values stay exactly as they were: a full ledger frees up later, and a
+             fault may not repeat. */
+          showError(createErrorMessage(response.status));
+          return;
+        }
+
+        if ((await readCreateAnswer(response)).created) {
+          hideError();
+          showGroup({
+            code,
+            name: fields.name,
+            displayName: fields.displayName,
+            memberId: payload.hostId,
+            currency: fields.currency
+          });
+          remember({
+            groupId: payload.groupId,
+            memberId: payload.hostId,
+            secret,
+            displayName: fields.displayName,
+            code
+          });
+          openHostSocket({ groupId: payload.groupId, memberId: payload.hostId, secret, code });
+          return;
+        }
       }
 
-      hideError();
-      showGroup({
-        code,
-        name: fields.name,
-        displayName: fields.displayName,
-        memberId: payload.hostId,
-        currency: fields.currency
-      });
-      remember({
-        groupId: payload.groupId,
-        memberId: payload.hostId,
-        secret,
-        displayName: fields.displayName,
-        code
-      });
-      openHostSocket({ groupId: payload.groupId, memberId: payload.hostId, secret, code });
+      showError(COLLISION_MESSAGE);
     } catch {
       showError(RETRY_MESSAGE);
     } finally {
       pending = false;
       setBusy(false);
+    }
+  }
+
+  /**
+   * Whether the Worker made this group or found it already there.
+   *
+   * A body without the field is read as a create, which is what the page did before the field
+   * existed: an answer it cannot read must not be mistaken for a collision and throw away a group
+   * it has just been given.
+   */
+  async function readCreateAnswer(response) {
+    try {
+      const body = await response.json();
+      return { created: body?.created !== false };
+    } catch {
+      return { created: true };
     }
   }
 
@@ -2858,6 +2892,10 @@ export function init(doc = document, win = window) {
 
   function openExpenseSheet(record = null) {
     if (!group || record?.deleted) return;
+
+    /* The first expense is the other ending of the code hint: it has done its job once the person
+       is past sharing the code and into the ledger. */
+    if (!record) hideHint();
 
     if (!expenseSheetOpen) {
       const opener = doc.activeElement;
