@@ -376,6 +376,17 @@ button {
 
 .steps li { margin: 0.5rem 0; }
 
+/* The trust-model panel is a floor of the page, not a footer: the anchor from either screen lands
+   on its heading rather than on the padding above it. */
+#how-it-works { scroll-margin-top: 1rem; }
+
+.how-limits {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.how-limits li { margin: 0 0 0.75rem; }
+
 /* ------------------------------------------------------------- the ledger */
 
 .group-actions {
