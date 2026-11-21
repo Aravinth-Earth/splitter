@@ -95,7 +95,10 @@ npm run check   # guards: no third-party refs, no inline handlers, no personal d
 npm test        # node:test — crypto, and the Worker's routes against a throwaway wrangler dev
 ```
 
-`npm run e2e` — two real Chromium profiles against a live Worker — is planned, not written yet.
+`npm run e2e` — a real Chromium browser with two member tabs, driven over CDP against a live
+Worker — records every WebSocket frame and HTTP request body and fails if a group name, member
+name, description, amount digit or the group code appears in the clear. Set `CHROME_PATH` if the
+browser is not found. The page-action paint checks still need their own harness.
 
 ### Deploy
 
