@@ -12,8 +12,16 @@
  * frame and nothing else. A failed join is counted by source in the Registry, and twelve failures
  * in five minutes answer the next attempt with `rate_limited`.
  *
- * Storage is the key-value API on a SQLite-backed namespace: one key per record, so a later write
- * to a record cannot rewrite its neighbours, and the meta is written once.
+ * Storage is the key-value API on a SQLite-backed namespace: one key per record, named
+ * `r:<kind>:<id>`, so a later write to a record cannot rewrite its neighbours and no key grows with
+ * the group. The meta is the one small key that makes the group exist, and it carries a host id,
+ * the join mode, a revision and two times — never a name or a blob. The sealed blobs live in their
+ * own `r:content:` keys, exactly as a record does.
+ *
+ * An alarm is the group's own expiry: every accepted write arms it ninety days later, and the
+ * alarm re-arms itself from the stored time if it wakes early. When it is due it runs the same
+ * destroy an operator does, so the wipe and the Registry release stay one path and a slot is freed
+ * once however many times the alarm is delivered.
  *
  * Destroy is the operator's one call out, and the host's end is the same act from a socket: both run
  * in one fixed order — every key with the meta last, then every socket, then the Registry slot. The
@@ -30,23 +38,34 @@ import { memberIdFromSecret } from './identity.js';
 import { isId, isSealed } from './wire.js';
 
 export const GROUP_KEY = 'meta';
-const MEMBER_PREFIX = 'member:';
-const RECORD_PREFIX = 'record:';
-/* The last accepted record write, kept in its own key rather than in the meta: a record write can
-   therefore stamp it with a blind put, and cannot clobber a join mode a host changed a moment
-   earlier between this write's read and its write of the meta. */
-const LAST_WRITE_KEY = 'last-write';
+/* One key per record, and every record key is `r:<kind>:<id>`. The kind is what a reader narrows a
+   listing by, and the id is what makes a write touch that record alone. */
+const MEMBER_PREFIX = 'r:member:';
+const RECORD_PREFIX = 'r:record:';
+/* The sealed group name, host name and group meta. They are content, so they are records — one key
+   each — rather than fields on the meta that makes the group exist. */
+const GROUP_NAME_KEY = 'r:content:group-name';
+const HOST_NAME_KEY = 'r:content:host-name';
+const GROUP_META_KEY = 'r:content:group-meta';
+/* Where the running total used to live. The key is still read so a group written before the move
+   answers, and never written again: the meta carries `lastWriteAt` now. */
+const LEGACY_LAST_WRITE_KEY = 'last-write';
 /* The id the Registry slot was taken under, in its own key rather than in the meta. The meta is the
    key a wipe removes last and the key that makes the group exist, so a destroy that wiped the group
    and then failed to free the slot would otherwise lose the only record of which slot to retry. */
 const SLOT_KEY = 'slot';
-/* The running total of record bytes and record keys, kept in its own key rather than in the meta: a
-   write moves it in one small read-and-put, so nothing there can write a meta read back stale.
-   Reading the total is what keeps `/counters` from walking every `record:` key, and the value is
-   repaired from the records when a group predates the key. */
-const TOTALS_KEY = 'totals';
+/* The running total of record bytes and record keys, kept in its own `r:` key rather than in the
+   meta: a write moves it in one small read-and-put, so nothing there can write a meta read back
+   stale. Reading the total is what keeps `/counters` from walking every `r:record:` key, and the
+   value is repaired from the records when a group predates the key. */
+const TOTALS_KEY = 'r:total:records';
 const DEFAULT_MAX_MEMBERS = 20;
+const DEFAULT_MAX_RECORDS = 300;
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
+/* A group is wiped this long after its last write. One constant, because the time the alarm is
+   armed for and the time it checks when it wakes must be the same number. */
+const RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
 /* A socket is only here while it is speaking: the heartbeat re-announces the present set, and a
    socket that has been quiet for longer than this is no longer in it. */
 const DEFAULT_SILENCE_MS = 90_000;
@@ -136,16 +155,24 @@ export class Group {
        so the id the ledger was asked for cannot be rewritten by a second caller. */
     if (isId(groupId)) await this.ctx.storage.put(SLOT_KEY, groupId);
 
+    /* Content goes in its own keys, one record each, before the meta: the meta is what makes the
+       group exist, so it is written last and an init that dies part-way leaves no half-group. */
+    await this.ctx.storage.put(GROUP_NAME_KEY, nameBlob);
+    if (isSealed(hostNameBlob)) await this.ctx.storage.put(HOST_NAME_KEY, hostNameBlob);
+    if (isSealed(metaBlob)) await this.ctx.storage.put(GROUP_META_KEY, metaBlob);
+
+    const now = Date.now();
+    /* The meta holds identity and bookkeeping, never content: five fields, nothing a key holder's
+       ciphertext could be read out of. `lastWriteAt` starts at the creation time so a group that is
+       never written still has a clock to expire from. */
     await this.ctx.storage.put(GROUP_KEY, {
-      groupId: isId(groupId) ? groupId : null,
       hostId,
       joinMode: 'approval',
       rev: 0,
-      createdAt: Date.now(),
-      nameBlob,
-      hostNameBlob: hostNameBlob ?? null,
-      metaBlob: metaBlob ?? null
+      createdAt: now,
+      lastWriteAt: now
     });
+    await this.armExpiry(now);
     return { ok: true, created: true };
   }
 
@@ -158,6 +185,19 @@ export class Group {
   maxMembers() {
     const configured = Number(this.env?.MAX_MEMBERS);
     return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_MAX_MEMBERS;
+  }
+
+  /**
+   * The record cap, from `MAX_RECORDS`, defaulting to 300.
+   *
+   * A group is one trip's ledger, and the cap is what bounds it: 300 records with a 4 KB blob each
+   * is about 1.7 MB of stored values, and every value is far below the per-value ceiling. A
+   * tombstone counts, because the key is still stored; a revision does not, because it replaces the
+   * value it already had.
+   */
+  maxRecords() {
+    const configured = Number(this.env?.MAX_RECORDS);
+    return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_MAX_RECORDS;
   }
 
   /** How long a socket may stay open before its first `auth` frame. */
@@ -237,12 +277,18 @@ export class Group {
     const meta = await this.ctx.storage.get(GROUP_KEY);
     if (!meta) return null;
 
-    const lastWrite = await this.ctx.storage.get(LAST_WRITE_KEY);
+    /* The meta carries the write time. A group written before the field existed kept it under its
+       own key, and answering that is what keeps an old group readable rather than timeless. */
+    let lastWriteAt = Number.isSafeInteger(meta.lastWriteAt) ? meta.lastWriteAt : null;
+    if (lastWriteAt === null) {
+      const legacy = await this.ctx.storage.get(LEGACY_LAST_WRITE_KEY);
+      if (Number.isSafeInteger(legacy?.at)) lastWriteAt = legacy.at;
+    }
     const totals = await this.recordTotals();
 
     return {
       createdAt: Number.isSafeInteger(meta.createdAt) ? meta.createdAt : null,
-      lastWriteAt: Number.isSafeInteger(lastWrite?.at) ? lastWrite.at : null,
+      lastWriteAt,
       records: totals.records,
       bytes: totals.bytes
     };
@@ -415,9 +461,8 @@ export class Group {
         this.sendRefusal(socket, 'bad_mode');
         return;
       }
-      meta.joinMode = frame.mode;
-      await this.ctx.storage.put(GROUP_KEY, meta);
-      await this.notifyState(meta);
+      const updated = await this.updateMeta((current) => ({ ...current, joinMode: frame.mode }));
+      if (updated) await this.notifyState(updated);
       return;
     }
 
@@ -665,6 +710,58 @@ export class Group {
   }
 
   /**
+   * The expiry alarm: the same destroy an operator asks for, once the group's last write is ninety
+   * days old.
+   *
+   * The stored time is the authority, never the alarm that woke this instance: a wake that arrives
+   * early — clock skew, a hand-set alarm — re-arms for the real deadline instead of taking a live
+   * group off the air. `destroy` reads the persisted slot id before the wipe and removes it only
+   * after the Registry freed a row, so a second delivery finds no slot left to hand back and never
+   * frees one twice. A group that is gone but whose slot release was refused has only the persisted
+   * slot id left, which is exactly what `destroy` retries.
+   */
+  async alarm() {
+    const meta = await this.ctx.storage.get(GROUP_KEY);
+    const slot = await this.persistedSlot(meta);
+
+    if (meta) {
+      const lastWriteAt = Number.isSafeInteger(meta.lastWriteAt)
+        ? meta.lastWriteAt
+        : Number.isSafeInteger(meta.createdAt)
+          ? meta.createdAt
+          : null;
+      /* No clock at all is a group written before either time existed. There is no deadline to
+         derive, so nothing is taken off the air. */
+      if (lastWriteAt === null) return;
+      if (Date.now() < lastWriteAt + RETENTION_MS) {
+        await this.armExpiry(lastWriteAt);
+        return;
+      }
+    } else if (slot === null) {
+      /* Already wiped and its slot already freed: a repeated delivery is a no-op. */
+      return;
+    }
+
+    await this.destroy();
+  }
+
+  /**
+   * Point the alarm at `at + RETENTION_MS`.
+   *
+   * Absent on a storage with no alarms — the group simply has no expiry, and no write is refused
+   * because of it. A refusal to arm is swallowed for the same reason: the record is already stored
+   * and accepted, and an alarm that would not stay set must not turn that write into an error.
+   */
+  async armExpiry(at) {
+    if (typeof this.ctx.storage.setAlarm !== 'function') return;
+    try {
+      await this.ctx.storage.setAlarm(at + RETENTION_MS);
+    } catch {
+      /* the write stands */
+    }
+  }
+
+  /**
    * The Registry slot id this group was created under, or `null` when it never held one.
    *
    * The persisted key is read first, because the wipe removes the meta and a retried destroy has
@@ -711,9 +808,8 @@ export class Group {
       const ordered = keys.filter((key) => key !== GROUP_KEY && key !== SLOT_KEY);
       if (keys.includes(GROUP_KEY)) ordered.push(GROUP_KEY);
       for (const key of ordered) await this.ctx.storage.delete(key);
-      /* No alarm is set anywhere in this Worker today; the guard is what keeps this call true if
-         one is ever added, instead of an unconditional call that would throw on a storage without
-         it. */
+      /* The alarm goes with the group: a wake left behind would find no group and no slot, and a
+         group that is re-created under the same id must not inherit the old group's deadline. */
       if (typeof this.ctx.storage.deleteAlarm === 'function') await this.ctx.storage.deleteAlarm();
     } catch (error) {
       /* The wipe stopped part-way, so the mark has to come off again. The failing storage is the
@@ -1173,16 +1269,24 @@ export class Group {
        ledger as it stood before it. A Durable Object interleaves requests at every await, and two
        writes accepted a moment apart would otherwise read the same baseline and drop each other's
        bytes; queued, each sees the total the one before it left. The value is replaced rather than
-       added to when the key was already there, so a revision moves the bytes by the difference. */
-    await this.moveTotals(async () => {
+       added to when the key was already there, so a revision moves the bytes by the difference.
+       The cap is checked in the same queue: a new key at the cap is refused, while a revision of a
+       key already counted is always allowed. */
+    const accepted = await this.moveTotals(async () => {
       const totals = await this.recordTotals({ backfill: false });
       const prior = await this.ctx.storage.get(key);
+      if (!prior && totals.records >= this.maxRecords()) return false;
       await this.ctx.storage.put(key, record);
       await this.ctx.storage.put(TOTALS_KEY, {
         records: totals.records + (prior ? 0 : 1),
         bytes: totals.bytes + storedBytes(record) - (prior ? storedBytes(prior) : 0)
       });
+      return true;
     });
+    if (!accepted) {
+      this.sendFrame(socket, { t: 'refused', code: 'group_full', id: frame.id });
+      return;
+    }
     /* The meta above was read before this write, so a wipe that set its mark in between listed its
        keys without this record in them, and the record would outlive a wipe that reported success.
        Read it again: a group that is being wiped now removes the record this write has just stored
@@ -1200,11 +1304,65 @@ export class Group {
       this.sendFrame(socket, { t: 'refused', code: 'wiping', id: frame.id });
       return;
     }
-    /* A blind put of the time alone: nothing here read the meta, so nothing here can write one back
-       stale. A write rejected above never reaches this line, so the time is the last *accepted*
-       write. */
-    await this.ctx.storage.put(LAST_WRITE_KEY, { at: record.at });
+    /* The time lives in the meta, so this is a read of the meta and a put of the whole record: the
+       transaction keeps a join mode changed a moment earlier from being written back stale. A write
+       rejected above never reaches this line, so the time is the last *accepted* write — and it is
+       the instant the expiry is armed from. The stamp also answers whether the group is still
+       there: a meta that went while this write ran is the one case the check above cannot see, so
+       the record is taken back rather than left in a group that no longer exists. */
+    const stamped = await this.stampLastWrite(record.at);
+    if (!stamped) {
+      await this.moveTotals(async () => {
+        await this.ctx.storage.delete(key);
+        await this.ctx.storage.delete(TOTALS_KEY);
+      });
+      this.sendFrame(socket, { t: 'refused', code: 'unknown_group', id: frame.id });
+      return;
+    }
+    await this.armExpiry(record.at);
     await this.broadcastRecord(record);
+  }
+
+  /**
+   * Move the group's last-write time, in one transaction when the storage offers one.
+   *
+   * The time is a meta field, and a blind put of the whole meta could put a join mode back the way
+   * it was before a host changed it. `transaction` closes that window; a storage without it gets
+   * the same read and put, which is the change itself with only the interleaving left.
+   *
+   * @returns {Promise<boolean>} whether the time was moved — false when the meta is gone or a wipe
+   *   has already marked it.
+   */
+  async stampLastWrite(at) {
+    const updated = await this.updateMeta((meta) =>
+      meta.wiping === true ? null : { ...meta, lastWriteAt: at }
+    );
+    return updated !== null;
+  }
+
+  /**
+   * Read the meta, change it in one step, and put it back — in a transaction when the storage
+   * offers one.
+   *
+   * `change` answers the next meta, or `null` to write nothing. The transaction is what keeps two
+   * fields written by different callers — a join mode here, a last-write time there — from
+   * overwriting each other with the copy each read before the other wrote.
+   *
+   * @returns {Promise<object|null>} the meta as written, or `null` when there was nothing to write.
+   */
+  async updateMeta(change) {
+    const apply = async (storage) => {
+      const meta = await storage.get(GROUP_KEY);
+      if (!meta) return null;
+      const next = change(meta);
+      if (next === null || next === undefined) return null;
+      await storage.put(GROUP_KEY, next);
+      return next;
+    };
+    if (typeof this.ctx.storage.transaction === 'function') {
+      return this.ctx.storage.transaction(apply);
+    }
+    return apply(this.ctx.storage);
   }
 
   /**
@@ -1269,6 +1427,18 @@ export class Group {
   }
 
   /**
+   * One sealed content value, from its own `r:content:` key.
+   *
+   * A group written before content moved out of the meta kept its name and meta there; reading that
+   * copy is what keeps such a group's frames intact instead of rendering it nameless. A key that is
+   * absent on a group written since is content the create never had, and answers `null`.
+   */
+  async contentValue(key, legacy) {
+    const stored = await this.ctx.storage.get(key);
+    return stored === undefined ? (legacy ?? null) : stored;
+  }
+
+  /**
    * The frame a role may see: the host sees pending names because it must decide; an approved
    * member sees only the approved roster. A pending member never receives this frame at all.
    *
@@ -1284,8 +1454,9 @@ export class Group {
        group's, not a person's, and putting it in a member slot would name the organizer after the
        group. The host's own name is the one the page already holds. */
     const roster = [];
-    if (isSealed(meta.hostNameBlob)) {
-      roster.push({ id: meta.hostId, status: 'approved', nameBlob: meta.hostNameBlob });
+    const hostNameBlob = await this.contentValue(HOST_NAME_KEY, meta.hostNameBlob);
+    if (isSealed(hostNameBlob)) {
+      roster.push({ id: meta.hostId, status: 'approved', nameBlob: hostNameBlob });
     }
     const members = await this.members();
     for (const [key, entry] of members) {
@@ -1315,8 +1486,8 @@ export class Group {
       memberId,
       role,
       joinMode: meta.joinMode === 'open' ? 'open' : 'approval',
-      nameBlob: meta.nameBlob,
-      metaBlob: meta.metaBlob ?? null,
+      nameBlob: await this.contentValue(GROUP_NAME_KEY, meta.nameBlob),
+      metaBlob: await this.contentValue(GROUP_META_KEY, meta.metaBlob),
       hostId: meta.hostId,
       roster,
       /* Absent, not empty: an empty list would say the group holds no records, and the client

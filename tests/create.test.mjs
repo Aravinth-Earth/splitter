@@ -458,14 +458,20 @@ test('group: the group stores its host, an approval join mode and revision zero'
   assert.equal(meta.hostId, hostId);
   assert.equal(meta.joinMode, 'approval');
   assert.equal(meta.rev, 0);
-  assert.deepEqual(meta.nameBlob, nameBlob);
-  assert.equal(meta.metaBlob, null);
+  assert.deepEqual(stored.get('r:content:group-name'), nameBlob, 'the sealed name is its own record');
+  assert.equal(stored.get('r:content:group-meta'), undefined, 'an absent meta is not stored at all');
+  assert.deepEqual(
+    Object.keys(meta).sort(),
+    ['createdAt', 'hostId', 'joinMode', 'lastWriteAt', 'rev'],
+    'the meta holds identity and times, never content'
+  );
 
   /* A retry with the same id is a no-op: the first host and revision stand. */
   const second = await group.init({ hostId: id22(), nameBlob: sealed(), metaBlob: sealed() });
   assert.equal(second.created, false);
   assert.deepEqual(stored.get('meta'), meta);
   assert.equal(stored.get('meta').rev, 0);
+  assert.equal(stored.get('r:content:group-meta'), undefined, 'a retried init stores no content');
 });
 
 /* ------------------------------------------------------- the cap on received bytes */

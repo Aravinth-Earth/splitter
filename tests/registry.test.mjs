@@ -618,12 +618,12 @@ test('registry: a list of real groups matches the counters their own API created
   for (const [index, entry] of groups.entries()) {
     const { stored } = instances.get(entry.id);
     const listed = body.groups[index];
-    const record = stored.get(`record:${entry.recordId}`);
+    const record = stored.get(`r:record:${entry.recordId}`);
 
     assert.equal(listed.id, entry.id);
     assert.equal(listed.readable, true, 'a created group is readable through the ledger');
     assert.equal(listed.createdAt, stored.get(GROUP_KEY).createdAt, 'the time the group stamped');
-    assert.equal(listed.lastWriteAt, stored.get('last-write').at, 'the time of its one write');
+    assert.equal(listed.lastWriteAt, stored.get(GROUP_KEY).lastWriteAt, 'the time of its one write');
     assert.equal(listed.records, 1);
     assert.equal(listed.bytes, new TextEncoder().encode(JSON.stringify(record)).length);
   }

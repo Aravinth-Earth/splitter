@@ -138,7 +138,7 @@ test('group: an empty init body is refused and writes nothing', async () => {
   const valid = await post(group, { hostId: id22(), nameBlob: sealed() });
   assert.equal(valid.status, 200, 'the refusal did not poison the instance');
   assert.deepEqual(await valid.json(), { ok: true, created: true });
-  assert.deepEqual(writes, [GROUP_KEY], 'a valid init writes the meta, and writes it once');
+  assert.equal(writes.filter((key) => key === GROUP_KEY).length, 1, 'a valid init writes the meta, and writes it once');
 });
 
 test('group: an init without a usable host id or sealed name is refused', async () => {
@@ -179,7 +179,7 @@ test('group: an absent meta is allowed, and a valid init writes the meta once', 
   assert.equal(first.status, 200);
   assert.deepEqual(await first.json(), { ok: true, created: true });
   assert.equal(stored.get(GROUP_KEY).hostId, hostId);
-  assert.equal(stored.get(GROUP_KEY).metaBlob, null, 'an absent meta is stored as null');
+  assert.equal(stored.get('r:content:group-meta'), undefined, 'an absent meta is not stored at all');
 
   /* A retry answers ok without a second write. */
   const second = await post(group, { hostId: id22(), nameBlob: sealed() });
@@ -201,7 +201,7 @@ test('group: only /init is routed, so a path that merely ends in it is not an in
   const routed = await post(group, { hostId: id22(), nameBlob: sealed() }, { path: '/init' });
   assert.equal(routed.status, 200, '/init itself is still the one init');
   assert.deepEqual(await routed.json(), { ok: true, created: true });
-  assert.deepEqual(writes, [GROUP_KEY], 'and it wrote exactly what an init writes');
+  assert.equal(writes.filter((key) => key === GROUP_KEY).length, 1, 'and it wrote exactly one meta, as an init does');
 });
 
 test('group: every write route answers a wrong method with Allow: POST', async () => {
@@ -246,9 +246,9 @@ test('group: destroy closes every socket, wipes storage and releases the slot', 
   const { group, stored } = newGroup({ env });
 
   await post(group, { groupId, hostId, nameBlob: sealed() });
-  stored.set(`member:${memberId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 1 });
-  stored.set(`record:${firstRecord}`, { id: firstRecord, rev: 1, blob: sealed(), deleted: false, at: 1 });
-  stored.set(`record:${secondRecord}`, { id: secondRecord, rev: 1, blob: sealed(), deleted: false, at: 2 });
+  stored.set(`r:member:${memberId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 1 });
+  stored.set(`r:record:${firstRecord}`, { id: firstRecord, rev: 1, blob: sealed(), deleted: false, at: 1 });
+  stored.set(`r:record:${secondRecord}`, { id: secondRecord, rev: 1, blob: sealed(), deleted: false, at: 2 });
 
   const host = newSocket();
   const member = newSocket();
@@ -314,14 +314,16 @@ test('group: a /release the registry refuses leaves the slot held and is not rep
   let deletes = 0;
   halfWipedStorage.api.delete = async (key) => {
     deletes += 1;
-    if (deletes === 2) throw new Error('storage');
+    /* The wipe dies on the meta — the key that makes the group exist — so everything before it,
+       the content and the records, has already gone. */
+    if (key === GROUP_KEY) throw new Error('storage');
     halfWipedStorage.stored.delete(key);
   };
   const { group: halfWiped } = newGroup({ env: untouched.env, storage: halfWipedStorage });
 
   const orphanRecord = id22();
   await post(halfWiped, { groupId: id22(), hostId: id22(), nameBlob: sealed() });
-  halfWipedStorage.stored.set(`record:${orphanRecord}`, { id: orphanRecord, rev: 1, blob: sealed(), at: 1 });
+  halfWipedStorage.stored.set(`r:record:${orphanRecord}`, { id: orphanRecord, rev: 1, blob: sealed(), at: 1 });
 
   const watcher = newSocket();
   halfWiped.sockets.add(watcher);
@@ -333,8 +335,8 @@ test('group: a /release the registry refuses leaves the slot held and is not rep
   assert.equal(brokenBody.destroyed, false);
   assert.equal(brokenBody.released, false, 'nothing may be reported as freed when the wipe failed');
   assert.equal(untouched.calls.length, 0, 'a failing wipe must never ask the Registry to free the slot');
-  assert.equal(deletes, 2, 'the wipe did stop part-way');
-  assert.equal(halfWipedStorage.stored.has(`record:${orphanRecord}`), false, 'the record was already gone');
+  assert.equal(deletes, 3, 'the wipe did stop part-way, at the meta');
+  assert.equal(halfWipedStorage.stored.has(`r:record:${orphanRecord}`), false, 'the record was already gone');
   assert.equal(halfWipedStorage.stored.has(GROUP_KEY), true, 'the group still exists, so the slot is still held');
   assert.equal(brokenBody.closed, 0, 'no socket was closed, so none may be counted as closed');
   /* The wipe never finished, so the group still exists: the socket is told exactly that — a frame
@@ -452,7 +454,7 @@ test('group: the ended frame is sent only after the wipe has finished', async ()
   const { group } = newGroup({ env: registry.env, storage });
 
   await post(group, { groupId, hostId, nameBlob: sealed() });
-  storage.stored.set(`record:${recordId}`, {
+  storage.stored.set(`r:record:${recordId}`, {
     id: recordId,
     rev: 1,
     blob: sealed(),
@@ -529,7 +531,7 @@ test('group: end wipes before it announces, and releases only the slot the creat
   const { group, stored } = newGroup({ env: registry.env, storage, id: objectId });
 
   await post(group, { groupId, hostId, nameBlob: sealed() });
-  storage.stored.set(`record:${recordId}`, {
+  storage.stored.set(`r:record:${recordId}`, {
     id: recordId,
     rev: 1,
     blob: sealed(),
@@ -573,7 +575,7 @@ test('group: an end whose wipe failed keeps the group and its sockets', async ()
   const { group, stored } = newGroup({ env: registry.env, storage });
 
   await post(group, { groupId: id22(), hostId, nameBlob: sealed() });
-  storage.stored.set(`record:${recordId}`, {
+  storage.stored.set(`r:record:${recordId}`, {
     id: recordId,
     rev: 1,
     blob: sealed(),
@@ -662,7 +664,7 @@ test('group: a put that arrives during end is refused and does not survive the w
   const { group, stored } = newGroup({ env: registry.env, storage });
 
   await post(group, { groupId, hostId, nameBlob: sealed() });
-  stored.set(`record:${earlyRecord}`, {
+  stored.set(`r:record:${earlyRecord}`, {
     id: earlyRecord,
     rev: 1,
     blob: sealed(),
@@ -692,8 +694,8 @@ test('group: a put that arrives during end is refused and does not survive the w
     { t: 'refused', code: 'wiping', id: lateRecord },
     'a group that is being wiped takes no writes'
   );
-  assert.equal(stored.has(`record:${lateRecord}`), false, 'the late put must not survive the wipe');
-  assert.equal(stored.has('last-write'), false, 'and must not leave its stamp behind');
+  assert.equal(stored.has(`r:record:${lateRecord}`), false, 'the late put must not survive the wipe');
+  assert.equal(stored.has(GROUP_KEY), false, 'and no meta is left to carry its stamp');
   assert.deepEqual(
     host.frames[host.frames.length - 1],
     { t: 'ended' },
@@ -736,8 +738,8 @@ test('group: a put that arrives during /destroy is refused and does not survive 
     { t: 'refused', code: 'wiping', id: lateRecord },
     'the operator route refuses writes for the same duration'
   );
-  assert.equal(stored.has(`record:${lateRecord}`), false, 'the late put must not survive the wipe');
-  assert.equal(stored.has('last-write'), false, 'nor its stamp');
+  assert.equal(stored.has(`r:record:${lateRecord}`), false, 'the late put must not survive the wipe');
+  assert.equal(stored.has(GROUP_KEY), false, 'nor its stamp, which lived in the meta');
   assert.equal(stored.size, 0, 'nothing is left behind a wipe that reported success');
 });
 
@@ -753,7 +755,8 @@ test('group: a failed wipe clears the mark, takes writes again, and a retry fini
   const { group, stored } = newGroup({ env: registry.env, storage });
 
   await post(group, { groupId, hostId, nameBlob: sealed() });
-  stored.set(`record:${earlyRecord}`, {
+  const initStamp = stored.get(GROUP_KEY).lastWriteAt;
+  stored.set(`r:record:${earlyRecord}`, {
     id: earlyRecord,
     rev: 1,
     blob: sealed(),
@@ -790,12 +793,13 @@ test('group: a failed wipe clears the mark, takes writes again, and a retry fini
     ],
     'the late put was refused, and the failure was announced as a failure'
   );
-  assert.equal(stored.has(`record:${lateRecord}`), false, 'the refused put left nothing');
+  assert.equal(stored.has(`r:record:${lateRecord}`), false, 'the refused put left nothing');
   assert.equal(stored.get(GROUP_KEY).wiping, undefined, 'the mark comes off when the wipe fails');
+  assert.equal(stored.get(GROUP_KEY).lastWriteAt, initStamp, 'a refused put does not move the last write');
 
   /* The group still exists — the sockets were told so — therefore it takes writes again. */
   await group.writeRecord(host, { id: afterRecord, base: 0, blob: sealed(), deleted: false });
-  assert.equal(stored.has(`record:${afterRecord}`), true, 'a write after a failed wipe is stored');
+  assert.equal(stored.has(`r:record:${afterRecord}`), true, 'a write after a failed wipe is stored');
 
   /* And the retry, through the operator route, finishes what the failed wipe could not. */
   const retried = await post(group, {}, { path: '/destroy' });
@@ -825,7 +829,7 @@ test('group: a put admitted before the wipe mark is undone by the write itself',
   const { group, stored } = newGroup({ env: registry.env, storage });
 
   await post(group, { groupId, hostId, nameBlob: sealed() });
-  stored.set(`record:${earlyRecord}`, {
+  stored.set(`r:record:${earlyRecord}`, {
     id: earlyRecord,
     rev: 1,
     blob: sealed(),
@@ -957,7 +961,7 @@ test('group: init stamps createdAt, and an accepted write stamps lastWriteAt', a
 
   const expected = recordIds.reduce(
     (total, recordId) =>
-      total + new TextEncoder().encode(JSON.stringify(stored.get(`record:${recordId}`))).length,
+      total + new TextEncoder().encode(JSON.stringify(stored.get(`r:record:${recordId}`))).length,
     0
   );
   assert.equal(counters.bytes, expected, 'bytes is the stored record values, summed in UTF-8');
@@ -969,7 +973,7 @@ test('group: init stamps createdAt, and an accepted write stamps lastWriteAt', a
 
 test('group: counters answer unknown for a group stored before timestamps existed', async () => {
   const { group, stored } = newGroup();
-  /* The meta a deploy before this patch wrote: no createdAt, and no last-write key at all. */
+  /* The meta a deploy before this patch wrote: no createdAt, and no write time anywhere. */
   stored.set(GROUP_KEY, {
     groupId: id22(),
     hostId: id22(),
@@ -1022,9 +1026,9 @@ test('group: presence defaults are 90 s of silence and a 30 s beat, and a socket
   const memberId = id22();
   const quietId = id22();
   const pendingId = id22();
-  stored.set(`member:${memberId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 0 });
-  stored.set(`member:${quietId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 0 });
-  stored.set(`member:${pendingId}`, { status: 'pending', nameBlob: sealed(), joinedAt: 0 });
+  stored.set(`r:member:${memberId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 0 });
+  stored.set(`r:member:${quietId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 0 });
+  stored.set(`r:member:${pendingId}`, { status: 'pending', nameBlob: sealed(), joinedAt: 0 });
 
   const now = Date.now();
   attach(group, { memberId: hostId, role: 'host', seen: now });
@@ -1057,7 +1061,7 @@ test('group: a pushed state frame carries the roster, and only a fresh authentic
 
   const recordIds = [id22(), id22(), id22()];
   recordIds.forEach((id, index) => {
-    stored.set(`record:${id}`, {
+    stored.set(`r:record:${id}`, {
       id,
       rev: 1,
       blob: sealed(),
@@ -1067,7 +1071,7 @@ test('group: a pushed state frame carries the roster, and only a fresh authentic
       at: index + 1
     });
   });
-  stored.set(`member:${memberId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 0 });
+  stored.set(`r:member:${memberId}`, { status: 'approved', nameBlob: sealed(), joinedAt: 0 });
 
   const meta = stored.get(GROUP_KEY);
 
