@@ -248,7 +248,10 @@ async function createGroup(request, env) {
     return json({ error: 'internal' }, 500);
   }
 
-  return json({ ok: true });
+  /* `created` is the difference between a new group and a code that already names one. Both take no
+     new slot — a retry of a live id is answered from the ledger — so the status cannot carry it, and
+     the page needs it: landing in a group it did not make would show it as its organizer. */
+  return json({ ok: true, created: initialised.body.created === true });
 }
 
 /* --------------------------------------------------------------- the operator surface */
